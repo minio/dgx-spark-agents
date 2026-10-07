@@ -210,3 +210,7 @@ python3 harness/analyze.py hermes-fleet data/hermes-fleet
 | Hermes Agent | 0.21.5 (2026.9.24) |
 | bubblewrap | 0.11.0 |
 | Apache Iceberg | commit c24eeea |
+
+## License
+
+This repository is licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
