@@ -1,0 +1,27 @@
+I have enough to answer. In this repo, **Spark** uses position deletes on both the *read* and *write* sides of DML; **Flink** uses them on the *write* side (sink DML) plus a maintenance task that converts equality deletes into DVs, and delegates the engine-agnostic read application to the shared `data` module.
+
+## How they hook in
+
+Both engines funnel position deletes through the same core plumbing we traced earlier — `PositionDeleteIndex` → `bitmap` is the in-memory form, `BaseDVFileWriter`/`PartitioningDVWriter` the write form, `BaseDeleteLoader`/`DeleteFilter` the read form. The engines just provide the engine-native row type (`InternalRow` for Spark, `RowData` for Flink) at the boundaries.
+
+## Spark — DML read side
+
+**DVIterator (spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/DVIterator.java)** is the most concrete use: it materializes a DV as a Spark `InternalRow` stream of delete positions. `loadPositionDeletes(...)` (line 52-53) loads the delete-file's bitmap, then `next()` emits one row per deleted `position`, filling the `_file` (referenced data file), `_pos`, partition/spec/file metadata columns, `content_offset`/`content_size`, and `null` for the deleted row (lines 71-90). This is consumed by the changelog reader / delete-file table to expose "these rows were deleted" as queryable rows.
+
+**ColumnarBatchUtil (spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/data/vectorized/ColumnarBatchUtil.java)** is the high-performance read path: it calls `deletes.deletedRowPositions()` to get the loaded index (lines 67, 146), then, since a batch's positions form a contiguous ascending range, traverses the index *once* with `forEachInRange` instead of probing per row (lines 72-74, 104-105, 154-155; `RowIdMappingCollector.accept` at 240-250). It builds either a row-ID compaction mapping (`buildRowIdMapping`, skipping deleted rows) or a `boolean[] isDeleted` (`buildIsDeleted`). Comment at 69-70 makes the ordering rationale explicit: "positions in a batch form a contiguous ascending range, so the index can be traversed once." This directly exploits the spec's requirement that positions are sorted/ascending (spec.md:1413-1416).
+
+**SparkPositionDeltaWrite (spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/SparkPositionDeltaWrite.java)** is the DML *write* side (DELETE/UPDATE/MERGE via Spark's row-level-ops API). It picks the delete writer in `newDeleteWriter` (lines 535-557): `PartitioningDVWriter` (DVs) when `useDVs()` (PUFFIN format, line 548-549), else a clustered/fanout position-delete-file writer, with the comment "The spec requires position deletes to be ordered by file and position for V2 tables" (lines 532-534). `PreviousDeleteLoader` (lines 560-591) calls `loadPositionDeletes` to merge prior DVs. Row deletes are routed via `delete(file, position, spec, partition)` (lines 631-643, 726-737) into the shared DV writer; commit uses `RowDelta` with conflict-detection validations (`validateDataFilesExist`, `validateNoConflictingDataFiles`, etc., lines 273-292) so the delete isn't committed against a stale snapshot.
+
+## Flink — DML write side (sink)
+
+Flink's sink is where position deletes enter: the CDC/UPSERT stream kind. BaseDeltaTaskWriter.write (flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/sink/BaseDeltaTaskWriter.java:80-111) maps RowData kinds → delete calls:
+- `UPDATE_BEFORE` and `DELETE` → `writer.delete(row)`
+- with upsert, `INSERT`/`UPDATE_AFTER` → `writer.deleteKey(...)` (delete the prior row by key)
+
+`RowDataDeltaWriter` (lines 113-127) extends `BaseEqualityDeltaWriter` with `DeleteGranularity.FILE` and the `PartitioningDVWriter` (from `BaseTaskWriter.useDv`). The DV writer then writes the bitmap (`PartitioningDVWriter.write` → `writer.delete(path, pos, spec, partition)`, core/src/main/java/org/apache/iceberg/io/PartitioningDVWriter.java:48-50). `PartitionedDeltaWriter` keeps a DV writer per partition key (PartitionedDeltaWriter.java:41, 71-84). So Flink DELETE/CDC events become per-file DVs.
+
+Separately, Flink also **converts existing equality deletes into DVs** post-commit: `EqualityConvertReader`/`EqualityConvertDVWriter` (flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/maintenance/operator/EqualityConvertReader.java, EqualityConvertDVWriter.java opens at "loadPositionDeletes"), gated by IcebergSink.Builder `convertEqualityDeletesToDeletionVectors` (IcebergSink.java:722-735). That's the spec's v3 story (spec.md:1358-1367) applied in Flink: retire equality/position files toward the keep-one-DV-per-file model.
+
+## Read application is shared, not engine-specific
+
+On the Flink *read* side, position deletes are applied by the shared `data` module's `DeleteFilter`, which both engines inherit — there's no Flink-specific `DeleteFilter`. The Spark-specific artifact is only the vectorization mapping above. If you want, I can trace `ChangelogRowReader`/the delete-file scanner in Spark that consumes `DVIterator`, or walk `BaseEqualityDeltaWriter` to show exactly where Flink's `deleteKey` becomes a position delete inside the DV writer. Want either?

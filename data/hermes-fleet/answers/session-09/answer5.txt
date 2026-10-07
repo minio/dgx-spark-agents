@@ -1,0 +1,21 @@
+Ten bullet points for a new contributor, each pointing to the file/line to read first.
+
+1. What a sort order is: a list of sort fields (source column, transform, direction, null-order) plus an id, defining how files are ordered. Read `api/src/main/java/org/apache/iceberg/SortOrder.java:40-55` (class fields) and `SortField.java:26-38` (the four attributes).
+
+2. Id 0 is reserved for "unsorted"; a real sorted order can't use it, and unsorted() is the singleton for it. Read `SortOrder.java:42-43` and the enforcement at `SortOrder.java:271-279`.
+
+3. A sort is only valid on primitive source columns with a compatible transform — enforced at build time. Read `SortOrder.java:298-313` (`checkCompatibility`).
+
+4. Sorting is advisory, not correctness-critical: writers "should" honor the default order but aren't required to (streaming especially). Read `core/src/main/java/org/apache/iceberg/util/SortOrderUtil.java:79-124`, which composes final ordering from sort + partition spec.
+
+5. JSON serialization is a custom parser (no Jackson annotations) whose keys mirror the spec: `order-id`, `fields`, `transform`, `source-id`, `direction`, `null-order`. Read `core/src/main/java/org/apache/iceberg/SortOrderParser.java:33-79`.
+
+6. Round-tripping through JSON is split unbound/bound to tolerate unknown transforms (required for forward compatibility). Read `api/src/main/java/org/apache/iceberg/UnboundSortOrder.java:40-65` (`bind` vs `bindUnchecked`).
+
+7. The transform is shared with partition specs (identity, bucket[N], truncate[W], year/month/day/hour, void). Read `api/src/main/java/org/apache/iceberg/transforms/Transforms.java:54-113` (`fromString`).
+
+8. Order-preserving transforms let one guarantee satisfy another (days(ts) satisfies month(ts)); this is what prevents redundant sorting. Read `api/src/main/java/org/apache/iceberg/transforms/Dates.java:112-131` and the interface default `Transform.java:87-102`.
+
+9. Spark turns the sort order into a required write ordering so data lands sorted; it also removes partition fields the sort already covers. Read `spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/SparkWriteUtil.java:242-260` and `Spark3Util.java:269-273`.
+
+10. Flink uses the sort order as the range-partition key of the shuffle (no guaranteed global sort), and its state snapshot refuses compatibility if the order changes. Read `flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkSink.java:662-694` and `flink/.../sink/shuffle/SortKeySerializer.java:375-376`.

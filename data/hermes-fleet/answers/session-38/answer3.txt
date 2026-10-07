@@ -1,0 +1,72 @@
+I now have a comprehensive picture. Below are the failure modes and edge cases, and how the code guards against each — the guards cluster in four places: the `NestedField` constructor (`Types.java`), the add/update column paths (`SchemaUpdate.java`), schema serialization and validation (`SchemaParser.java`, `Schema.java`), and read-time missing-field resolution (`ValueReaders.java`). Write-time consumption lives in engine code (e.g. Spark's `SparkTypeToType.java`).
+
+## 1. Type mismatch — default value not castable to the field's type
+
+**Failure:** a default of the wrong type (e.g. a string default on an `int` field) silently stored, then misread or corrupting the schema.
+
+**Guard:** `NestedField.castDefault` (Types.java:895-907): for a non-null default on a non-nested type it calls `defaultValue.to(type)` (line 900) and `Preconditions.checkArgument(typedDefault != null, "Cannot cast default value to ...")` (line 901-902), throwing on failure. Both `initialDefault` and `writeDefault` go through it in the constructor (Types.java:891-892). The `Literal.to(type)` helper is what surfaces an incompatibility. On the way in from JSON, `SingleValueParser.fromJson` also rejects wrong-shaped nodes per type (e.g. SingleValueParser.java:56-57 boolean check, 60-64 int integral check, 97-101 decimal scale check).
+
+## 2. Nullability contract — required field with no default
+
+**Failure:** adding a *required* column with no default → existing/new rows would have to be non-null but have no value to fall back to.
+
+**Guard (two layers):**
+- Add time: `SchemaUpdate.internalAddColumn` (SchemaUpdate.java:160-163) — `Preconditions.checkArgument(defaultValue != null || isOptional || allowIncompatibleChanges, "cannot add required column without a default value")`.
+- Read time: `ValueReaders.createMissingFieldReader` throws `"Missing required field"` (ValueReaders.java:325) when a required field is absent from the data file with no constant/default — matching the spec's "if the write default for a required field is not set, the writer must fail" (spec.md:334).
+
+## 3. Forward/backward versioning — non-null default on a v1/v2 table
+
+**Failure:** writing a default into a v1/v2 table breaks old readers (defaults are a v3 feature).
+
+**Guard:** `Schema.checkCompatibility` (Schema.java:619-627) — flags any field whose `initialDefault() != null` when `formatVersion < DEFAULT_VALUES_MIN_FORMAT_VERSION` (= 3, Schema.java:61) with "non-null default ... is not supported until v3", then throws (Schema.java:631-636).
+
+## 4. Nested-type defaults — non-null default on a struct/list/map
+
+**Failure:** per spec, only *struct* defaults are tracked, and a nested struct's default may only be `null` or an *empty* struct (`{}`); non-null defaults on list/map/struct-with-values are invalid.
+
+**Guard:** `castDefault` throws for any non-null default on a nested type: `"Invalid default value for %s: %s (must be null)"` (Types.java:896-898). This is stricter than the spec's `{}` empty-struct case — which is worth flagging as a divergence/limitation rather than a bug: the core `NestedField` path accepts only `null` for a nested default, so it doesn't currently model the spec's "non-null struct with no field values" (`{}`) default (spec.md:338). Where nested defaults legitimately apply (sub-field defaults on `point.x`/`point.y`), they're attached to each *leaf* field, not the struct.
+
+## 5. Write-default followed by a read — backwards compatibility of changed defaults
+
+**Failure:** after changing a write-default, old readers interpreting new data wrong; or old data getting the *new* default when it should keep the historical one. This is the `initial-default` (frozen) vs `write-default` (mutable) split.
+
+**Guard:**
+- Read path uses only the *initial* default: `ValueReaders.createMissingFieldReader` checks `field.initialDefault()` (ValueReaders.java:315-316), never write-default — so historical rows keep the frozen value (spec.md:329-330, 407).
+- Change path mutates only the write default: `SchemaUpdate.updateColumnDefault` uses `withWriteDefault` only (SchemaUpdate.java:339) and explicitly leaves the initial default untouched; the comment at line 337 documents "write default is always set and initial default is only set if the field requires one."
+- Write default is write-time-only (forward-compatible per spec.md:1931) and is consumed by engines, e.g. Spark maps Spark's `ColumnDefaultValue.getExpression()` → `withWriteDefault` (SparkTypeToType.java:264-267).
+
+## 6. Collision / immutable-initial-default violation
+
+**Failure:** a later schema evolution trying to change the initial default, or a default that redeclares behavior for old rows.
+
+**Guard:** the only mutation API is `updateColumnDefault` (write-default only, SchemaUpdate.java:322-343); there's no code path that rewrites `initialDefault` after construction. `NestedField` is immutable — `asOptional`/`asRequired`/`withFieldId` preserve both defaults unchanged (Types.java:913-937). The union-by-name visitor likewise only ever calls `updateColumnDefault` for changes and seeds the initial default only at add time (UnionByNameVisitor.java:163-168, 192-194).
+
+## 7. Value equality / redundant update
+
+**Failure:** a no-op default update that still rewrites metadata or churns the commit.
+
+**Guard:** `updateColumnDefault` early-returns when the converted new write-default equals the existing one: `Objects.equals(field.writeDefault(), converted.value())` (SchemaUpdate.java:333-335). Same pattern for docs (SchemaUpdate.java:309-311). UnionByNameVisitor likewise skips the update when write defaults are equal (UnionByNameVisitor.java:177-178, 192-194).
+
+## 8. Malformed JSON default during parsing
+
+**Failure:** a corrupted/hand-edited metadata file carrying a garbage default (wrong node type, malformed UUID/hex, wrong decimal scale, invalid timestamp offset).
+
+**Guard:** `SingleValueParser.fromJson` throws on malformed input for every type: UUID length/format (SingleValueParser.java:107-120), fixed length check (157-167), hex decoding (168-176), decimal `scale()==` check (97-101), timestamps requiring `+00:00` offset (132-139), integral/floating type checks (56-86). These all flow up through `SchemaParser.defaultFromJson` (SchemaParser.java:198-211), halting schema load. The nanosecond branch is special-cased to avoid `Long` overflow in `Expressions.lit` (SchemaParser.java:201-205).
+
+## 9. Timestamp/type overflow promotion traps
+
+**Failure:** nanosecond timestamps overflowing `Literal`'s long-based representation, or a default that can't survive a type promotion.
+
+**Guard:** the `Expressions.nanos` special-case (SchemaParser.java:201-205) prevents overflow for `timestamp_ns`/`timestamptz_ns`. Since defaults are typed against the field type and `castDefault` re-casts via `Literal.to`, a default incompatible with a promoted type fails loudly (Types.java:900-902) rather than silently producing wrong values.
+
+## 10. Physical-vs-logical type drift in readers
+
+**Failure:** when a logical type maps to a different physical type (e.g. decimal backed by fixed binary in Arrow vectors), a default typed for the logical type can't be applied to the physical vector.
+
+**Guard:** `VectorizedArrowReader` explicitly drops the defaults when rebuilding the physical type — `"drop initialDefault/writeDefault: they are typed for the logical (decimal) type and cannot be cast to the underlying physical type"` (VectorizedArrowReader.java:255-259).
+
+## Guarding gap worth highlighting (honest caveat)
+
+The core layer hard-guards everything *except* the writer-side application of the write default. The spec requires a writer to fail if a required field has no write default and isn't supplied (spec.md:334), but that enforcement lives in engine layers (Spark's `TestSparkDefaultValues` exercises `INSERT ... VALUES (1, DEFAULT, ...)`), not in `SchemaUpdate`/`Schema` core — so correctness depends on each engine enforcing it, and a lenient engine could silently ship nulls for required defaulted columns. That's a distribution of responsibility, not a core bug, but it's the weakest link in the chain.
+
+Also note the `{}` empty-struct default (a real spec feature for nested structs, spec.md:338-347) is not representable through `castDefault`'s blanket nested-type rejection (Types.java:896-898) — the core models nested defaults at the leaf-field level only. If you need that behavior you'd be reading a divergence between the spec and this implementation.

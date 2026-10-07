@@ -1,0 +1,18 @@
+{
+ "label": "day1-2",
+ "wall_s": 89.7,
+ "server": {
+  "prompt_tokens_total": 853851.0,
+  "generation_tokens_total": 3675.0,
+  "prefix_cache_hits_total": 819968.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 19.3,
+  "time_to_first_token_seconds_count": 10.0,
+  "request_prefill_time_seconds_sum": 18.0,
+  "request_decode_time_seconds_sum": 67.4
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "toreTableOperations.java:128-129) \u2014 its instance now points at the new metadata. Back in `SnapshotProducer.commit`, after the loop it refreshes and cleans up (SnapshotProducer.java:553-564), then notifies listeners.\n\n**The loser** surfaces `CommitFailedException` inside `Tasks.runTaskWithRetry` (Tasks.java:419). Because it's a retryable type (matched at Tasks.java:440-448), `Tasks` does NOT throw it; it sleeps and loops (Tasks.java:462-477) into **attempt 2**.\n\n**Attempt 2 (the loser):**\n\n- Loops back to `apply()` (SnapshotProducer.java:500). `apply()` calls `refresh()` (line 478) \u2192 sets `base` to the now-current metadata **V1 (the winner's new version)** \u2014 this is how the loser picks up W1's committed state.\n- `apply()` now computes its change against the latest snapshot: `SnapshotUtil.latestSnapshot(base, targetBranch)` (line 297) returns the winner's snapshot as the new parent; the new snapshot's `parent-snapshot-id` and next `sequence-number` (line 299-300) are derived from that fresh base. The loser also gets a fresh manifest list (line 306, unique path line 622-633).\n- Rebuilds the metadata update on the current base and calls `taskOps.commit(base=V1, ...)` (line 533).\n- On the DB, `validateMetadataLocation` (JdbcTableOperations.java:200) now matches V1, so `updateTable` flips the pointer to the loser's new metadata \u2192 commit succeeds.\n\nSo both writers end up committed, linearly: W1 \u2192 V1, W2 \u2192 V2 \"on top of\" V1, W2's snapshot parented by W1's. Neither writer is lost; the retry loop (SnapshotProducer.java:489-534 + Tasks.java:406-480) turns the lost race into a rebase-and-retry.\n\n## Key points to retain\n\n- Atomicity comes from the single metadata-pointer swap being conditional (check-and-put in a metastore, one-shot rename in HDFS), checked against the exact base the writer loaded.\n- `onlyRetryOn(CommitFailedException.class)` (SnapshotProducer.java:496) is what distinguishes a \"lost the race, try again on fresh state\" failure from a non-transient error, which is rethrown immediately (Tasks.java:440-451).\n- Each retry fully rebuilds the snapshot via `apply()` against the refreshed base (SnapshotProducer.java:500, 478), so the loser's change is re-based onto the winner's, and sequence numbers/snapshot IDs are regenerated \u2014 no partial state leaks between attempts.\n- All the expensive work (writing manifests/manifest-lists) happens before the conflict*;* the atomic pointer swap is the only synchronized point, and it's cheap (O(1) on the metadata store), which is what keeps concurrent-writer throughput high.\n\nLine citations for the core loop: SnapshotProducer.java:489-534 (commit + retry config), 478 (refresh in apply), 500 (apply per attempt), 533 (atomic commit); Tasks.java:406-480 (retry logic, 440-451 only-retry-on, 462-477 backoff); BaseMetastoreTableOperations.java:109-135 (commit entry + stale check), JdbcTableOperations.java:103-163 (check-and-put and CommitFailedException on lost race), HadoopTableOperations.java:131-172 (rename commit).\n",
+ "stderr": ""
+}

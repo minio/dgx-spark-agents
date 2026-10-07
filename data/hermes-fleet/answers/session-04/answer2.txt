@@ -1,0 +1,42 @@
+I have everything I need. Here's the explanation.
+
+## What the implementation does
+
+`ManifestMergeManager<F>` (core/src/main/java/org/apache/iceberg/ManifestMergeManager.java) is an abstract base class that merges a list of manifest files into fewer, larger manifests. It's invoked from `MergingSnapshotProducer` (the commit/record-flush path) at `MergingSnapshotProducer.java:1065-1067`, which runs both a data-file merge manager and a delete-file merge manager over the unmerged manifests. Both are private subclasses: `DataFileMergeManager` (MergingSnapshotProducer.java:1269) and `DeleteFileMergeManager` (MergingSnapshotProducer.java:1333).
+
+The core algorithm lives in `mergeManifests` (ManifestMergeManager.java:79-94), `mergeGroup` (139-185), and `createManifest` (187-239):
+
+1. `mergeManifests` bails if merging is disabled or there's only one manifest (79-83).
+2. `groupBySpec` (129-137) groups manifests by `partitionSpecId`, keeping groups ordered by spec id descending.
+3. `mergeGroup` (139-185) runs a `ListPacker` with a "lookback of 1" (145-146) to bin-pack manifests up to `targetSizeBytes` without reordering them, processing bins in parallel but preserving bin order in the output (148-184).
+4. `createManifest` (187-239) rewrites each bin of 2+ manifests into one new manifest by reading each source manifest and writing entries via `writer.add/delete/existing`.
+
+## How it follows the spec (with file:line citations)
+
+**1. Fast append + letting merges clean up later — the whole rationale.**
+The spec says appends can add a new manifest rather than rewriting existing ones ("fast append", spec.md:978-980) and that this accumulates manifests that a later merge can consolidate. The implementation is the flip side: when a bin has exactly one manifest it rewrites nothing (`bin.size() == 1` returns the manifest as-is, ManifestMergeManager.java:164-168), and the first (in-memory, just-appended) manifest is only merged if there are enough to bother with (`bin.contains(first) && bin.size() < minCountToMerge`, ManifestMergeManager.java:175). So the fresh appended manifest is left alone when it's small — the "under-filled first manifest is merged the next time" (ManifestMergeManager.java:141-145) — matching the spec's split between cheap appends and occasional consolidation.
+
+**2. One manifest per partition spec.**
+The spec requires a manifest to store files for a single partition spec because "a manifest file's schema is based on its partition spec" (spec.md:660, 666). The implementation enforces exactly that at merge time by grouping only same-spec manifests together before packing/merging — `groupBySpec` keyed on `partitionSpecId` (ManifestMergeManager.java:129-137, 88), and each merged output is written by a writer built for that single spec (`newManifestWriter(spec(specId))`, ManifestMergeManager.java:195, resolved in the subclass via `ops().current().spec(specId)`, MergingSnapshotProducer.java:1281-1283). Preserving the grouping order by spec id (MergingSnapshotProducer.java:133) keeps spec-consistent output.
+
+**3. Immutable manifests + reuse to avoid rewriting slow-changing metadata.**
+The spec: "Manifest files are reused across snapshots to avoid rewriting metadata that is slow-changing" (spec.md:87) and "Large tables can be split across multiple manifests ... to reduce the cost of rewriting a manifest" (spec.md:982). The implementation reuses any manifest that ends up alone in a bin — it's passed through untouched (ManifestMergeManager.java:164-168) rather than rewritten — and merges are cached in `mergedManifests` so a retried commit can reuse the same merged file instead of rewriting (ManifestMergeManager.java:188-193, 230).
+
+**4. Manifest-entry status semantics (ADDED/DELETED/EXISTING).**
+This is the most direct spec-conformance point. The spec defines entry status as `0: EXISTING, 1: ADDED, 2: DELETED`, where "Deletes are informational only and not used in scans" (spec.md:691), the snapshot id in an entry records "where the file was added, or deleted if status is 2" (spec.md:692), and a file added in this snapshot keeps status ADDED while carries into the new manifest (spec.md:699-700). `createManifest` applies this per entry (ManifestMergeManager.java:202-215):
+- `Status.DELETED` entries are suppressed unless the file was deleted by *this* snapshot (`entry.snapshotId() == snapshotId()`, ManifestMergeManager.java:203-208) — keeping only this snapshot's logical deletes, exactly as the spec's "used to track additions and deletions" (spec.md:691).
+- Entries `ADDED` in this snapshot stay `ADDED` (ManifestMergeManager.java:209-211).
+- Everything else (older ADDED, and EXISTING) is rewritten as `EXISTING` (ManifestMergeManager.java:212-215), preserving persisted sequence numbers (`writer.existing(entry)` → `wrapExisting`, ManifestWriter.java:190-192).
+
+**5. Sequence-number and data-sequence-number inheritance.**
+The spec says manifests track the sequence number when a file was added, and that existing files written into a new manifest must carry their original (non-null) sequence numbers rather than inherit (spec.md:928-935, especially "When writing an existing file to a new manifest ... the data and file sequence numbers must be non-null and set to the original values"). This is why the merge uses `writer.existing(entry)` (ManifestMergeManager.java:214) — `wrapExisting` preserves the entry's data and file sequence numbers (ManifestWriter.java:184-188, 190-192) — while genuinely new adds in this snapshot use `writer.add(entry)` which reuses `snapshotId` and the as-yet-unassigned data sequence number (ManifestWriter.java:165-167). This is precisely the "write the manifest once, inherit the sequence number at read time" behavior the spec describes (spec.md:107, 930-937).
+
+**6. Manifest-list summary metadata enables skipping — irrelevant to the merge, but why it doesn't break scans.**
+The spec uses manifest-list summaries (file counts, partition bounds) so scans can skip manifests (spec.md:1005, 1057) and notes the merge-relevant `manifests-created` / `manifests-kept` / `manifests-replaced` summary fields (spec.md:2116-2118). The implementation tracks replaced manifests for exactly that accounting: `replacedManifestsCount` increments per replaced manifest (ManifestMergeManager.java:230-236, 104-106), and the producer feeds it into the `replace`-operation summary (MergingSnapshotProducer.java:1069-1070). The merge also preserves partitioning and bounds when writing (`writer.toManifestFile()` builds summaries via `stats.summaries()`, ManifestWriter.java:241), so merged manifests keep the skip-pruning the spec relies on (spec.md:1027-1043).
+
+**7. Concurrency / retry safety.**
+The spec's optimistic concurrency requires that a retried commit be able to re-apply cleanly and that failed/cleaned-up files not leak (spec.md:91-99). The merge manager handles this in two ways that map to the spec: it caches merge results per bin so a retry reuses them (ManifestMergeManager.java:188-193, 230), and `cleanUncommitted` deletes any merged manifest that was never committed (ManifestMergeManager.java:108-127). Sequence-number inheritance (spec.md:107, 937) is what allows that cache to be reused on retry without rewriting files.
+
+**Caveat / boundary.** The spec never prescribes the merge *policy* — packing thresholds, the lookback of 1, `minCountToMerge`, `targetSizeBytes`. Those tuning values are implementation choices in `ManifestMergeManager` (e.g. ListPacker with lookback 1, ManifestMergeManager.java:142-146) driven by table properties, not spec requirements. What the spec does require — single-spec manifests, immutable/reusable manifests, correct entry status and sequence-number propagation, and scan-skippable summaries — is precisely what the merge manager preserves. Everything I cited above is where it does so.
+
+Note: I did not find a class literally named `ManifestMerger.java` in the repo — the merge logic lives in `ManifestMergeManager` itself plus the `ManifestWriter`/`ManifestReader` it calls. If you want, I can trace `ManifestFiles.read` / the entry-status projection further, but the core merge path is fully covered above.

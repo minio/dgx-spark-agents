@@ -1,0 +1,42 @@
+I've read format/spec.md end to end (all 2,153 lines). Here's what the spec says about table encryption.
+
+## What the spec specifies for table encryption
+
+Encryption support is a v3+ feature (it appears in the v3 capability list). The design is deliberately minimal — the spec defines where key metadata lives, but delegates the actual crypto algorithm, key management, and cipher to the implementation and the table's KMS provider. Concretely:
+
+**1. `encryption-keys` (table metadata, table metadata JSON)**
+A list of encryption keys in table metadata. Each key is a struct with:
+- `key-id` (required string) — identifier of the key
+- `encrypted-key-metadata` (required string) — the encrypted key and metadata, base64 encoded
+- `encrypted-by-id` (optional string) — the ID of the key used to encrypt/wrap `key-metadata`
+- `properties` (optional string map) — "additional metadata used by the table's encryption scheme"
+
+The spec notes that the format of `encrypted-key-metadata` is determined by the table's encryption scheme and "can be a wrapped format specific to the table's KMS provider."
+
+**2. `key-id` (snapshot)**
+An optional field on each snapshot giving "the ID of the encryption key that encrypts the manifest list key metadata." So each snapshot points to which key was used.
+
+**3. `key_metadata` (manifest list `manifest_file` entry)**
+Optional binary — "implementation-specific key metadata for encryption." So the manifest list can carry its own key metadata.
+
+**4. `key_metadata` (data/delete file entry in manifests)**
+Optional binary on the `data_file` struct — "implementation-specific key metadata for encryption."
+
+**5. `key-metadata` (table statistics / Puffin metadata)**
+Base64-encoded implementation-specific key metadata for encryption on table statistics files.
+
+That's essentially the whole spec surface for encryption.
+
+## Why it's designed this way
+
+- **The spec stores key references and metadata, not keys or algorithms.** Every field is a `key-id` (an identifier) or opaque `key_metadata` bytes. The actual AES key material, the cipher mode/scheme, and how keys are wrapped live outside the table format — in the KMS and the reader/writer implementation. This is why the "format of encrypted key metadata" is explicitly said to be implementation/KMS-specific.
+
+- **Envelope encryption, end to end.** The pattern is clear: table metadata points to a wrapping key (`encrypted-by-id` wraps the data key stored in `encrypted-key-metadata`), snapshots and manifest lists carry their own `key_metadata`/`key-id`, and each data file carries per-file `key_metadata`. This lets the actual data key (which encrypts file contents) be distinct from and wrapped by a master key held in the KMS — so Iceberg never has to handle raw key material, and key rotation can be done at the KMS without rewriting table files.
+
+- **Delegation, not prescription.** Encryption is one of those areas where the "right" scheme depends on the deployment (which KMS, regional keys, compliance rules). Rather than standardize a cipher, the spec standardizes only the plumbing — where to record that a key exists and which key a file/snapshot used — and leaves the scheme to the implementation. This keeps Iceberg engine-agnostic and KMS-agnostic, consistent with its goal of not baking in cloud-specific or vendor-specific assumptions.
+
+- **The metadata‑tree design keeps files immutable.** Iceberg data and metadata files are immutable, so per-file `key_metadata` must be written alongside each file at write time, and the reader resolves keys through the snapshot's `key-id` and the table's `encryption-keys`. The `key-metadata` on table statistics follows the same model for the optional Puffin statistics files.
+
+So in short: the spec adds just enough structure (where keys are listed, which key a snapshot/file uses, opaque per-file metadata) to let engines encrypt data files and their metadata, but explicitly pushes the actual encryption/wrapping scheme, key format, and KMS integration onto the implementation — treating encryption as a provider-specific concern rather than a standardized Iceberg algorithm.
+
+Note that encryption support is part of the formally adopted v3 spec (v3 is "complete and adopted"), so this is a finalized, named feature rather than an in-progress one.

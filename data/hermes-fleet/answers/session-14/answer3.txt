@@ -1,0 +1,62 @@
+I've now read the pruners that actually consume the metrics (`InclusiveMetricsEvaluator`, `InclusiveEvalVisitor`), plus `Conversions`, `Metrics`, `MetricsConfig`, `MetricsModes`, `FieldMetrics`, and `MetricsUtil`. Here are the edge cases and failure modes, each paired with how the code guards against it.
+
+## 1. The cardinal sin: dropping a file that could match
+
+The worst failure mode for any metric is a false "cannot match." Every pruning decision is guarded to only return `ROWS_CANNOT_MATCH` when it's provable. Look at the shape of each predicate: they all first check `containsNullsOnly(id) || containsNaNsOnly(id)` before using bounds (InclusiveEvalVisitor.java:160, 187, 214, 235, 256, 300), then refuse to prune when the bound is absent or unreliable:
+
+```
+if (null == lower || NaNUtil.isNaN(lower)) { return ROWS_MIGHT_MATCH; }
+```
+(InclusiveEvalVisitor.java:164-168, 191-195, 311-315)
+
+The guard is "if I don't know the upper/lower bound, I must NOT skip." This is the spec's `lower_bounds`/`upper_bounds` being optional (spec.md:735-736) turned into a correctness rule: unknown bound => keep the file.
+
+## 2. NaN is a special poisoning case
+
+The class Javadoc documents a real ORC failure (InclusiveMetricsEvaluator.java:43-47): ORC reports NaN for BOTH bounds when the first value is NaN, even if non-NaN data exists. If you trusted that, a range predicate would wrongly drop files with real data. The guard: `lt`/`ltEq`/`eq`/`in` explicitly bail to `ROWS_MIGHT_MATCH` when the bound is NaN (InclusiveEvalVisitor.java:166-167, 193, 261, 313). This is extra rigor beyond the spec, which merely says NaNs are not permitted as bounds (spec.md:753) — the code assumes the writer violated that and refuses to prune.
+
+## 3. Missing counts vs. present-but-zero counts
+
+`mayContainNull` (InclusiveMetricsEvaluator.java:100-102) returns true if `nullCounts == null`, the id is missing, OR the count is non-zero. So a missing `null_value_counts` entry means "might contain null" => don't prune. Same for `mayContainNaN` (:114-116). This mirrors the spec's rule that a missing metric is equivalent to "unknown" (spec.md:767). The evaluator treats "no data" and "0" as different states — only an explicit count of 0 allows pruning.
+
+## 4. `notEq` / `notIn` cannot use normal bounds
+
+The Javadoc at InclusiveEvalVisitor.java:283-285 and 334-336 explains: `col != X` with bounds (X, Y) can't be answered because X might not actually appear in the column. The guard is `uniqueValue` (:437-459): it only prunes when the whole file provably holds a single value — no nulls, no NaN, and lower bound equals upper bound (and for float/double, no NaN at all, :450-452). Otherwise it conservatively returns `ROWS_MIGHT_MATCH`. This is defense against misinterpreting bounds as value-sets.
+
+## 5. Bounds survive type promotion but must be decoded by original width
+
+After `int -> long` promotion, a bound written as 4 bytes must not be read as 8. `Conversions.fromByteBuffer` guards this by checking remaining bytes (Conversions.java:175-178, 182-187): a short remaining buffer is widened (`(long) tmp.getInt()`, `(double) tmp.getFloat()`), exactly the spec's bounds-length inference table (spec.md:367-379). Without this, every promoted column would either throw or produce garbage bounds => mass false pruning.
+
+## 6. Negative / unknown record counts
+
+`eval` (InclusiveMetricsEvaluator.java:78-96): a record count of 0 means the file can't match (:79-81), but a negative count (the code never parsed record counts from imported Avro, :83-88) returns `ROWS_MIGHT_MATCH` — missing metadata never triggers pruning.
+
+## 7. Bounds for non-order-preserving transforms
+
+`transformLowerBound`/`transformUpperBound` (InclusiveEvalVisitor.java:485-503) only derive a transformed bound when `transform.preservesOrder()` — for `bucket[]`, `truncate`, etc. that don't preserve order, they return null (:492, :502), so the file is never pruned on a transformed predicate. Pruning on a non-injective transform with a raw bound would be unsound; the guard refuses.
+
+## 8. Wide `in`/`notIn` lists
+
+`in` with more than `IN_PREDICATE_LIMIT = 200` literals (InclusiveEvalVisitor.java:29, 306-309) refuses to evaluate and returns `ROWS_MIGHT_MATCH`. This guards against both CPU blowup and edge cases where the bounds check becomes unreliable at scale; correctness (never prune) is preserved.
+
+## 9. `isNull`/`notNull` with transforms and variant
+
+`isNull` (InclusiveEvalVisitor.java:92-104) only prunes when the term is non-null-preserving (isNonNullPreserving, :506-517) — for a non-order-preserving transform or a variant extract it can't claim "no nulls," so it won't prune. `startsWith`/`notStartsWith` (:348-431) do their own truncated-prefix comparison and bail on any unknown bound, again never over-pruning.
+
+## 10. Column sizes / counts mismatch for delete files
+
+The spec requires bounds for *all deleted rows* or omit them (spec.md:769). If a writer under-reports delete metrics, the delete-file pruning (same evaluator) could skip a delete file that actually overlaps scanned rows — the classic "delete not applied => phantom rows" bug. The code's defense is structural, not per-check: `copyWithoutFieldCountsAndBounds` (MetricsUtil.java:71-83) removes stats rather than potentially-collapsing them, and every prune path treats a missing entry as "keep the file" (item 3). So an omitted-but-partial metric degrades to reading the delete file, never skipping a needed one.
+
+## 11. Config drop / disabled metrics must not corrupt
+
+`MetricsConfig` (MetricsConfig.java:263-302) resolves each column to a mode; when a column's metrics aren't collected, the corresponding map entry is simply absent (`copyWithoutKeys` returns null on empty, MetricsUtil.java:85-97). Because the evaluator keys on "entry present AND value says prune" rather than "able to prune", dropping metrics via config only reduces pruning power — it never introduces a wrong answer.
+
+## 12. NaN/negative-zero order in bounds
+
+The spec mandates `-0.0` before `+0.0` and no NaN bounds (spec.md:753, 1043). If a writer violates this, `uniqueValue` and the NaN checks (items 2, 4) catch the commonly-dangerous case (NaN). The `-0.0`/`+0.0` ordering is a writer contract; the readers' float/double equality via `Comparators` keeps consistency, though the reference evaluator relies on writer conformance here.
+
+---
+
+## Net summary of the design
+
+Almost every guard collapses to a single principle: **never return `ROWS_CANNOT_MATCH` unless the metric is present, non-NaN, and logically conclusive; on any doubt, return `ROWS_MIGHT_MATCH` (InclusiveEvalVisitor.java:31-32, 164-168, etc.).** The failure modes the code defends against hardest are the ones that would produce wrong query results: NaN-poisoned bounds (2), missing counts (3), promoted-type decode (5), and non-order-preserving transforms (7). The remaining spec violations (e.g. incorrect bounds or delete-metric undercounts) are guarded only by "omit rather than lie" conventions in the writer side (`MetricsConfig`/`copyWithoutKeys`), which is exactly the posture the spec's optional-metrics design intends: incorrect metrics are the writers' contract violation, but the readers are built so that the *absence* of metrics never causes a skip.

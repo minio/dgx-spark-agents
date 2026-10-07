@@ -1,0 +1,21 @@
+Here are ten briefing points for a new contributor, each with a concrete file:line to start from.
+
+1. Table metadata is a single JSON file describing one version of the table. Read the whole parser before anything else: core/src/main/java/org/apache/iceberg/TableMetadataParser.java:165 (toJson) and :341 (fromJson) bracket the full field set.
+
+2. The metadata file is immutable — every change creates a new file and swaps a pointer. The immutable model is built in core/src/main/java/org/apache/iceberg/TableMetadata.java:305 (constructor validates specs/sort-orders/format).
+
+3. All table state lives in memory as a TableMetadata object; `BaseTable` reads everything from it. core/src/main/java/org/apache/iceberg/BaseTable.java:124 (`schema()` → `ops.current().schema()`).
+
+4. Snapshots are embedded in the metadata JSON, not separate files. core/src/main/java/org/apache/iceberg/TableMetadataParser.java:246 (SNAPSHOTS array written inline) and SnapshotParser.java:124 (fromJson).
+
+5. Each snapshot points at a manifest-list, which points at manifests, which list files — the three-tier tree. core/src/main/java/org/apache/iceberg/SnapshotParser.java:179 (manifest-list vs embedded manifests).
+
+6. Version-conditional fields are the trickiest part: v1 uses legacy single `schema`/`partition-spec`, v2+ requires lists. core/src/main/java/org/apache/iceberg/TableMetadataParser.java:182 (v1 schema) and :369 (schemas array).
+
+7. The format version gates everything; the reader must reject anything newer than it supports. core/src/main/java/org/apache/iceberg/TableMetadata.java:58 (SUPPORTED_TABLE_FORMAT_VERSION = 4) and TableMetadataParser.java:345 (reject on read).
+
+8. Validation happens in the constructor, not just the parser — dangling refs, missing current snapshot, bad logs all fail here. core/src/main/java/org/apache/iceberg/TableMetadata.java:651 (validateCurrentSnapshot) and :868 (validateRefs).
+
+9. The commit/atomic-swap is deliberately NOT in the parser — it lives in TableOperations (check-and-put / atomic rename). core/src/main/java/org/apache/iceberg/BaseTable.java:97 (`refresh()` → `ops.refresh()`).
+
+10. Engines consume it by loading once, pinning a snapshot, and planning through it; Spark does this in spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/SparkTable.java:390 (determineLatestSnapshot) and pinning in SparkScanBuilder.java:353.

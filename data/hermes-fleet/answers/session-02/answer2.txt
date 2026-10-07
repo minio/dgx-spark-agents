@@ -1,0 +1,35 @@
+I have what I need. Here's how `SchemaUpdate` (and the code it calls) implements the spec, with file:line citations.
+
+1. Evolution applies to a copy; the new schema gets its own ID and becomes current
+
+`SchemaUpdate` doesn't mutate the original schema. It accumulates pending changes and `apply()` rebuilds a new schema (SchemaUpdate.java:466-470), then `commit()` wraps that new schema into new table metadata and atomically swaps it in (SchemaUpdate.java:472-476). The metadata side is in `TableMetadata.updateSchema` -> `Builder.setCurrentSchema` -> `addSchemaInternal` (TableMetadata.java:603-607, 1093-1096). That method assigns a fresh ID via `reuseOrCreateNewSchemaId` (highest id + 1) (TableMetadata.java:1658-1669), appends the schema to the table's `schemas` list, emits an `AddSchema` metadata update for REST, and sets `current-schema-id` to it (TableMetadata.java:1646-1655). This mirrors the spec's "added to the table's list of schemas, set as current" (spec.md:355). It also bumps `last-column-id` to `max(lastColumnId, highestFieldId)` (TableMetadata.java:605), matching the spec's guarantee that new IDs stay unused (spec.md:1152). It must be monotonically increasing (TableMetadata.java:1615-1618).
+
+2. Adding a column assigns fresh IDs and defaults
+
+`internalAddColumn` (SchemaUpdate.java:113-187): looks up the parent struct (descending into map value / list element for nested adds, :128-134), rejects duplicates (:145-149), enforces that a required column needs a default unless incompatible changes are allowed (:160-163), then assigns fresh IDs in order via `assignNewColumnId()` (:166, :478-482) and applies `TypeUtil.assignFreshIds` to all nested fields (:179). TypeUtil's `AssignFreshIds` visitor walks the type and reassigns every id (TypeUtil.java:301-303). The new field is built carrying both `initial-default` and `write-default` (SchemaUpdate.java:174-183) — matching the spec rule that both defaults are set on add (spec.md:391-392) and that adding an ID allocates a new one per field and nested field (spec.md:385). `allowIncompatibleChanges()` (:94-97) gates the strict path.
+
+3. Delete, rename, update (type/doc/default), and move
+
+- deleteColumn (:190-202) records the id and rejects conflicts (can't delete a column that also has additions/updates).
+- renameColumn (:205-227) changes the name but keeps the id, and merges with a pending update — exactly the spec's "rename must change the name, but not the field ID" (spec.md:385).
+- updateColumn (:273-298) allows only promotion: it calls `TypeUtil.isPromotionAllowed` and refuses anything else (:285-290). TypeUtil's implementation (api/TypeUtil.java:471-497) encodes precisely the spec's promotion table (spec.md:357-365): int->long, float->double, decimal(P,S)->decimal(P',S) with equal scale and P' >= P; everything else (including date->timestamp) returns false. It even carries a comment warning that partition compatibility must be preserved — the spec's reason for restricting promotions involving partition sources (spec.md:381).
+- updateColumnDefault (:322-343) converts the literal to the field type and updates only `write-default`, leaving `initial-default` untouched — matching "write-default may change" vs "initial-default cannot change" (spec.md:391-392).
+- moveFirst/moveBefore/moveAfter (:346-375) record moves; `moveFields` (:783-818) reorders within the same struct. Moving across structs is rejected (:439-444).
+
+4. Reordering is ID-based, so rename/reorder can't corrupt reads
+
+The ApplyChanges visitor (SchemaUpdate.java:590-758) rebuilds the struct by field id. Renames are applied via `NestedField.from(field).withName(...)` and the fields retain their ids; projection stays correct because Iceberg reads by id, not name or position (spec.md:401). The `struct` visitor (:624-654) preserves unchanged fields by identity and only rebuilds when something actually changed.
+
+5. Nested/structural rules from the spec are enforced
+
+The spec forbids regrouping nested structs and evolving primitives to structs (spec.md:387). `SchemaUpdate` reflects this by only ever adding/moving fields within existing structs and by type-promoting primitives — it never has an operation that folds/unfolds a struct or turns a primitive into a struct. It also blocks illegal map-key operations: `map()` throws if you try to delete/update/add-fields/alter map keys (:714-725), and `list()` forbids deleting the element type (:694-696) — the spec's map-key-is-required / no-map-or-list-nesting rules (spec.md:242, 437).
+
+6. Identifier fields follow spec constraints and deletion rules
+
+`identifierFieldNames` is tracked across rename (:221-224) and settable via `setIdentifierFields` (:384-387). `applyChanges` validates that no identifier field (or a nested ancestor struct that contains one) is being deleted (SchemaUpdate.java:544-563), then re-validates each identifier against the final schema via `Schema.validateIdentifierField` (:584-585). That validator (api/Schema.java:163-205) enforces the spec's identifier rules (spec.md:433-437): must exist, be a primitive, be required, and not be float/double; its parent chain must be required structs (no nesting in maps/lists/optional structs).
+
+7. Commit conflict and side-effect handling
+
+`commit()` calls `ops.commit(base, update)` (SchemaUpdate.java:475), so a schema change fails and retries if the base metadata moved — the spec's rule that schema updates validate the schema hasn't changed between base and current (spec.md:1319). It also updates dependent metadata as side effects (SchemaUpdate.java:484-531): refreshes the `schema.name-mapping.default` table property to reflect new/renamed fields via `MappingUtil.update` (:490-491) — the spec's name-mapping fallback for projection (spec.md:406-428) — and rewrites column-scoped metrics/bloom/parquet-stats properties when columns are deleted or renamed (:508-527).
+
+Where the implementation goes a little beyond the spec text: nullability changes (`requireColumn`/`makeColumnOptional`, :229-270) are gated on `allowIncompatibleChanges` since the spec doesn't define optional->required as a standard evolution. Otherwise it's a faithful, line-for-line mapping of the spec's evolution model to code.

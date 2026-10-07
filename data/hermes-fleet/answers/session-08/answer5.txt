@@ -1,0 +1,23 @@
+Deletion vectors — a 10-point orientation, each with the first place to read.
+
+- 1. The spec contract. DVs encode deleted rows of one data file as a position bitmap, stored as a Puffin `deletion-vector-v1` blob; at most one DV per data file, and it must absorb older position deletes. Read format/spec.md:1375-1389 first — this is the source of truth every class below implements.
+
+- 2. What the format looks like. Scan planning/application rules: a DV applies only to its `referenced_data_file`, in the same partition, with data seq <= DV seq; a DV lets readers ignore matching position delete files. format/spec.md:1075-1083.
+
+- 3. The interface you'll code against. `DVFileWriter` (delete a file+pos, merge a whole index, return `DeleteWriteResult`). Children of this are what engines call. core/src/main/java/org/apache/iceberg/deletes/DVFileWriter.java:28-62.
+
+- 4. The writer itself. `BaseDVFileWriter` groups deletes by data-file path, writes one Puffin file with one blob per file, merges previous deletes, and records the per-blob offset/length so a reader can fetch it directly. core/src/main/java/org/apache/iceberg/deletes/BaseDVFileWriter.java:114-161 (close) is the heart.
+
+- 5. The blob metadata. Each DV blob advertises `type=DV_V1`, its referenced data file, and its cardinality; snapshot/sequence are deferred (inherited) at write time. core/src/main/java/org/apache/iceberg/deletes/BaseDVFileWriter.java:199-212.
+
+- 6. The in-memory representation. `PositionDeleteIndex` is the abstraction (`delete`, `merge`, `isDeleted`, `forEachInRange`, `cardinality`, `serialize`). core/src/main/java/org/apache/iceberg/deletes/PositionDeleteIndex.java:28-144.
+
+- 7. The bitmap storage. `RoaringPositionBitmap` = a 64-bit position split into a 32-bit "key" + sub-position, as an array of 32-bit Roaring bitmaps — the spec's split-key design. core/src/main/java/org/apache/iceberg/deletes/RoaringPositionBitmap.java:33-80.
+
+- 8. Serialization / integrity. The on-disk wrapper writes a magic number and CRC over little-endian bitmaps; `deserialize` validates CRC, magic, blob length vs `contentSizeInBytes`, and cardinality vs `recordCount`. core/src/main/java/org/apache/iceberg/deletes/BitmapPositionDeleteIndex.java:116-165.
+
+- 9. Reading a DV at query time. `DVUtil.readDV` does a single random-access read at `contentOffset` for `contentSizeInBytes`, then deserializes. core/src/main/java/org/apache/iceberg/DVUtil.java:52-67.
+
+- 10. How an engine consumes it. Spark's vectorized reader turns the DV into a live-row mapping by traversing the batch's contiguous position range once (`forEachInRange`), or probing per row when equality deletes coexist. spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/data/vectorized/ColumnarBatchUtil.java:58-109.
+
+Suggested reading order: 1 → 2 → 6/7 → 4/5 → 8 → 9 → 10. Writer-side first (4, 5) if you're touching writes; reader-side first (9, 10) if you're touching query execution.

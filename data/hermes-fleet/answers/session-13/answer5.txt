@@ -1,0 +1,14 @@
+Here's the mental model, in the order to read it:
+
+- Scan planning starts at `DataTableScan.doPlanFiles()` — it pulls the snapshot's data and delete manifests, then builds a `ManifestGroup` with the filter, schema/spec maps, and `ignoreDeleted`. Start here. — core/src/main/java/org/apache/iceberg/DataTableScan.java:64
+- `ManifestGroup.planFiles()` is the orchestrator: it builds residual/delete/task-context caches and fans out per-manifest work (parallel if an executor is set). — core/src/main/java/org/apache/iceberg/ManifestGroup.java:177
+- Manifests are skipped before opening using the manifest list's per-partition summaries: `ManifestEvaluator.eval()` returns "cannot match" only on proof, otherwise "might match." — api/src/main/java/org/apache/iceberg/expressions/ManifestEvaluator.java:75
+- Scan predicates become partition predicates via the inclusive projection, computed per manifest's own spec — this is what decouples queries from partition layout. — api/src/main/java/org/apache/iceberg/expressions/Projections.java:90 (see the guarantee at :37)
+- Files inside a manifest are filtered by column metrics — `InclusiveMetricsEvaluator.eval()` against value/null/NaN counts and bounds; missing stats resolve to "might match." — api/src/main/java/org/apache/iceberg/expressions/InclusiveMetricsEvaluator.java:66
+- The per-file operator logic lives in `InclusiveEvalVisitor` — every `<`, `=`, `in`, etc. prunes only on contradiction with stored bounds; null/NaN bounds and non-order-preserving transforms all bail to might-match. — api/src/main/java/org/apache/iceberg/expressions/InclusiveEvalVisitor.java:157
+- `ManifestReader.entries()` ties it together per manifest: evaluates the partition predicate + metrics + partition-set, filters DELETED entries, and (critically) defensively copies files because the Avro reader reuses containers. — core/src/main/java/org/apache/iceberg/ManifestReader.java:267
+- `DeleteFileIndex` selects the delete files that apply to each data file using sequence numbers and partition equality (equality = strictly-less + global-if-unpartitioned; position/DV = by path + seq <=). — core/src/main/java/org/apache/iceberg/DeleteFileIndex.java:158
+- Files get grouped into larger scan tasks for engines by `TableScanUtil.planTasks()` (split size/lookback/open-file-cost) — the layer Spark and Flink actually consume. — core/src/main/java/org/apache/iceberg/BaseTableScan.java:43
+- The entire design enforces one invariant: pruning only happens on proof of no-match; any uncertainty (missing/NaN stats, unknown transforms, unknown overlap) over-reads rather than under-reads. Wrong-answer bugs live in writers' bad bounds or container-reuse, not here. — format/spec.md:1061
+
+If you only read four things: DataTableScan.java:64 → ManifestGroup.java:177 → InclusiveEvalVisitor.java:157 → spec.md:1061.

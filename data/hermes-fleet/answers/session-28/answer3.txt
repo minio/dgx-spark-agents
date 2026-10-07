@@ -1,0 +1,58 @@
+Here are the file-IO edge cases and failure modes, and the guards against each, with citations.
+
+## 1. Which storage backend to use for a path
+Wrong scheme, or a scheme with no adapter. If the location parsing picked a bad class, I/O fails confusingly.
+
+Guard: `scheme()` takes the text before the first `:` (ResolvingFileIO.java:248-255); `implFromLocation()` maps it to a concrete impl or to the Hadoop fallback (ResolvingFileIO.java:235-237, map at :60-69). If even the fallback can't be loaded, the original exception is rethrown with the suppressed one attached so the real cause isn't lost (ResolvingFileIO.java:210-223). The loaded delegate must be a `DelegateFileIO` or load fails loudly (ResolvingFileIO.java:226-228). This is the "isolate the failure to the backend" guard — the core never hardcodes a backend.
+
+## 2. Writing over a file that already exists (immutability violation)
+The spec requires in-place, never-overwritten files (spec.md:125). Overwriting silently would corrupt data / lose the previous snapshot's file.
+
+Guard: `OutputFile.create()` is documented to throw `AlreadyExistsException` if the path exists (OutputFile.java:32-41). Hadoop impls do `fs.create(path, overwrite=false)` and surface `FileAlreadyExistsException` (HadoopOutputFile.java:72-80). S3 does an existence check first then throws `AlreadyExistsException` (S3OutputFile.java:62-68). The only way past this is the explicitly separate `createOrOverwrite()` (OutputFile.java:46-53; HadoopOutputFile.java:83-89) — used only where immutability doesn't apply.
+
+## 3. Deleting/throwing on a file that doesn't exist
+Delete failures on already-gone files are common during GC and should not abort the whole job.
+
+Guard: bulk delete treats `FileNotFoundException` as expected — it stops retrying on that class and doesn't count it as a failure (HadoopFileIO.java:178, :185-189). Reads map a missing file to `NotFoundException` rather than a raw IO error (HadoopInputFile.java:165-167; interface contract at InputFile.java:43-44), and `exists()` catches it and returns false instead of throwing (HadoopInputFile.java:236-242). S3's `exists()` path likewise normalizes to a boolean.
+
+## 4. Transient errors during deletes / writes
+Networks and object stores fail transiently; a single failure shouldn't fail the batch or leave files half-deleted.
+
+Guard: bulk delete runs under `Tasks.foreach` with the `iceberg.hadoop.delete-file-parallelism` worker pool, `retry(DELETE_RETRY_ATTEMPTS=3)`, `stopRetryOn(FileNotFoundException)`, and `suppressFailureWhenFinished` — failures are counted and surfaced as one `BulkDeletionFailureException` per batch, not thrown per file (HadoopFileIO.java:173-190; constants :51-54). Write-stream creation wraps `IOException` in `RuntimeIOException`/`UncheckedIOException` with the path in the message (HadoopOutputFile.java:78-79, :86-88; S3OutputFile.java:74-76).
+
+## 5. Stale / cached length after the file changes
+A file can be deleted or replaced after metadata cached its size; a cached length then becomes wrong.
+
+Guard: input files treat a known length as authoritative and skip the stats call they'd otherwise make — they only hit the FS lazily when length is unknown (HadoopInputFile.java:127-134 keeps provided length; :175-180 lazy stat only if `length == null`; S3InputFile.java:66-72 caches `getObjectMetadata().contentLength()` only when not already set). This mirrors spec's "O(1)" goal (spec.md:72) by avoiding an extra round-trip when the manifest already holds the size (FileIO.java:55 passes `file.fileSizeInBytes()`). The known caveat is documented: the cached value "may be stale if file was deleted" (S3InputFile.java:61-62). So the read path avoids extra I/O; the delete/GC path relies on idempotent deletes (guard #3) rather than trusting the cached length.
+
+## 6. A "plan" referencing a file that no longer exists on disk
+A live manifest can point at a data file that was deleted (corruption/race), and the table can't be read.
+
+Guard: `SupportsRecoveryOperations.recoverFile(path)` is the best-effort repair hook for exactly this — "repairing corrupted tables where there are reachable files missing from disk" (SupportsRecoveryOperations.java:21-35). S3FileIO implements it (S3FileIO.java:96). Iceberg's goal is that planning never requires enumerating the whole tree (spec.md:72), so a dangling reference is caught as `NotFoundException` at open time (HadoopInputFile.java:165-167) and is recoverable via this hook rather than a full rescan.
+
+## 7. Delegates not being configured after deserialization / sharing
+A delegate might lose its Hadoop conf or storage credentials (e.g. after Kryo serialization), causing auth or config failures even though the resolving wrapper looks fine.
+
+Guard: `io(location)` re-applies the conf if null and refreshes credentials if they differ on every fetch, under synchronization (ResolvingFileIO.java:166-184). On first load, the wrapper also passes credentials and conf into `CatalogUtil.loadFileIO`, which sets them before `initialize(properties)` (CatalogUtil.java:419-423, :434). Delegates are cached per scheme in a concurrent map (ResolvingFileIO.java:71, :187) so concurrent readers share one configured instance.
+
+## 8. Resource leaks (unclosed FileIO / streams)
+Leaked file handles or background workers accumulate over a long-running process.
+
+Guard: `close()` closes and clears every cached delegate exactly once via CAS (ResolvingFileIO.java:136-147), and `finalize()` warns with a creation stack trace if an instance was never closed (ResolvingFileIO.java:259-270). HadoopFileIO's delete worker pool is created via `newExitingWorkerPool` (HadoopFileIO.java:201-208). FileIO is `Serializable` and its delegates hold the conf in a `SerializableConfiguration` so they survive transport (FileIO.java:37; HadoopFileIO.java:57, :57-58).
+
+## 9. Bulk delete across mixed backends
+A GC pass may span objects on different storage (S3 + HDFS), and each backend deletes differently.
+
+Guard: `deleteFiles` partitions the batch by `io(location)` before delegating, so each backend gets only its own paths and its own bulk call (ResolvingFileIO.java:109-121).
+
+## 10. Partitioning/parallelism hazards
+Parallel deletes against a backend with limited burst can throttle or fail.
+
+Guard: HadoopFileIO sizes its delete thread pool from `Runtime.availableProcessors() * DEFAULT_DELETE_CORE_MULTIPLE` (HadoopFileIO.java:192-195), and batches are chunked at `BATCH_SIZE=100_000` in the resolver (ResolvingFileIO.java:55, :110) so bulk operations stay bounded.
+
+## Things the code deliberately does NOT defend against
+- Stale cached length at read time is accepted and documented (S3InputFile.java:61-62); the design routes around staleness by keeping deletes idempotent rather than by re-validating every read.
+- `recoverFile` is explicitly "best-effort," returning a boolean — recovery can fail and callers must handle `false` (SupportsRecoveryOperations.java:31-35).
+- Recursive deletes / listings on directory-style FS have documented semantic restrictions (SupportsPrefixOperations.java:30-32, 41-43).
+
+I focused on the FileIO layer as in your previous question. The commit/sequence-number/optimistic-concurrency edge cases (the atomic metadata swap) live outside this layer in table operations, not in ResolvingFileIO — I can trace those too if you want the full write-path failure-mode picture.

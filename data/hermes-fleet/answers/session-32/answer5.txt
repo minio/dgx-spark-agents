@@ -1,0 +1,14 @@
+Here are ten bullets, each pointing at the first place to read. Paths are repo-relative.
+
+1. Start with the user-facing contract: read options `start-snapshot-id` and `end-snapshot-id`, plus the explicit "only append, no replace/overwrite/delete" caveat. docs/docs/spark-queries.md:316
+2. What an "append" snapshot means in the spec: additive-only, no files removed — this is why the delta is a clean union. format/spec.md:969
+3. Fast append: an append writes a brand-new manifest instead of rewriting one, so the delta is already materialized as ADDED entries. format/spec.md:978
+4. The core entry point you actually call: `newIncrementalAppendScan()` and its `fromSnapshotExclusive`/`toSnapshot` refinements. core/src/main/java/org/apache/iceberg/BaseIncrementalScan.java:46
+5. The heart of the scan: `appendsBetween` keeps only APPEND snapshots in range, then `appendFilesFromSnapshots` filters to ADDED entries of the in-range snapshots. core/src/main/java/org/apache/iceberg/BaseIncrementalAppendScan.java:68
+6. How the range is walked and bounded: ancestry checks and the inclusive→exclusive conversion via parentId. core/src/main/java/org/apache/iceberg/BaseIncrementalScan.java:159
+7. The lineage walk behind the range (offset to the `ancestorsBetween` iterator). core/src/main/java/org/apache/iceberg/util/SnapshotUtil.java:210
+8. The anti-double-count guard: a manifest's own snapshotId keeps reused manifests from being rescanned in later snapshots. core/src/main/java/org/apache/iceberg/BaseIncrementalAppendScan.java:73
+9. Where manifests are skipped and files become scan tasks: `ignoreDeleted`, liveEntries, and the manifest-list added/existing counts. core/src/main/java/org/apache/iceberg/ManifestGroup.java:311
+10. How Flink drives it as a streaming loop (repeated incremental scans advancing a "last consumed snapshot" position) — the main reason incremental append scans exist. flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/source/enumerator/ContinuousSplitPlannerImpl.java:124
+
+Ordering: read 1–3 to get the semantics, 4–5 for the core flow, 6–8 for range/correctness, 9 for planning, 10 for the real-world streaming use case. Copy the paths into the repo search to jump to the exact line.

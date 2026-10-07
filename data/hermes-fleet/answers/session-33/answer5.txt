@@ -1,0 +1,23 @@
+Changelog scans in 10 bullets — each with the first file:line to open.
+
+1. What it is: an incremental read that diffs snapshots in a `(from, to]` range and emits each file-level change as a row with INSERT/DELETE (and, downstream, UPDATE) markers. Start at core/src/main/java/org/apache/iceberg/BaseIncrementalChangelogScan.java:56.
+
+2. The core contract the scan implements: `ChangelogScanTask` exposes `operation()` (change type), `changeOrdinal()` (apply order), and `commitSnapshotId()`; api/src/main/java/org/apache/iceberg/ChangelogScanTask.java:24.
+
+3. The range is bounded by walking snapshot parent lineage, not by scanning data. Snapshots are pulled oldest-first from `ancestorsBetween`; core/src/main/java/org/apache/iceberg/BaseIncrementalChangelogScan.java:103.
+
+4. Validation of that range (ancestor checks, branch checks, empty-table guards) lives in the base class: BaseIncrementalScan.java — start at fromSnapshotIdExclusive() at core/src/main/java/org/apache/iceberg/BaseIncrementalScan.java:159.
+
+5. Changes come from manifest entry status: ADDED → added-rows task, DELETED → deleted-file task, EXISTING ignored. This is the spec's "DELETED is informational, not used in normal scans" flipped on: core/src/main/java/org/apache/iceberg/BaseIncrementalChangelogScan.java:156.
+
+6. Each task carries the change ordinal and committing snapshot ID, which feed the spec's `_change_ordinal` and `_commit_snapshot_id` metadata columns: core/src/main/java/org/apache/iceberg/BaseChangelogContentScanTask.java:32.
+
+7. Two hard limits: delete files are rejected (row-level deletes aren't file diffs) and REPLACE snapshots are skipped (they don't change data): core/src/main/java/org/apache/iceberg/BaseIncrementalChangelogScan.java:107 and :108-111.
+
+8. Spark exposes it as a special `changelog` table whose builder converts user timestamps/snapshot IDs into the `(from, to]` window and calls `newIncrementalChangelogScan()`: spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/SparkChangelogScanBuilder.java:44.
+
+9. The row reader turns each task into a data row joined with the three change-metadata columns (`_change_type`, `_change_ordinal`, `_commit_snapshot_id`): spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/ChangelogRowReader.java:89.
+
+10. Spark's iterator layer reconstructs true updates — removes "carry-over" rows from rewrites, then pairs DELETE+INSERT into UPDATE_BEFORE/UPDATE_AFTER using identifier columns. This is the engine-side work core deliberately leaves out: spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/ChangelogIterator.java:76.
+
+One caveat for the new contributor: this repo's core task classes (`BaseAddedRowsScanTask`, `BaseDeletedDataFileScanTask`) at this commit supply `changeOrdinal()`/`commitSnapshotId()` but I didn't find an `operation()` override, while `ChangelogRowReader.java:92` calls it and `ChangelogOperation` (api/.../ChangelogOperation.java:22) defines the four values — so bullet 9/10 may target a newer core surface than the files here provide. Worth confirming at this exact revision.

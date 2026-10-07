@@ -1,0 +1,27 @@
+I have everything needed. Here's how the query engines in this repo use schema evolution, split into the read path (projection) and the write path (mutating the schema).
+
+Flink — automatic schema evolution on the write path
+
+Flink's dynamic sink doesn't require the user to predeclare columns; it compares the incoming record schema against the table and evolves the table automatically.
+
+- `TableUpdater.findOrCreateSchema` (flink/v1.20/.../sink/dynamic/TableUpdater.java:124-179) compares the target schema to the current one with `CompareSchemasVisitor`. If `SCHEMA_UPDATE_NEEDED`, it gets `table.updateSchema()` (:151) and asks `EvolveSchemaVisitor` to populate the update (:152-153), then commits (:156). So it uses the exact `UpdateSchema` API (SchemaUpdate.java) we discussed, not a private path.
+- `EvolveSchemaVisitor` (flink/v1.20/.../sink/dynamic/EvolveSchemaVisitor.java) turns the schema difference into UpdateSchema calls. It maps each target field by name to an existing field id via `CompareSchemasVisitor.getFieldFromStruct` (:116-118). Matching fields are updated (`updateColumn`): widening the type with `updateColumn` when the target primitive differs and isn't data-convertible (:227-229), and relaxing required->optional (:223-225). Missing fields are added with `addColumn` (:124, `addColumn` at :205-208). Column order is enforced with `moveFirst`/`moveAfter` (:236-242). Fields in the table but absent from the input are made optional by default (`makeColumnOptional`, :144) or dropped when `dropUnusedColumns` is set (`deleteColumn`, :141).
+- Note the engine constraint acknowledged in the visit: it calls `api.caseSensitive(caseSensitive)` (:73) and can't rename (Javadoc :48) — only SchemaUpdate's add/widen/reorder/optional ops.
+- The DDL path (`ALTER TABLE`) is separate: `FlinkAlterTableUtil.applySchemaChanges` (flink/v1.20/.../util/FlinkAlterTableUtil.java:82-86, 154-224) translates Flink `TableChange`s into the same `UpdateSchema` ops — `addColumn`/`addRequiredColumn` (:164-169), `renameColumn` (:205), `updateColumn` with `makeColumnOptional`/`requireColumn` (:215-218), `ModifyColumnPosition` (:206-210) — going through `transaction.updateSchema()` so AlterTable and other changes commit atomically (:83-85).
+
+Spark — DDL and identifier fields
+
+- `DROP IDENTIFIER FIELDS` is implemented directly on the same API: `iceberg.table.updateSchema().setIdentifierFields(...).commit()` (spark/v4.1/spark-extensions/.../DropIdentifierFieldsExec.scala:53-56). `SET IDENTIFIER FIELDS` uses the same `updateSchema().setIdentifierFields()` pattern. This wires the spec's `identifier-field-ids` property through `SchemaUpdate.setIdentifierFields` (SchemaUpdate.java:384-387).
+
+Spark and Flink — reads rely on ID-based projection (spec's Column Projection, spec.md:399-409)
+
+The engine metadata is rebuilt from Iceberg's by field id, so renamed/reordered/added columns in old files stay correct.
+
+- Scan builders carry the current schema as projection: `BaseSparkScanBuilder` holds `Schema schema`/`Schema projection` (spark/v4.1/.../BaseSparkScanBuilder.java:69, 75, 98-104) and passes it down.
+- For every file, the reader projects by field id: `readBuilder.project(...)` (BatchDataReader -> BaseBatchReader.java:84; BaseRowReader.java:57), building the Spark reader from `(icebergSchema, fileSchema, idToConstant)` (SparkFormatModels.java:47-56). The engine schema is derived from the Iceberg projection, not from the stored file schema.
+- Missing fields (fields not present in an older file) are resolved to constants per the spec's rules via `PartitionUtil.constantsMap` (called from BaseReader.java:193-200). That method (core/.../util/PartitionUtil.java:46-103):
+   - Identity-partition fields: fills in the value from the file's partition tuple when the source is an identity transform, via `field.transform().isIdentity()` and `idToConstant.put(field.sourceId(), converted)` (:94-99) — the spec's first fallback (spec.md:405).
+   - Metadata columns: `_file`, `_spec_id`, `_partition`, `_row_id`, `_last_updated_sequence_number` are all supplied as constants keyed by their reserved field ids (:57-88) — the spec's reserved ID range and row-lineage rules.
+   - Columns that resolve to neither stay null or come from `initial-default` (BaseRowReader also passes `.withNameMapping(...)` at :63, covering the spec's `schema.name-mapping.default` fallback, spec.md:406-407).
+
+So the engines never hard-code column identity by name or ordinal — every read goes through field-id projection with a constant fallback, and every write-side mutation funnels into the single `UpdateSchema` implementation. That's exactly why Iceberg's ID-based evolution (spec.md:401) is load-bearing for the Spark/Flink integrations: it lets a table grow and reshape while old data files remain universally readable.

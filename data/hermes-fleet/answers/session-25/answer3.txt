@@ -1,0 +1,77 @@
+Here's the edge cases and failure modes of fast append, and the specific guard each one has, with citations. Files are under core/src/main/java/org/apache/iceberg/ (and api/src/main/java/org/apache/iceberg/util/ for DataFileSet).
+
+1. Same file appended twice -> duplicate live entries in one snapshot (violates content-file uniqueness, format/spec.md:680-682)
+
+What could go wrong: two ADDED manifest entries for one data file, giving undefined scan behavior.
+Guard: appendFile collects new files per spec into a DataFileSet (FastAppend.java:39, 87-88). DataFileSet dedupes by file location — equals/hashCode are on file.location() (api/.../DataFileSet.java:90-106). `if (dataFiles.add(file))` sets hasNewFiles only when it was actually a new file (FastAppend.java:90-93), so the summary and manifest won't double-count or double-write it.
+
+2. Appending a file into an unknown/removed partition spec
+
+What could go wrong: writing manifest entries against a spec the table no longer has, corrupting manifest schema resolution.
+Guard: appendFile looks up `spec(file.specId())` and throws via Preconditions.checkArgument if null (FastAppend.java:80-85).
+
+3. Appending a manifest that isn't a clean append-only manifest
+
+What could go wrong: reusing a manifest that already contains EXISTING/DELETED entries as if it were newly appraisal — you'd duplicate or re-own files.
+Guard: appendManifest rejects manifests with existing or deleted files (FastAppend.java:110-113) and requires the snapshot id be unassigned (null or -1) and sequence number unset (FastAppend.java:114-118).
+
+4. Appending a manifest whose snapshot id / sequence is already set
+
+What could go wrong: the manifest can't legally claim this commit's snapshot id, so its entries wouldn't correctly represent this append.
+Guard: the same Preconditions above (FastAppend.java:114-118). If inheritance isn't available (v1), the manifest is instead copied/rewritten with this commit's id via copyManifest (FastAppend.java:123-126 -> 132-144 -> ManifestFiles.copyAppendManifest). copyAppendManifest also enforces that every entry is status ADDED before copying (ManifestFiles.java:442-449 together with the allowedEntryStatus check at 496-500) — so a rewritten "append" manifest can't carry hidden existing/deleted entries.
+
+5. Mixing files from different partition specs into one manifest
+
+What could go wrong: a manifest may only store files for a single partition spec (format/spec.md:666).
+Guard: new files are bucketed per spec in newDataFilesBySpec (FastAppend.java:39, 88), and writeNewManifests writes a separate manifest (or set) per spec via writeDataManifests(dataFiles, spec(specId)) (FastAppend.java:210-212).
+
+6. apply() invoked more than once within a commit (retry/conflict) leaving stale written manifests
+
+What could go wrong: orphan manifest files accumulating on every attempt, or double-writing the same files.
+Guard: writeNewManifests first deletes and clears any previously written newManifests when there are still new files (FastAppend.java:204-208), then only writes when newDataFilesBySpec is non-empty (FastAppend.java:210). So a re-applied update starts fresh instead of stacking manifests.
+
+7. A commit fails -> uncommitted manifest files leak in the file system
+
+What could go wrong: orphaned data manifests, wasting storage.
+Guard: SnapshotProducer.commit catches RuntimeException and calls cleanAll -> cleanUncommitted (SnapshotProducer.java:538-543, 610-616). FastAppend.cleanUncommitted deletes its owned newManifests and rewrittenAppendManifests (FastAppend.java:184-187, 189-191). Note it deliberately does NOT delete appendManifests (FastAppend.java:190) — those are user-supplied and owned by the table.
+
+8. A later attempt commits, and cleanup must not delete manifests that a winning attempt actually committed
+
+What could go wrong: two concurrent/repeated attempts share manifests; deleting "uncommitted" ones could delete files the successful attempt referenced.
+Guard: deleteUncommitted receives the set of committed manifests and only deletes files not in that set (FastAppend.java:184-187 -> SnapshotProducer.deleteUncommitted, SnapshotProducer.java:756-769: `if (!committed.contains(manifest))`). And cleanupAfterCommit returns true only when there are rewrittenAppendManifests (FastAppend.java:199-202); for the normal appended-manifest case cleanup is skipped entirely so nothing committed is ever deleted.
+
+9. Commit conflict with a concurrent writer
+
+What could go wrong: two writers base on the same metadata; only one can win.
+Guard: the commit loop retries with exponential backoff, retrying only on CommitFailedException (SnapshotProducer.java:484-535). FastAppend carries no validation (its validate() is the base no-op, SnapshotProducer.java:283), matching the spec that an append "has no requirements and can always be applied" on retry (format/spec.md:1316). Existing manifests are immutable and reused (FastAppend.java:165-167), so re-applying the same new manifests against a newer base is always valid.
+
+10. First append to a table with no current snapshot
+
+What could go wrong: NPE when there is no parent snapshot to inherit manifests from.
+Guard: apply handles snapshot == null by only adding the new manifests and skipping the `snapshot.allManifests(...)` call (FastAppend.java:165: `if (snapshot != null)`).
+
+11. Manifest/list writes starve or fail partway (parallel writes)
+
+What could go wrong: a partially written manifest list referencing manifests that never completed.
+Guard: parallel manifest writes use stopOnFailure().throwFailureWhenFinished() (ManifestFiles.java:593-597); the concurrent manifest-list build uses the same pattern (SnapshotProducer.java:324-328). Any failure surfaces as an exception that triggers the cleanup paths above.
+
+12. Manifest writer left unclosed (unflushed/finalized manifest)
+
+What could go wrong: a manifest file whose footer/counts are incomplete.
+Guard: writers are closed via try-with-resources (SnapshotProducer.java:775, 799); RollingManifestWriter.close finalizes and records the file, and toManifestFiles throws if not closed (RollingManifestWriter.java:139-149).
+
+13. Single manifest growing unbounded / one oversized manifest for the whole append
+
+What could go wrong: pathological manifest size; the spec notes manifests can be split for planning (format/spec.md:982-983).
+Guard: RollingManifestWriter rolls to a new manifest once the current one reaches the target size (RollingManifestWriter.java:109-122, targetFileSizeBytes passed in at SnapshotProducer.java:661-663), and writeParallel splits files into multiple writer groups bounded by the write pool (SnapshotProducer.java:748-753, ManifestFiles.java:584-604).
+
+14. IO error while writing a data manifest
+
+What could go wrong: exception during a mid-write manifest.
+Guard: wrapped and rethrown as RuntimeIOException (FastAppend.java:155-157; SnapshotProducer.java:781-783), which then feeds the commit-failure cleanup at #7.
+
+Optional/state-management nuances (not failures, but consequences the code accounts for):
+- Sequence-number/snapshot-id assignment is deferred and inherited from manifest-list metadata so a manifest can be reused across retries without rewriting — the "can always retry" property at #9 (SnapshotProducer.java:104-107, 308-316; entries added with null data-seq, SnapshotProducer.java:779).
+- Cleanup is intentionally asymmetric (cleanupAfterCommit only for rewritten manifests, FastAppend.java:194-202) because cleared/finalized appended manifests are never rewritten — the spec's `manifests-kept` behavior.
+
+The main residual risks are not guardable in the writer: data files the caller hands to appendFile are not verified to still exist or be uncommitted, and orphan manifests created by a crash between file-write and commit are only reclaimed by the table's garbage-collection (manifest expiry), not by the append path itself — FastAppend/SnapshotProducer only clean up files it can prove are uncommitted.

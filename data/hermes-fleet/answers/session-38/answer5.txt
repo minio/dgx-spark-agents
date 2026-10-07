@@ -1,0 +1,14 @@
+Default values in Iceberg — a new-contributor map. Each point = one file:line to read first.
+
+1. What a default is: every struct field can carry two — `initial-default` (for rows written before the column existed, frozen) and `write-default` (for new rows when the writer omits the value, mutable). Read the design in format/spec.md:325.
+2. The evolution contract: initial default is set once and never changes; write default is set at add time (same value) and can be changed later. Read format/spec.md:329.
+3. The core type that holds them: `NestedField` stores both as `Literal<?>`, and its constructor casts/validates them against the field type. Read api/src/main/java/org/apache/iceberg/types/Types.java:872.
+4. The per-type (de)serializer: `SingleValueParser` converts between JSON (Appendix D format) and typed values for every Iceberg type. Read core/src/main/java/org/apache/iceberg/SingleValueParser.java:49.
+5. How they get into the JSON schema: `SchemaParser` writes `initial-default`/`write-default` as field attributes and parses them back into Literals. Read core/src/main/java/org/apache/iceberg/SchemaParser.java:96.
+6. Adding a column: `SchemaUpdate.internalAddColumn` sets both defaults to the same value and enforces that a required column can't be added without a non-null default. Read core/src/main/java/org/apache/iceberg/SchemaUpdate.java:160.
+7. Changing a default: `SchemaUpdate.updateColumnDefault` mutates only the write default and leaves the initial default untouched. Read core/src/main/java/org/apache/iceberg/SchemaUpdate.java:322.
+8. Version gating: a non-null initial default is rejected on v1/v2 tables (defaults are a v3 feature). Read api/src/main/java/org/apache/iceberg/Schema.java:619.
+9. Read-time application: when a column is missing from an old file, the reader materializes the initial default, else null for optional, else throws for required. Read core/src/main/java/org/apache/iceberg/avro/ValueReaders.java:302 (Arrow variant: arrow/.../VectorizedReaderBuilder.java:128).
+10. Engine integration: Spark round-trips defaults via `TypeToSparkType` (expose) and `SparkTypeToType.convertDefaultValue` (consume); Flink's main code doesn't use them yet. Read spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/SparkTypeToType.java:233 and spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/TypeToSparkType.java:84.
+
+Quick mental model: `NestedField` owns the two Literals, `SingleValueParser` + `SchemaParser` move them to/from JSON, `SchemaUpdate` manages their lifecycle, `Schema` gates the version, `ValueReaders`/`VectorizedReaderBuilder` apply the initial default on read, and Spark is the one engine wired to both defaults.

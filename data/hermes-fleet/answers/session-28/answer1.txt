@@ -1,0 +1,62 @@
+I've read the full spec (format/spec.md, all 2153 lines). Here's what it says about file IO and why.
+
+## The core model: files, not directories
+
+Iceberg "tracks individual data files in a table instead of directories" (Overview). There's one logical "data layer" — a flat collection of immutable files (Parquet/ORC/Avro data files, plus delete files and metadata files) — and a "metadata layer" that names which files constitute the table. A table's state is a chain of immutable metadata JSON files; each state change produces a new metadata file and atomically swaps a pointer to it.
+
+The metadata hierarchy is three levels (Overview, Manifests, Manifest Lists):
+- Table metadata JSON — schema, partition specs, and the list of snapshots.
+- A snapshot → one manifest list — lists manifest files with alignment stats.
+- A manifest → a list of data/delete files with each file's partition tuple and column metrics.
+
+Manifests are Avro files that hold one row per content file. Crucially they're "reused across snapshots to avoid rewriting metadata that is slow-changing" — an append adds a new manifest rather than rewriting existing ones (fast append).
+
+The stated goals that shape all the IO design (Goals):
+- Serializable isolation — readers use a committed snapshot, never acquire locks.
+- Speed — O(1) remote calls to plan a scan, not O(n) in table size.
+- Scale — job planning is client-side, not bottlenecked on a central metadata store.
+
+## What the filesystem must provide (File System Operations)
+
+The spec deliberately requires very little from storage — only three operations:
+- In-place write: files are never moved or altered after being written.
+- Seekable reads: data formats need random access.
+- Deletes: remove files no longer used.
+
+It explicitly documents what it does NOT need: no random-access writes, and no rename except for the atomic-rename commit scheme. "These requirements are compatible with object stores, like S3." This is the point: the design makes an object store (or a local/distributed FS) work identically because all the state-change logic lives in the metadata layer, and files are only ever written once and read.
+
+IO operations therefore fall into three categories by how they interact with storage:
+- Data writes: in-place append of immutable files.
+- Metadata commit: the ONLY place storage semantics matter, and only there do you need something atomic (see below).
+- Reads: seekable, predicate-driven, metadata-first.
+
+## Why commit is an "atomic swap" of metadata, and how it's done
+
+Because data files are immutable and written in place, the only concurrency-sensitive operation is publishing a new table state. That's a single atomic swap of the metadata pointer:
+- Optimistic concurrency: writers assume the current version won't change, build a new metadata file, then swap the pointer. If the base moved, they retry — no locks, no serialization center.
+- The swap is implemented differently per catalog: atomic rename (filesystem tables) or a metastore check-and-put (REST/Hive catalogs). The spec standardizes the abstract operation, not the mechanism. Note the filesystem-rename scheme is explicitly deprecated and "unsafe in object stores" (no atomic rename in S3) — hence the metastore/REST route is the modern path.
+
+Two mechanics make retry cheap and metadata reusable:
+- Sequence numbers: every commit assigns a next sequence number. New files are written with null sequence numbers, then "inherit" the manifest's sequence number at read time. So a manifest can be written once before its sequence number exists and reused across retries — only the (already-being-rewritten) manifest list must change. Same idea for v3 row-ID assignment (first_row_id) and row-lineage fields.
+- Manifests are writable before the commit succeeds because they're immutable content too; retries only regenerate the manifest list and metadata.
+
+## Scan planning is IO-driven (the "O(1)" goal)
+
+Reads are planned by reading the current snapshot's metadata tree and using statistics to skip I/O:
+- Partition transforms (identity, bucket, truncate, year/month/day/hour) let scan predicates be converted into partition predicates — an inclusive projection (if a row matches, its partition matches). This lets manifest-list partition summaries and per-file partition tuples prune files, and lets partitioning evolve without rewriting data.
+- Manifests carry per-file column metrics (value/null/nan counts, lower/upper bounds, sizes, split offsets) by field ID. Both data and delete files store these, so the same filter logic prunes both. Split offsets enable parallel reading per file.
+- Manifest lists carry per-manifest partition summaries so whole manifests can be skipped before being opened. That layering is what buys O(1)-ish planning: you read the small manifest list, skip most manifests from summaries, and only read manifests/files that could match.
+
+## File locations and path handling
+
+Path fields in metadata are full URIs with an FS scheme (through v3). All v4 adds relative-path support so a table can be relocated without rewriting metadata: relative paths are resolved against the table's base location; path resolution says anything without a URI scheme is relative, and relativization converts an absolute path under the table location back to relative on write. (v4 is still under active development, not adopted.) Everything about this is about making the metadata portable across storage and not baking absolute machine-specific paths into the table.
+
+## Delete file IO
+
+Row-level deletes are separate immutable files tracked by the same manifest machinery, in their own manifests so they're scanned first. Apply rules are governed by data sequence numbers and partition matching: an equality delete applies to older data files in the same partition (or globally if unpartitioned), a position delete applies to the same or older files. DV/position files are read at execution time alongside data. This keeps deletes from ever rewriting existing data files — deletes are IO additive, not rewrite-based. v3 consolidates position deletes into per-file deletion-vector bitmaps; v4 drops writing equality deletes.
+
+## Why this overall design
+
+The through-line is: push all the expensive, stateful, concurrency-sensitive work into a small immutable metadata hierarchy, and treat storage as a dumb, append-only, seekable blob service. That gives object-store compatibility, client-side parallel planning (no metadata bottleneck), serializable isolation without locks, and schema/partition evolution without rewriting data. The costs — every commit writes new metadata, and readers must traverse the metadata tree — are accepted in exchange for those guarantees, and the layered manifests + stats exist specifically to keep that traversal cheap.
+
+One caveat on scope: I read only format/spec.md as you asked. File "IO" as a concept is described throughout the spec (it's foundational to the design), but there's no single "file IO" chapter — I've pulled together the Goal/Overview/concurrency concepts, the File System Operations section, the path-resolution rules, and the scan-planning mechanics. The appendices (A–G) cover file-format column encodings and serialization rather than IO behavior, so I've only referenced them as they relate to the above.

@@ -1,0 +1,54 @@
+I now have a thorough, well-sourced picture of both integrations. Here's the explanation.
+
+## The two things engines consume
+
+Query engines consume metadata columns at two distinct layers, and the code separates them cleanly:
+
+1. **Row identity / lineage columns** (`_row_id`, `_last_updated_sequence_number`) — for row-level *writes* (UPDATE/MERGE) and lineage-preserving rewrites.
+2. **Physical-position columns** (`_file`, `_pos`, `_spec_id`, `_partition`, and the changelog trio) — for identifying *which physical row* a change applies to (position deletes) and for changelog/`_deleted` reads.
+
+## Spark — row-level operations built on lineage
+
+The whole point of `_row_id` in Spark is to make UPDATE/MERGE a **row-preserving identity operation** instead of delete+insert.
+
+**Capacity check and system gating.** Everything is gated on the table supporting lineage. `TableUtil.supportsRowLineage` returns false for metadata tables and requires format version ≥ 3 (`TableUtil.java:64–71`, using `TableMetadata.MIN_FORMAT_VERSION_ROW_LINEAGE`). `RewriteOperationForRowLineage.shouldUpdatePlan` only rewrites the plan when that's true and `_row_id` isn't already projected (`RewriteOperationForRowLineage.scala:39–52`).
+
+**UPDATE preserves identity.** `RewriteUpdateTableForRowLineage` is the clearest example. It pulls the two lineage attribute refs out of the relation's metadata output, then rewrites the UPDATE assignments to append:
+- `Assignment(lastUpdatedSequence, Literal(null))` — reset the "last updated" seq to null so the new commit inherits the fresh sequence number, and
+- `Assignment(rowId, rowId)` — copy the existing `_row_id` to itself, preserving identity.
+(`RewriteUpdateTableForRowLineage.scala:40–49`.)
+
+This is precisely the spec's contract for modified rows (spec.md:482–486): copy `_row_id`, null the last-updated seq. The code strips the Spark metadata-attribute flag on these two columns so downstream treats them as normal data columns (`RewriteOperationForRowLineage.scala:54–84`), because `ExposesMetadataColumns` would otherwise suppress *other* metadata columns when one is surfaced.
+
+**MERGE does the same for matched updates and not-matched-by-source updates** (`RewriteMergeIntoTableForRowLineage.scala:40–78`): UPDATE actions get `rowId→rowId` + `lastUpdated→null` assignments; DELETE actions are left alone (lineage not needed — the row vanishes). Inserts rely on alignment assigning null literals (comment at :58–60).
+
+**Required metadata attributes.** Both write modes request the lineage columns whenever supported:
+- `SparkPositionDeltaOperation.requiredMetadataAttributes` — always `_spec_id`, `_partition`; plus `_row_id`, `_last_updated_sequence_number` when lineage is on (`SparkPositionDeltaOperation.java:101–113`).
+- `SparkCopyOnWriteOperation.requiredMetadataAttributes` — `_file`, and `_pos` for DELETE/UPDATE, plus the lineage pair when supported (`SparkCopyOnWriteOperation.java:99–114`).
+
+**Physical-position metadata for delete/update.** For the copy-on-write and position-delta paths, `_file` and `_pos` are the identity used to carve out deleted/replaced rows. `SparkCopyOnWriteScan.filterAttributes` uses `_file` for file-level filtering (`SparkCopyOnWriteScan.java:115–118`), and `SparkWriteUtil` clusters/orders writes by `FILE_PATH`, `ROW_POSITION`, `SPEC_ID`, `PARTITION` — e.g. `POSITION_DELETE_ORDERING = orderBy(SPEC_ID, PARTITION, FILE_PATH, ROW_POSITION)` (`SparkWriteUtil.java:62–63`) — matching the spec's requirement that position deletes be sorted by file then position (spec.md:1413–1416).
+
+**Stripping lineage from the original table.** Because the rewrite injects `_row_id`/`_last_updated_sequence_number` into the output purely to carry identity, Spark's physical planning would otherwise see them where it expects only real columns. `RemoveRowLineageOutputFromOriginalTable` filters the lineage columns back out of the write's `originalTable` relation (`RemoveRowLineageOutputFromOriginalTable.scala:34–51`), so caching/planning work without touching physical strategies.
+
+**Spark read-side surfacing.** `TypeToSparkType.fieldMetadata` tags any field whose id is a metadata column with a `METADATA_COL_ATTR_KEY` flag (`TypeToSparkType.java:136–139), letting `SELECT _row_id, ...` and predicate pushdown treat them specially; `SparkSchemaUtil` guards against a user column colliding with a metadata column name (`SparkSchemaUtil.java:350–358`). Per-task constants (including `_row_id`/`_last_updated_sequence_number`) are produced via `PartitionUtil.constantsMap` through `BaseReader.constantsMap` (`BaseReader.java:194–201`), which is exactly the core path that resolves `first_row_id + pos` and the file data-sequence number (PartitionUtil.java:56–65).
+
+**Changelog reads.** Spark's changelog iterator keys on `_change_type`, and computes row identity by excluding the metadata columns `_change_ordinal`, `_commit_snapshot_id`, `_change_type` from the comparison fields (`ChangelogIterator.java:45`, `RemoveNetCarryoverIterator.java:122–128`). `SparkChangelogTable` exposes `_spec_id`, `_partition`, `_file`, `_pos`, `_deleted` as metadata columns (`SparkChangelogTable.java:112–118`).
+
+## Flink — lineage preserved through maintenance rewrites
+
+**Compaction/data rewrite is where Flink leans on lineage.** `DataFileRewriteRunner` rewrites files *without* breaking row identity: it projects `_row_id` and `_last_updated_sequence_number` into both the read schema and the write schema via `MetadataColumns.schemaWithRowLineage(...)`, but only when `preserveRowId` is set (default behavior):
+- read: `projectedSchema = preserveRowId ? schemaWithRowLineage(table.schema()) : ...` (`DataFileRewriteRunner.java:204–208`);
+- write: `writeSchema = preserveRowId ? schemaWithRowLineage(table.schema()) : ...` (`DataFileRewriteRunner.java:184–187`).
+
+Because the resolved values were already populated by `RowDataFileScanTaskReader.open` → `PartitionUtil.constantsMap(task, RowDataUtil::convertConstant)` (`RowDataFileScanTaskReader.java:78`), the rewrite reads back the same `_row_id` and writes it into the new files — the "copy existing non-null `_row_id` into the new data file" rule (spec.md:484). This is the concrete Flink implementation of lineage-preserving compaction.
+
+**`_pos` in Flink.** `EqualityConvertReader` projects `_pos` (`appendRowPosition` adds `MetadataColumns.ROW_POSITION`, `EqualityConvertReader.java:218–221`) and reads it via a field accessor (`EqualityConvertReader.java:160–163`) to reconcile existing deletion vectors against rewritten files — using the physical position for delete bookkeeping.
+
+## The read-side consumption shared by both
+
+Both engines ultimately drive through `PartitionUtil.constantsMap` (Spark `BaseReader.java:197`, Flink `RowDataFileScanTaskReader.java:78`), which is what turns file-level metadata into per-row constants (PartitionUtil.java:56–82): `_file` from file location, `_spec_id`, `_partition`, `_row_id` from `firstRowId`, and `_last_updated_sequence_number` from the file's data sequence number. That centralization is why both engines get identical, spec-faithful lineage values without reimplementing the inheritance logic.
+
+## Summary of how each relies on it
+
+- **Spark** uses `_row_id` as the *identity anchor* for UPDATE/MERGE: it turns a logical row update into rewriting the row while preserving its id (`RewriteUpdateTableForRowLineage.scala:45–46`, `RewriteMergeIntoTableForRowLineage.scala:47–70`), and uses `_file`/`_pos`/`_spec_id`/`_partition` for the physical file position side of delete/update and for changelog reads. It also goes to real lengths to strip lineage columns back out of the physical plan once they've served their identity purpose (`RemoveRowLineageOutputFromOriginalTable.scala:34–51`, `RewriteOperationForRowLineage.scala:69–73`).
+- **Flink** primarily uses lineage to make rewrites/compaction *idempotent to identity* — projecting and rewriting `_row_id`/`_last_updated_sequence_number` through `schemaWithRowLineage` (`DataFileRewriteRunner.java:184–187, 204–208`) — and `_pos` for deletion-vector bookkeeping (`EqualityConvertReader.java:160–163`).

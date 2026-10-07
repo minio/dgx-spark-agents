@@ -1,0 +1,81 @@
+I've read ManifestWriter.java in full plus the code it delegates to (GenericManifestEntry, PartitionSummary, V1–V4Metadata entry schemas and wrappers, ManifestEntry and DataFile field definitions). Here's how the implementation tracks the spec.
+
+## 1. The manifest_entry struct matches the spec exactly
+
+Spec (format/spec.md:684-696) defines `manifest_entry` = `status`, `snapshot_id`, `sequence_number`, `file_sequence_number`, `data_file`. The implementation reproduces this in `ManifestEntry.java:51-56`:
+
+- `STATUS = required(0, "status")` — spec id 0
+- `SNAPSHOT_ID = optional(1, "snapshot_id")` — spec id 1, optional for inheritance
+- `SEQUENCE_NUMBER = optional(3, "sequence_number")` — spec id 3 (data seq num)
+- `FILE_SEQUENCE_NUMBER = optional(4, "file_sequence_number")` — spec id 4
+- `DATA_FILE_ID = 2` — spec id 2
+
+These wrap the file into the Avro schema in `wrapFileSchema` (ManifestEntry.java:64-71, and per-version in V1Metadata.java:203, V2Metadata.java:245/249, V3Metadata.java:267/271). The spec mandates the exact same field ids, so Avro is written with the correct "manifest_entry" schema whose named record is set in every `newAppender` (e.g. ManifestWriter.java:296 `.named("manifest_entry")`).
+
+## 2. Column-level field ids in `data_file` match the spec table
+
+Spec's `data_file` struct (spec.md:720-744) gives each field a specific id (100 path, 101 format, 102 partition, 103 record_count, 104 size, 125/128 bounds, 134 content, 142 first_row_id, 143 referenced_data_file, 144/145 offset/size...). The implementation declares the same ids in `DataFile.java:37-121` — e.g. `CONTENT`=134, `FILE_PATH`=100, `FIRST_ROW_ID`=142, `REFERENCED_DATA_FILE`=143, `CONTENT_OFFSET`=144, `CONTENT_SIZE`=145. The reserved id 141 is also present (`SPEC_ID`, DataFile.java:100), matching the spec's note that 141 is reserved (spec.md:757).
+
+## 3. Per-version schema differences follow spec's version tables
+
+- V1 omits `CONTENT`, sequence numbers, optional `snapshot_id` (required in v1 spec). Spec says v1 has only status/snapshot_id/data_file (spec.md:689-691). V1Metadata.entrySchema/wrapFileSchema reflect this.
+- V2 adds `content`, `sequence_number`, `file_sequence_number`, `snapshot_id` optional (spec.md:2040-2046). V2Metadata.fileType (V2Metadata.java:259-278) includes `DataFile.CONTENT`, and the entry schema includes SEQUENCE_NUMBER/FILE_SEQUENCE_NUMBER.
+- V3 adds row-lineage/delete-vector fields `first_row_id`, `referenced_data_file`, `content_offset`, `content_size_in_bytes` (spec.md:741-744). V3Metadata.fileType (V3Metadata.java:281-304) adds exactly these four after SORT_ORDER_ID.
+
+So the writer's `V2Writer.newAppender` (uses V2Metadata.entrySchema) and `V3Writer.newAppender` (V3Metadata.entrySchema) produce schemas that match the spec for each format-version. This is why the spec says "A manifest stores files for a single partition spec" — the `partition` field type is `spec.partitionType()`, threaded through `entrySchema(spec.partitionType())` (ManifestWriter.java:77, 292, 332, etc.).
+
+## 4. Manifest key-value metadata matches spec's required properties
+
+Spec (spec.md:668-678) says a manifest must store `schema`, `partition-spec`, and (v2+) `schema-id`, `partition-spec-id`, `format-version`, `content` as Avro key-value metadata. Every `newAppender` writes exactly these via `.meta(...)`:
+
+- `.meta("schema", SchemaParser.toJson(spec.schema()))` (e.g. ManifestWriter.java:297)
+- `.meta("partition-spec", PartitionSpecParser.toJsonFields(spec))` (298)
+- `.meta("partition-spec-id", String.valueOf(spec.specId()))` (299)
+- `.meta("format-version", "2"/"3"/"4")` (300)
+- `.meta("content", "data"/"deletes")` (301)
+
+Note the V1Writer omits `content` and `schema-id`/`format-version` is present but content omitted — V1 spec doesn't require `content` (spec.md:672-678 column for v1 shows `content` blank). This is precisely the per-version requirement table.
+
+## 5. data vs. delete manifests ("content" concept)
+
+Spec: a manifest stores either data files or delete files, not both (spec.md:664). The base `content()` defaults to DATA (ManifestWriter.java:107-109); each `*DeleteWriter` overrides `content()` to return DELETES (e.g. V2DeleteWriter.java:530-533, V3DeleteWriter.java:441-444). This drives both the `content` metadata and the schema's `content` field. The delete writers subclass `ManifestWriter<DeleteFile>` (vs `<DataFile>`), giving a typed split.
+
+## 6. ADDED/EXISTING/DELETED status semantics
+
+Spec (spec.md:691, 699-706): ADDED=1 stores the snapshot where added; EXISTING/ DELETED must preserve the original data/file sequence numbers. `GenericManifestEntry` implements this:
+
+- `wrapAppend` sets status ADDED, keeps `fileSequenceNumber = null` (to be assigned at commit), and sets dataSequenceNumber from the argument or null (GenericManifestEntry.java:69-80). Additionally it calls `Delegates.suppressFirstRowId` so `_row_id` inheritance stays unassigned for new files.
+- `wrapExisting` sets EXISTING and copies the original snapshot + both sequence numbers (54-67).
+- `wrapDelete` sets DELETED, reusing the current snapshot id but carrying the original data/file sequence numbers (87-95).
+
+This directly mirrors spec.md:699-706 — new files leave sequence numbers unassigned for inheritance, existing/deleted files carry their assigned values forward.
+
+## 7. Sequence-number inheritance via the manifest list
+
+Spec (spec.md:701-711, 928-939): new files write `null` sequence numbers, replaced with the manifest's sequence number from the manifest list at read time; inheritance only for ADDED. Two places enforce this:
+
+- The writer literally writes `UNASSIGNED_SEQ = -1L` as the manifest's sequence number and min sequence number in `toManifestFile()` (ManifestWriter.java:232-248), leaving them to be replaced by the manifest list.
+- `V2Metadata.ManifestEntryWrapper.get` (V2Metadata.java:321-336) validates that a null data sequence number is only allowed for ADDED entries and only when the snapshot matches the current commit, then returns null (to be inherited). This is the spec's rule "inherited only if status is 1 (added)" (spec.md:706).
+
+`UNASSIGNED_SEQ` is the stand-in the class javadoc describes (ManifestWriter.java:40-42) — the mechanism that lets a manifest be written before the commit's sequence number is known and reused across optimistic retries, exactly the spec's rationale (spec.md:107, 937).
+
+## 8. Per-file metrics and partition statistics for data skipping
+
+Spec stores column metrics per file (spec.md:730-744) and partition-field summaries in the manifest list (spec.md:1005-1043). The writer accumulates both:
+
+- File-level metrics come along inside each `data_file` (the metrics maps are part of the file, written via DataFileWrapper).
+- Partition summaries: `PartitionSummary` tracks, per partition field, `containsNull`, `containsNaN`, and min/max bounds (PartitionSummary.java:62-101), serialized to bytes via `Conversions.toByteBuffer`. `ManifestWriter.addEntry` calls `stats.update(...)` on every entry (ManifestWriter.java:127), and `toManifestFile` passes `stats.summaries()` into the `GenericManifestFile` (ManifestWriter.java:241). These populate the manifest list's `field_summary` — the spec's partitioning summary that lets a planner skip manifests (spec.md:1057).
+
+## 9. Aggregated counts for the manifest list
+
+Spec (spec.md:1005, 1021-1026): a manifest list records added/existing/deleted files and rows. `addEntry` accumulates `addedFiles/existingFiles/deletedFiles` and row totals by status (ManifestWriter.java:111-125), and `toManifestFile` embeds them (244-248). The min data sequence number over live entries is also tracked (129-133) for the manifest list's `min_sequence_number`.
+
+## 10. Format/encryption details
+
+- Manifests must be a valid Iceberg data file (spec.md:662); every `newAppender` routes through `InternalData.write(...)`.
+- V2/V3 manifests are restricted to Avro — `Preconditions.checkArgument(format() == FileFormat.AVRO, ...)` (V2Writer.java:456-457, V3Writer.java:367-368). Note V4Writer does not force Avro, allowing Parquet manifests. This is consistent with the spec, which defines the manifest as "an immutable Avro file" (spec.md:660) but introduces alternative formats/relative paths in v4.
+- Whole-file encryption key metadata is embedded as `key_metadata` (ManifestWriter.java:252-263), matching the optional `key_metadata` field in both manifest entries and the manifest list (spec.md:737, 1028).
+
+## The connecting thread
+
+Every decision in ManifestWriter.java is a mechanical translation of the spec's per-version tables: the exact field ids come from `ManifestEntry`/`DataFile`, the entry/partition schemas come from `V1/V2/V3/V4Metadata`, the key-value metadata and `content` split mirror the manifest requirement tables, and the unassigned-sequence-number mechanism (`UNASSIGNED_SEQ`, `suppressFirstRowId`) implements the spec's inheritance design so manifests can be written once and reused across optimistic-commit retries (spec.md:107, 937, 943-949). The one deliberate exception worth flagging: the code enforces Avro-only for V2/V3 but the spec text describes manifests generically as Avro, with v4 opening the door to other formats — a forward-compatible interpretation of the spec.

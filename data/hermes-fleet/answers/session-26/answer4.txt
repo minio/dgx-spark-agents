@@ -1,0 +1,43 @@
+Flink has zero manifest-rewriting integration (the search returned nothing), so this is entirely a Spark story. The repository has two distinct Spark entry points plus the distributed engine that does the work.
+
+## User-facing entry points
+
+1. The SQL stored procedure — `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/procedures/RewriteManifestsProcedure.java`. It exposes `CALL system.rewrite_manifests` with parameters `table`, `use_caching`, `spec_id`, `sort_by` (lines 48-58). `call()` (93-123) validates `sort_by` is non-empty (114-116), wires the options into the action (103-117), runs `action.execute()` (119), and returns `(rewritten_manifests_count, added_manifests_count)` (125-130). The class doc (38-44) notes it invalidates cached Spark plans for the table — query-engine integration detail.
+
+2. Programmatic action — `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/actions/RewriteManifestsSparkAction.java`, entered through `SparkActions.rewriteManifests(table)` (SparkActions.java:84-85).
+
+## The distributed rewrite lives in RewriteManifestsSparkAction
+
+Unlike the single-node core `BaseRewriteManifests`, this action pushes the manifest rewrite onto the Spark engine to run in parallel across executors:
+
+- `doExecute()` (204-226) rewrites DATA manifests and DELETES manifests as two separate passes (208, 212) — matching the spec/AGENTS rule that data and delete manifests are handled separately.
+- `findMatchingManifests` (350-362) selects the current snapshot's data/delete manifests (364-373) that match the target spec id and the `rewriteIf` predicate (360) — the analogue of core's `matchesPredicate`.
+- `buildManifestEntryDF` (254-274) loads the `entries` metadata table, filters `status < 2` (only live entries, line 262 — same rule as core's `liveEntries()`/spec.md:691), and joins to the chosen manifests (270-273).
+- The manifest files themselves are written on executors: `writePartitionedManifests` (284-294) does `repartitionByRange(...).sortWithinPartitions(...)` (332-334) to cluster entries by partition, then each partition's rows are written by a `WriteManifests` mapPartitions function (485-551). Per partition, `call` (516-534) writes every entry as **EXISTING** via `writer.existing(...)` with the original `snapshotId`, `sequenceNumber`, and optional `fileSequenceNumber` read from the dataframe (523-527, 527) — precisely the spec requirement (spec.md:706/935) that rewritten-existing entries carry explicit, original sequence/snapshot ids. The writer is closed in a `finally` (529-531) to avoid orphaning partial manifests.
+
+This is a genuinely different performer than core `BaseRewriteManifests`: the Spark action runs the write on distributed executors using `MapPartitionsFunction` and a broadcast `Table` (433-441, 553-608), targeting 1.2x target manifest size (440) to amortize the distributed-estimation imprecision. But note the roles are split: the Spark action produces the *content* of the new manifests and picks which old ones are replaced — then hands off to the core commit path.
+
+## The engine still commits through core `RewriteManifests`+`SnapshotProducer`
+
+`replaceManifests` (397-420) is the bridge back to the core implementation we analyzed earlier:
+- It calls `table.rewriteManifests()` — which constructs a core `BaseRewriteManifests` — and feeds it the replaced/added manifests via `deleteManifest`/`addManifest` (400-402).
+- It calls `commit(rewriteManifests)` (403), which goes through `BaseSnapshotUpdateSparkAction` → `SnapshotProducer.commit()` — the exact optimistic-concurrency, apply-retry, manifest-list-writing machinery we traced (SnapshotProducer.java:484-534).
+
+So the query-engine rewrite is a two-tier design: **Spark executors cluster entries into new EXISTING manifests**, then **core BaseRewriteManifests validates and commits** the manifest-list swap. The core guards we listed earlier (file-count balance, current-manifest validation, ownership-aware cleanup) all still apply to the final commit; the Spark layer adds its own distributed concerns:
+
+- Staging vs. direct commit — `shouldStageManifests` (137-142) is true only for v1 without snapshot-ID inheritance; otherwise new manifests are written straight to the metadata folder and committed without staging (per the class doc 84-91, because with inheritance the manifests can be reused across retries). This ties back to spec.md:937 — a manifest written once is reusable in retries — which is only safe when snapshot-id inheritance is on.
+- Cleanup ownership — after commit, staged manifest files are deleted only if `shouldStageManifests` (405-408); on `CommitStateUnknownException` nothing is cleaned because the commit may actually have landed (409-411); on a `CleanableFailure` the new manifests are deleted (412-416). Same ownership discipline as core `cleanUncommitted` (BaseRewriteManifests.java:345-351).
+- Guarding correctness of the count inputs — `totalSizeBytes` requires non-null file counts before sizing target manifests (383-394), mirroring core's `activeFilesCount` precondition (BaseRewriteManifests.java:320-323).
+
+## How the engine maps onto the spec's design
+
+The whole point for a query engine is planning cost. The spec's scalar goal — "Operations will use O(1) remote calls... not O(n)" (spec.md:72) — and the manifest-list summaries that make "avoid reading manifests that are not required" possible (spec.md:89) are exactly what the engine improves when it proves-out rewriting: it re-clusters entries by partition (`sort_by`, `sortColumn` 310-330) so each new manifest covers a compact partition range, reducing how many manifests a future scan must open. `clustering` in the Javadoc (84-85) states this intent directly: "rewrites manifests in a distributed manner and co-locates metadata for partitions."
+
+## Tests
+
+Coverage is in `spark/v3.5/spark-extensions/src/test/.../TestRewriteManifestsProcedure.java` — empty table (54), no-op (86), case-insensitive args (266), invalid inputs (294), sort-by variants (398, 428, 458, 476). And `spark/.../TestRewriteDataFilesAction.java:2100` exercises `table.rewriteManifests().rewriteIf(manifest -> true).commit()`. This is the engine-facing behavior the spec's REPLACE semantics are asserted against.
+
+## Bottom line
+
+- Flink: no manifest-rewriting support in this repo.
+- Spark: `RewriteManifestsProcedure` (SQL) and `RewriteManifestsSparkAction` (API) are the entry points; the Spark engine does the distributed manifest clustering and rewrites entries as EXISTING with explicit snapshot/sequence ids (RewriteManifestsSparkAction.java:254-274, 485-551, 527), then delegates the validated commit to the core `table.rewriteManifests()` / `SnapshotProducer` path (RewriteManifestsSparkAction.java:397-420, SnapshotProducer.java:484-534). It stages only when inheritance is off (137-142) and is careful to clean up only manifests it owns (405-416).

@@ -1,0 +1,18 @@
+{
+ "label": "day1-1",
+ "wall_s": 71.0,
+ "server": {
+  "prompt_tokens_total": 162914.0,
+  "generation_tokens_total": 1741.0,
+  "prefix_cache_hits_total": 97792.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 31.8,
+  "time_to_first_token_seconds_count": 5.0,
+  "request_prefill_time_seconds_sum": 31.1,
+  "request_decode_time_seconds_sum": 36.2
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "nce_number (either explicit or inherited from the manifest's metadata via the manifest list)\n- v3+: first_row_id for row lineage\n\nManifests are intentionally reused across snapshots so slow-changing metadata isn't rewritten every commit; a fast append just creates one new manifest and a new manifest list pointing at the old manifests plus the new one.\n\n## 5. Data files\n\nThe actual rows, stored in Parquet / Avro / ORC (or Puffin for stats and deletion vectors). They're tracked by path in manifests \u2014 Iceberg tracks individual files, not directories. Rows are read by column ID, not name, so schema evolution doesn't require rewriting files. Delete files (position deletes / deletion vectors / equality deletes) live alongside data files, tracked in their own delete manifests.\n\n## How a reader finds the files for a query\n\nThis is the \"planning\" path, and the design goal is O(1) cheap metadata calls rather than O(n) over files:\n\n1. Load one table metadata file (the current one for `main`, or a historical one for time-travel). Resolve paths relative to table location (v4).\n\n2. Pick the snapshot \u2014 current-snapshot-id by default, or the snapshot-log entry for \"as of timestamp\".\n\n3. Open that snapshot's ONE manifest list. This is the single most important optimization: the read of the manifest list gives you partition summaries and file/row counts for every manifest.\n\n4. Use the manifest list's stats to SKIP manifests that can't contain matching data: if a manifest's partition field summaries (bounds, null flags) exclude the query's range for a partition field, that entire manifest is skipped without opening it.\n\n5. For each surviving manifest, plan its files:\n   - Convert the scan predicate (on table columns) into a partition predicate using the manifest's partition spec \u2014 the \"inclusive projection\" (if a row matches, its partition matches), so files are never wrongly pruned.\n   - Further filter individual files within the open manifest using per-file column metrics (lower/upper bounds, value counts). For example, a file whose upper bound for `id` is 10 won't be read for `id = 99`.\n\n6. Collect the surviving data files (skipping DELETED-status entries) \u2014 these are the FileScanTasks the engine will parallel-read.\n\n7. Separately plan matching delete files/deletion vectors and, at read time, apply only the deletes whose scope rules match each data file: position deletes/vectors apply when the data file's sequence number <= the delete's and the referenced file_path/partition match; equality deletes apply to all older (strictly lower sequence number) files in the same partition, or globally if unpartitioned. Metrics can let a delete file be ignored entirely (e.g. its bounds don't overlap the query).\n\nThe net effect: number of remote metadata calls for scan planning is bounded by the size of the metadata tree the snapshot points at, not by the number of files, and most pruning happens by skipping manifests cheaply from the manifest list before ever opening files.\n",
+ "stderr": ""
+}

@@ -1,0 +1,21 @@
+Fast append: an append that adds a brand-new manifest instead of rewriting existing ones, so commit cost is O(new data), not O(table size).
+
+1. The spec's definition and rationale — read the "fast append" bullet in the snapshots section (format/spec.md:978-983): it exists to minimize bytes written per append instead of appending records into an existing manifest.
+
+2. Where it all starts — Spark's streaming sink calls table.newFastAppend() (spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java:653); core maps that to the FastAppend class (core/src/main/java/org/apache/iceberg/BaseTable.java:214-216).
+
+3. The class itself — FastAppend is a SnapshotProducer that "adds new manifest files for writes" (core/src/main/java/org/apache/iceberg/FastAppend.java:35-48). Its state: new files bucketed by spec, plus append/rewritten/new manifest lists.
+
+4. Collecting the files to append — appendFile validates the spec exists and dedupes files per spec (so duplicate live entries are impossible) (FastAppend.java:78-96; dedupe by file.location() in api/src/main/java/org/apache/iceberg/util/DataFileSet.java:90-106).
+
+5. The commit work — apply() writes new manifests for the new files, then concatenates them with the parent snapshot's existing, immutable manifests (FastAppend.java:147-172, especially 165-167). It never rewrites existing manifests — that's the whole trick.
+
+6. Writing manifests in parallel — writeDataManifests -> ManifestFiles.writeParallel splits the files and writes groups concurrently (core/src/main/java/org/apache/iceberg/SnapshotProducer.java:748-753; core/src/main/java/org/apache/iceberg/ManifestFiles.java:584-604), with a rolling writer so a huge append becomes several manifests (RollingManifestWriter.java:109-122).
+
+7. Why retries are free — new files are written with null sequence numbers and the snapshot id, both inherited from the manifest list at commit; so a manifest is written once and reused across commit retries, only the manifest list is rewritten (SnapshotProducer.java:299, 308-316; entries added with inherit data-seq at SnapshotProducer.java:771-786).
+
+8. Concurrency — the commit loop retries with exponential backoff on CommitFailedException, and FastAppend carries no validations, matching the spec's "append can always be applied" (SnapshotProducer.java:484-535; empty validate() at SnapshotProducer.java:283 matches format/spec.md:1316).
+
+9. Cleanup — FastAppend deletes only manifests it owns (new + rewritten-appended) and never touched appendManifests; cleanup-after-commit runs only when there are rewritten manifests (FastAppend.java:184-202; deleteUncommitted guards on the committed set at SnapshotProducer.java:756-769).
+
+10. The catch — each append leaves a new manifest, so manifests pile up; the manifest list's summary metadata lets scans skip them, but this is why rewriting/compaction exists. FastAppend's sibling MergeAppend (BaseTable.java:209-211) is the bounded-manifest alternative, and engines default to it (SparkWriteOptions:97-98).

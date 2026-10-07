@@ -1,0 +1,23 @@
+Ten bullets for a new contributor, each anchored to the first place to read:
+
+1. What a partition spec is — read the class that models it: four attributes per field (sourceId, fieldId, name, transform) plus a specId. `api/.../PartitionSpec.java:62-84`.
+
+2. What a single partition field holds — `sourceId`, `fieldId`, `name`, `transform`, each with a getter. `api/.../PartitionField.java:26-37`.
+
+3. The transform contract — every transform implements `apply`/`bind` (produce the value), `canTransform`/`getResultType` (type rules), and `project`/`projectStrict` (used for scan pruning). Read the Javadoc on each. `api/.../transforms/Transform.java:39-128`.
+
+4. The factory that parses transform strings (`day`, `bucket[16]`, `truncate[8]`, `void`, and unknown → `UnknownTransform`). This is where spec strings become objects. `api/.../transforms/Transforms.java:54-81`.
+
+5. Bucket partitioning and its exact hash — the `(hash & Integer.MAX_VALUE) % N` formula plus null handling. `api/.../transforms/Bucket.java:112-117`.
+
+6. Truncation and its negative-value edge case — the positive-remainder formula, called from the per-type apply methods. `api/.../transforms/Truncate.java:181-186` and `api/.../util/TruncateUtil.java:55-61`.
+
+7. Build-time validation — a spec can't be built from a non-primitive source, a type a transform rejects, or a field nested under a map/list; skipped for `void`. `api/.../PartitionSpec.java:649-686`.
+
+8. The partition tuple's type — `partitionType()` derives a `StructType` from the spec fields using partition field ids, since manifests reuse this struct. `api/.../PartitionSpec.java:135-152`.
+
+9. Applying the transform to a row (write path) — `PartitionKey` maps each field's sourceId+transform and computes the tuple; `toPath()` renders the `name=value/...` directory. `api/.../PartitionKey.java:53-73`.
+
+10. Partition pruning in a real engine (read path) — the spec's per-spec inclusive projection is applied to tasks in Spark's runtime filter handling. `spark/v3.5/.../source/SparkBatchQueryScan.java:127-147`.
+
+Point 10 is the best single "aha": it shows `Projections.inclusive(spec)`, `spec.partitionType()`, and keying evaluators by `task.spec().specId()` all working together — the whole design in one screen.

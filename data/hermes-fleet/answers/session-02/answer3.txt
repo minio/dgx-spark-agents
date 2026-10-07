@@ -1,0 +1,50 @@
+Here are the failure modes of schema evolution and the guards that catch each. Citations are to `core/src/main/java/org/apache/iceberg/SchemaUpdate.java` unless noted.
+
+Add / structure failures
+
+- Adding a column whose name already exists: guarded in `internalAddColumn` — `Preconditions.checkArgument` rejects a non-null existing field unless that field is itself pending deletion (allowing add-after-delete in one transaction) (SchemaUpdate.java:145-149, 152-156).
+- Adding to a missing parent or a non-struct: parent must resolve and be a struct (map value / list element are unwrapped first) (SchemaUpdate.java:123-140); the nested-target check rejects map/list keys and non-nested types (SchemaUpdate.java:136-140).
+- Adding a required column with no default: refused unless `allowIncompatibleChanges()` is set (SchemaUpdate.java:160-163). This is the spec's "required field added must have both defaults non-null" (spec.md:393).
+- Adding to a column that is being deleted: blocked (SchemaUpdate.java:143-144).
+- ID collision when adding nested structs: `TypeUtil.assignFreshIds` reassigns every nested id (SchemaUpdate.java:179; api/TypeUtil.java:301-303), so a nested type never reuses an id.
+
+Delete / update conflicts
+
+- Deleting a missing column (SchemaUpdate.java:192), deleting a column that has pending additions (193-196) or pending updates (197-198) — all rejected.
+- Renaming a missing column (207), to null (208-209), or a column marked for deletion (209-212) — rejected.
+- Updating (type) a missing (275) or deleted (276-279) column — rejected.
+- Changing nullability to a stronger requirement without a default or `allowIncompatibleChanges`: `internalUpdateColumnRequirement` blocks optional->required unless the field is a defaulted add or incompatible changes are allowed (SchemaUpdate.java:252-255). Back to optional is always allowed (the spec's only guaranteed-rollback case, spec.md:385).
+- Deleting/updating/altering map keys or the list element: `map()` throws for any key-side delete, update, add, or type-alter (SchemaUpdate.java:714-725) and for deleting the value type (730-731); `list()` rejects deleting the element type (694-696). This enforces the spec's "no map/list key restructuring" and "not nested in map or list" rules (spec.md:387, 437).
+
+Type promotion failures
+
+- Non-promotion type change (e.g., `int`->`string`, or a narrowing) is blocked by `TypeUtil.isPromotionAllowed` (SchemaUpdate.java:285-290). The exact promotion set lives in api/TypeUtil.java:471-497 and mirrors the spec table (spec.md:357-365): only int->long, float->double, and decimal with equal scale / wider precision. Note `date`->`timestamp`, while in the v3 spec, is intentionally NOT allowed here — the code keeps partition-safe promotions only, per spec.md:381.
+- A default that can't convert to the new field type: `updateColumnDefault` converts via `Literal.to` and relies on the builder to throw (SchemaUpdate.java:330-332, 339).
+
+Move / reorder failures
+
+- Moving a missing column (348, 357, 369), moving a column to a different struct (439-444, 448-453), or moving a column before/after itself (360, 372) — all rejected.
+- Reordering across struct boundaries is impossible because `internalMove` keys moves by the field's parent id and validates both fields share that parent (SchemaUpdate.java:432-457).
+
+Identifier-field failures
+
+- Deleting (directly or through an ancestor struct) a field that's in `identifierFieldNames`: `applyChanges` walks the parent chain and throws (SchemaUpdate.java:544-563). This honors the spec's identifier-field rules (spec.md:433-437).
+- Setting an invalid identifier: re-validated against the final schema via `Schema.validateIdentifierField` (SchemaUpdate.java:584-585), which rejects missing, non-primitive, optional, float/double, and map/list/optional-struct-nested identifiers (api/Schema.java:163-205).
+- Renaming an identifier stays consistent: the name is swapped in `identifierFieldNames` so the id isn't lost (SchemaUpdate.java:221-224).
+
+No-op and merge cases
+
+- Repeated/identical operations are detected early and return (requireColumn/makeColumnOptional at :245-248, type update at :281-283, doc update at :309-311, default update at :333-335), so an unchanged schema doesn't churn metadata.
+- Conflicting ops in one transaction (add then delete the same name) resolve deterministically through the `deletes`/`updates`/`parentToAddedIds` maps rather than corrupting state.
+
+Concurrency and metadata bookkeeping
+
+- Last-column-id regression: `addSchemaInternal` requires `newLastColumnId >= lastColumnId` (TableMetadata.java:1615-1618), so concurrent schema commits can't reuse/overlap ids.
+- Commit conflict: `commit()` runs `ops.commit(base, update)` where `base` is the version this update was derived from (SchemaUpdate.java:472-476); if another writer moved metadata first, the commit fails and the caller must retry from the new base — the spec's "schema updates must validate the schema hasn't changed" (spec.md:1319).
+- Stale name-mapping / column-property side effects: the `schema.name-mapping.default` property is refreshed for added/renamed fields (SchemaUpdate.java:487-505), and delete/rename propagates to metrics, bloom-filter, and parquet-stats column properties (SchemaUpdate.java:508-527). The name-mapping refresh is wrapped in try/catch that logs but does not fail the update (:487, 501-504), so a mapping hiccup can't abort an otherwise valid schema change.
+
+Known gap
+
+- The code has an explicit open edge case for deleting the last remaining field of a struct — `struct()` rebuilds with "TODO: What happens if there are no fields left?" (SchemaUpdate.java:649). The visitor will produce an empty struct rather than throwing, so nested fields can in principle be fully emptied; the list/map guards prevent the same for their element/value, but a top-level or nested struct isn't separately guarded.
+
+Net: every spec-defined invariant (unique fresh ids, promotion-only type changes, no map/list restructuring, identifier validity, monotonic last-column-id, atomic commit against a fixed base) is enforced at the point where the API method is called, and the only place the code is softer than the spec is the deliberately non-fatal name-mapping side-effect path and the unguarded empty-struct case.

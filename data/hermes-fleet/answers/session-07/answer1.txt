@@ -1,0 +1,37 @@
+Read the whole file (1–2153) in three chunks. Here's what the spec says about delete file indexing and the reasoning behind it.
+
+## What the spec says
+
+**Delete files are rows, tracked like data files.** Row-level deletes (v2+) live in delete files, of three kinds:
+- Position deletes (v2) — mark a row by (data file path, row position). In v3 they're deprecated and replaced by deletion vectors.
+- Deletion vectors (v3) — a Puffin `deletion-vector-v1` bitmap of deleted positions for a single referenced data file.
+- Equality deletes (v2/v3) — mark rows by one or more column values (e.g. id = 5). Prohibited in v4.
+
+**Indexed by manifests, in a separate list.** Delete files are tracked by the same manifest infrastructure as data files (same `manifest_entry`/`data_file` schema), but in *delete manifests* separate from data manifests, because delete manifests are scanned first during planning. Manifests store the partition tuple and per-file metrics (bounds, counts) for delete files exactly as they do for data files — the metrics describe the *deleted* rows.
+
+**Why separate delete manifests.** Since delete files are applied to data files rather than read directly, scan planning must consider them before deciding what to read. Splitting them out means a planner can scan the (usually much smaller) set of delete manifests first, and only open data manifests for files that have applicable deletes.
+
+**The `content` field is the index discriminator.** On both the manifest entry and the manifest-list `manifest_file` row, `content` (0=data, 1=deletes) and the `data_file.content` field (0=data, 1=position deletes, 2=equality deletes) tell the planner what kind of file an entry is. `referenced_data_file`, `content_offset`, and `content_size_in_bytes` (v3) let a DV point at its exact data file and blob location in the Puffin file.
+
+## How deletes are matched to data files
+
+**Partition + age, not a lookup table.** Deletes apply to data files in the *same partition* (partition values and spec ID must be equal). The relative age comes from the **data sequence number**: a delete applies to a data file only if the data file's data sequence number is ≤ the delete's (strictly `<` for equality deletes). This is why sequence numbers exist and why `file_sequence_number` can't be used for pruning — a data file's content can be older than its manifest entry, so only the *data* sequence number reflects true age.
+
+## Why it's designed this way
+
+1. **No rewrite of data files.** The whole point of v2 was to enable row-level updates on immutable files without rewriting them. Indexing deletes separately lets you delete rows by just adding a small delete file in a commit, leaving data untouched.
+
+2. **O(1) planning / metadata-stats pruning.** A core goal is that scans don't do O(n) work in table size. By keeping delete files in manifests with partition summaries and column bounds/counts, a planner can:
+   - Skip whole manifests via counts/partition summaries,
+   - Use a delete file's metrics to ignore it when it can't overlap the scan predicate (a delete file with ids 1–4 is ignored for `id = 9`), and
+   - Filter deletes by partition using the same inclusive-projection from column predicates to partition predicates used for data files.
+
+3. **Avoiding a lookup structure.** There is deliberately no global "delete lookup table." Instead deletes are matched at read time by the cheap, stateless rule "same partition, older-or-equal data sequence number." This keeps metadata immutable and append-friendly and avoids any central structure that would bottleneck or need serialization.
+
+4. **Partition cardinality is bounded.** Since a delete only ever applies within a partition, the number of data files a single delete file can possibly affect is bounded by that partition's files — keeping the read-time filtering tractable. Equality deletes under an *unpartitioned* spec are the one global exception, and they're explicitly called out as such.
+
+5. **Deletion vectors for efficiency and simplicity.** v3 introduced DVs as a binary, per-file bitmap that's cheaper at execution than position-delete files, with the crucial invariant of at most one DV per data file (writers merge/rewrite, replacing prior position deletes) so readers can safely ignore matching position files when a DV exists.
+
+6. **Forward-looking direction.** v4 drops equality deletes (a global, value-based match that's expensive to index at scale) but keeps applying pre-existing ones for upgraded tables — preserving read compatibility without paying for new writes.
+
+In short: delete indexing is tied to partition and data sequence number, indexed via manifests with metric-based pruning, and kept as small immutable files appended in commits — chosen to preserve the core Iceberg promise of immutable files, cheap metadata-driven scan planning, and engine-independent row-level deletes.

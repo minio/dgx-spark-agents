@@ -1,0 +1,47 @@
+I have the full picture for both integrations. Here's how query engines use views.
+
+## The engine-facing abstraction
+
+Both Spark and Flink talk to views only through the public `View`/`ViewCatalog` API (api/src/main/java/org/apache/iceberg/view/) and never touch the `ViewMetadata` internals directly. The engine's job is to bridge Spark/Flink's own `View` interface to Iceberg's, and the critical operation on both sides is `sqlFor(dialect)` — pulling the stored SQL back out in a dialect the engine can actually execute. That single method is what makes "the query stored by the view is executed every time the view is referenced" (view-spec.md:25) real.
+
+`BaseView.sqlFor` implements dialect resolution — exact match first, else the first SQL representation, else null — with case-insensitive matching (BaseView.java:113-130).
+
+## Spark
+
+SparkCatalog is a `ViewCatalog` adapter; `asViewCatalog` (SparkCatalog.java:142) is the underlying Iceberg catalog.
+
+Read path — SparkView.java
+- `SparkView` (SparkView.java:36) adapts an Iceberg `View` to Spark's `org.apache.spark.sql.connector.catalog.View`.
+- `query()` calls `icebergView.sqlFor("spark")` and throws if no Spark-dialect SQL exists (SparkView.java:61-65). This is what Spark executes when the view is referenced.
+- `currentCatalog()`/`currentNamespace()` map the view version's `default-catalog`/`default-namespace` back to Spark (SparkView.java:67-77), falling back to the catalog name when default-catalog is null — matching view-spec.md:86-87.
+- `schema()`, `columnAliases()`, `columnComments()` project the Iceberg schema/columns back to a Spark StructType (SparkView.java:80-107).
+- `equals`/`hashCode` use only the view name deliberately, so Spark's plan cache invalidates correctly across loads (SparkView.java:133-150).
+
+DDL path — SparkCatalog.java
+- `createView` builds the view by calling `asViewCatalog.buildView(...).withDefaultCatalog(currentCatalog).withDefaultNamespace(...).withQuery("spark", sql).withSchema(...).create()` (SparkCatalog.java:605-647). Notice the dialect is literally `"spark"` (SparkCatalog.java:629-636).
+- `replaceView` uses the `.createOrReplace()` builder path (SparkCatalog.java:649-691).
+- `alterView` routes Spark's property changes into `view.updateProperties()` (SparkCatalog.java:693-709), which is `PropertiesUpdate` (BaseView.java:89-91).
+- `loadView` wraps the Iceberg view in `SparkView` (SparkCatalog.java:591-603), and `listViews`/`viewExists` funnel to the ViewCatalog (SparkCatalog.java:575-589).
+
+So a Spark `CREATE VIEW` stores a `spark`-dialect SQL representation; when another engine (say Trino) or another session references the view, Spark's `sqlFor("spark")` finds its own dialect and replays it.
+
+## Flink
+
+FlinkCatalog similarly adapts the ViewCatalog (FlinkCatalog.java:115). Views are only consulted for names that can't be metadata tables (`canBeView`, FlinkCatalog.java:187-191), and it gracefully treats catalogs that reject view ops as "no views" (FlinkCatalog.java:374-375, 397-400, 461-463, 487-489).
+
+Read path — toCatalogView (FlinkCatalog.java:862-898)
+- `view.sqlFor(FLINK_DIALECT)` must return a Flink-dialect SQL representation or Flink throws (FlinkCatalog.java:863-864). The stored SQL becomes both Flink's original and expanded query (FlinkCatalog.java:896-897).
+- Returned as a `CatalogView` with the Iceberg schema converted via `FlinkSchemaUtil` and the comment extracted from `ViewProperties.COMMENT` (FlinkCatalog.java:887-897).
+
+Write path — create view
+- `asViewCatalog.buildView(...).withSchema(FlinkSchemaUtil.convert(...)).withDefaultCatalog(getName()).withDefaultNamespace(appendLevel(...)).withQuery(FLINK_DIALECT, view.getExpandedQuery())` (FlinkCatalog.java:627-632). Note Flink stores the *expanded* query, fully qualifying every reference against this catalog+schema, so the view resolves identically regardless of the reader's session.
+
+The important difference from Spark, and the reason for an extra guard: Flink resolves SQL references against the view's own catalog/namespace (not the reader's session). So Flink must reject a view whose stored `default-catalog`/`default-namespace` don't match the catalog it's being read through — otherwise an unqualified reference would resolve to the wrong table (FlinkCatalog.java:866-885). This is a real failure mode the earlier "what can go wrong" analysis only hinted at: the `default-catalog` fallback (view-spec.md:86-87) is safe for engines like Spark that resolve against the session, but unsafe for Flink, which resolves against the view's stored location.
+
+## How this ties back to the spec and the earlier edge cases
+
+- The stored `default-catalog`/`default-namespace` (view-spec.md:83-87) are what both engines use to reconstruct resolution context. Spark trusts them (with the null fallback), Flink validates them strictly (FlinkCatalog.java:869-885).
+- Both engines depend on `sqlFor` finding their dialect — which is exactly why the builder rejects duplicate dialects in one version (the guard I cited earlier) and why the dialect-drop guard exists. If a REPLACE silently dropped the `spark` or `flink` representation while the alternate `replace.drop-dialect.allowed` was false, the corresponding engine would fail its "Cannot load SQL for view" checkState (SparkView.java:63, FlinkCatalog.java:864). Removing a dialect is the one interop failure the metadata layer actively blocks.
+- The unknown-representation tolerance (UnknownViewRepresentation on read) means a future, not-yet-supported representation type won't crash an engine that only understands `sql` — it simply won't be found by `sqlFor`, and the engine reports the view unreadable.
+
+If you want, I can trace the concrete round-trip in the TestViews test (spark/v3.5/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/TestViews.java) to confirm the create → load → query behavior end to end.

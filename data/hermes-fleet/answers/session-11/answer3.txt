@@ -1,0 +1,72 @@
+I've now confirmed the guards. Note: some of these edge cases (retention expiration, GC of files) are guarded in SnapshotUtil's callers (ManageSnapshots, RemoveSnapshots/ExpireSnapshots) rather than inside SnapshotUtil itself, but I'll focus on what SnapshotUtil and its direct path can guard, and note where the guard lives elsewhere.
+
+Here are the edge cases and failure modes of Iceberg time travel, and how the code guards against each (with citations).
+
+## 1. Requested timestamp is older than every snapshot — no snapshot exists at/before T
+
+The most common failure. A time-travel query asking for a state before the table existed, or beyond the retained history, has no matching snapshot.
+
+Guard: `SnapshotUtil.snapshotIdAsOfTime` throws `IllegalArgumentException` "Cannot find a snapshot older than %s" when the lookup returns null — SnapshotUtil.java:317-320, following the spec's "raise an informative error message" (spec.md:2080). The null is produced by `nullableSnapshotIdAsOfTime` when no `HistoryEntry` satisfies `timestamp <= T` (SnapshotUtil.java:326, 329).
+
+## 2. The snapshot-log is unpopulated / empty (it's an optional field)
+
+The spec notes snapshot-log is optional (spec.md:2080). If a table's metadata has no `snapshot-log` entries, `table.history()` returns an empty list and the loop never assigns a snapshot.
+
+Guard: `snapshotIdAsOfTime` still routes through the same null check and throws "Cannot find a snapshot older than ..." (SnapshotUtil.java:317-320). So an unavailable log degrades to a clear error rather than a wrong answer. (Note: because the log is only maintained going forward, a fresh/upgraded table simply has no history to query.)
+
+## 3. The snapshot exists in the log but was already expired from `snapshots` (retention)
+
+A snapshot-log entry can reference a snapshot that retention has already removed from the valid `snapshots` list — the log entry is only removed when the snapshot is expired via `snapshot-log` maintenance, so a stale entry can survive (spec.md:1163).
+
+Guard: this is caught at the *use* stage, not the lookup stage. `SnapshotUtil.schemaFor` calls `table.snapshot(snapshotId)` (SnapshotUtil.java:354) and throws "Cannot find snapshot with ID %s" if it's null (SnapshotUtil.java:355). `TableMetadata.snapshot(long)` returns null for a missing/expired id (TableMetadata.java:533, guarded by the `containsKey` check at 529-531). The expiration work itself happens in the retention/expire path (ManageSnapshots/RemoveSnapshots), which enforces `min-snapshots-to-keep`/`max-snapshot-age-ms` per spec.md:1118-1132.
+
+## 4. Rewinding/rollback: the two histories (lineage vs. log) disagree
+
+The spec explicitly warns that the snapshots lineage and the snapshot-log can name different IDs for the same timestamp (spec.md:2077-2078), e.g. after a rollback to an arbitrary snapshot with no lineage.
+
+Guard: the implementations only ever consult the log for `AS OF` reads — `nullableSnapshotIdAsOfTime` iterates `table.history()` and nothing else (SnapshotUtil.java:328). It deliberately never touches `parentId` chains for the time lookup, so the ambiguity is resolved by construction. When a rollback changes `current-snapshot-id`, `TableMetadata.Builder.setRef` records the *change time* (`lastUpdatedMillis`) rather than the snapshot's original timestamp (TableMetadata.java:1341-1344), so the log reflects "state became X at time now," which is the correct semantics for point-in-time reads.
+
+## 5. Snapshot created before `schema-id` existed — schema can't be resolved from the snapshot
+
+Snapshots written before Iceberg added `schema-id` to the snapshot have `schemaId == null` (spec.md:964 makes it optional).
+
+Guard: `SnapshotUtil.schemaFor` checks `if (schemaId != null)` and only then looks up `table.schemas().get(schemaId)` (SnapshotUtil.java:356-363); on null it falls back to `table.schema()` (SnapshotUtil.java:366, with a `// TODO` noting it could recover by reading prior metadata files). This is a degradation rather than a hard failure — the historical schema may be approximated by the current one.
+
+## 6. Both snapshot-id AND timestamp supplied (ambiguous request)
+
+Calling `schemaFor(table, snapshotId, timestampMillis)` with both set is contradictory — which one should win?
+
+Guard: `Preconditions.checkArgument(snapshotId == null || timestampMillis == null, "Cannot use both snapshot id and timestamp ...")` at SnapshotUtil.java:381-383 rejects it outright rather than silently preferring one.
+
+## 7. Time travel to a snapshot/branch that doesn't resolve
+
+- Asking for a schema at a snapshot ID not present: `schemaFor(table, snapshotId)` → `table.snapshot` returns null → `Preconditions.checkArgument(snapshot != null, "Cannot find snapshot with ID %s")` at SnapshotUtil.java:355.
+- Asking for a schema by a ref that isn't a tag: `schemaFor(table, String ref)` and `schemaFor(metadata, String ref)` treat a missing ref or a *branch* as "use the table's current schema" (SnapshotUtil.java:408-417, 432-443), because branches don't fix a schema. This matches the spec's branch/tag semantics (spec.md:1100-1116).
+
+## 8. Oldest-ancestor traversal hits an expired ancestor
+
+Manifest reads and retention builds often walk the `parentId` lineage. If an ancestor has been expired, `lookup.apply(parentId)` returns null.
+
+Guard: `SnapshotUtil.oldestAncestorOf` is explicitly defined to stop at "an ancestor snapshot whose parent is null **or has been expired**" (SnapshotUtil.java:127-130). The iterator in `ancestorsOf` treats a null lookup result as the end of iteration: `this.next = lookup.apply(parentId); if (next != null) {...} return false;` (SnapshotUtil.java:248-254). And `Preconditions.checkArgument(start != null, "Cannot find snapshot: %s")` guards the entry point when the starting ID itself is unknown (SnapshotUtil.java:146).
+
+## 9. Starting point of a traversal is itself unknown/expired
+
+`ancestorsOf(snapshotId, lookup)` begins by resolving the supplied ID.
+
+Guard: `SnapshotUtil.java:145-147` — `lookup.apply(snapshotId)` then `Preconditions.checkArgument(start != null, "Cannot find snapshot: %s")`, throwing an informative error instead of NPE-ing or returning garbage.
+
+## 10. Retention/expiration racing a concurrent time-travel read
+
+Because snapshots/data files can be physically deleted only after the last snapshot listing them is GC'd (spec.md:1162), an in-flight read of an old snapshot could, in principle, find its files gone. This is the fundamental boundary the spec draws.
+
+Guard: the code doesn't fully protect the *read* inside SnapshotUtil — the protection lives in the retention/expire path (RemoveSnapshots/ExpireSnapshots) which respects `min-snapshots-to-keep` and `max-snapshot-age-ms` and only frees files after the referencing snapshots are expired (spec.md:1118-1162). SnapshotUtil's contribution is to fail loudly on any dangling reference (cases 3 and 9), so time travel past the retention horizon produces an error rather than silently reading a partially-deleted state. The default is `main`-branch snapshots never expire and references pin their snapshots (spec.md:1114).
+
+## 11. Null current snapshot (empty table)
+
+Traversals over the current state short-circuit on a null current snapshot.
+
+Guard: `oldestAncestorAfter` returns `null` immediately when `table.currentSnapshot() == null` (SnapshotUtil.java:161-164), and `currentAncestors` via `ancestorsOf(null, ...)` returns an empty `ImmutableList` (SnapshotUtil.java:227-228, 268-269), so ancestry walks don't NPE on an empty table.
+
+## Summary of the failure-signaling pattern
+
+Most of these reduce to one consistent guard: **never guess, never return a wrong snapshot, fail with an informative exception or degrade explicitly.** The null-tolerant lookups (`table.snapshot` → null at TableMetadata.java:533, `schemaId` null check at SnapshotUtil.java:356) plus the `Preconditions` at SnapshotUtil.java:146, 317-320, 355, 381-383 turn every "missing" condition — expired snapshot, empty log, unknown ref, both-id ambiguity, missing schema — into a clear error, while the lineage/rollback divergence (case 4) is avoided structurally by reading only the snapshot-log.

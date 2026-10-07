@@ -1,0 +1,42 @@
+I read the full spec (format/spec.md, 2153 lines). Here's what it says about name mapping and why it's designed that way.
+
+## What the spec says
+
+Name mapping lives in the **Column Projection** section (§ schemas, lines 412-429) and its serialization is in **Appendix C** (lines 1805-1823).
+
+The core problem it solves: Iceberg identifies columns by **field id**, not by name. But the underlying file formats (Parquet, Avro, ORC) are name-based. When a data file is written it stores its own column names plus field ids. Normally the ids in the file are authoritative. Name mapping is a **fallback** used only when a data file does *not* contain field id information at all — for example when you register data that was originally written by a non-Iceberg tool (e.g. a Hive or Parquet table that never stamped ids into the schema).
+
+It's a table property, `schema.name-mapping.default`, whose value is a JSON list of field-mapping objects. Each object has:
+
+- `names` — required, a list of one or more names for the field. A `.` inside a name is a literal dot, not a nesting separator.
+- `field-id` — optional; the Iceberg field id to use when a field's name matches one of `names`.
+- `fields` — optional; child-field mappings for structs, lists, and maps.
+
+Position in the resolution order (line 399-408), when a data file lacks a column id:
+1. If an identity partition transform exists for the field and the partition value is present, return it from partition metadata (enables metadata-only Hive migrations).
+2. **Use the name-mapping to map field id to column.**
+3. Return the `initial-default` if defined.
+4. Otherwise return `null`.
+
+Key rules in the mapping:
+- Several names can map to one field id — e.g. all Avro aliases for a field are listed in `names`, handled per-file.
+- A field that exists only in the Iceberg schema (not in imported files) may use an empty `names` list.
+- A field that exists in imported files but not the Iceberg schema may omit `field-id`.
+- Lists must map an `element`, maps must map `key` and `value`, structs map their children.
+- The example (lines 1816-1823) shows `id`/`record_id`, `data`, and a nested `location` struct with `latitude`/`lat` and `longitude`/`long` — the classic case of importing data with quarkus/Hive-style column names into a renamed Iceberg schema.
+
+## Why it's designed this way
+
+**Name mapping exists to bridge the name-based world of the file formats to Iceberg's id-based world, without rewriting files.** The whole point of id-based projection is that the table schema can evolve — columns renamed, reordered, dropped — independently of the physical files. That works when files carry ids. But imported files (built outside Iceberg) only have names. Rather than forcing a full rewrite of the data to stamp ids, Iceberg provides a metadata-level translation table at the catalog/table level.
+
+A few design decisions stand out as intentional:
+
+1. **It's the last-resort fallback, not the primary mechanism.** The spec is careful that ids in the file win, and projection is done by id. Name mapping only kicks in for files missing id info. This keeps the fast, correct path id-based and confines the per-file name matching to exactly the data that needs it.
+
+2. **Names are only guidance, ids are binding.** The mapping object has optional `names` and optional `field-id`, and the field-id is what Iceberg actually uses downstream (stats, bounds, scan planning all key on field id). The names are just the lookup key. That asymmetry is deliberate: it lets an imported column join the id-based system despite having foreign names.
+
+3. **One mapping set serves all files.** Because it's a table-level property, a single mapping covers the variety of file-specific names (the aliases case: `latitude` and `lat` both → field 4). This avoids storing per-file mapping metadata.
+
+4. **It pairs with identity-partition metadata-only reads.** Placing it right after the identity-transform rule in the resolution order is not incidental: both exist to make Hive-style tables readable without a data rewrite — the partition value can stand in for a column, and name mapping handles the rest.
+
+So in short: name mapping is a compatibility bridge. It lets named (non-Iceberg) files be incorporated and read as if they carried Iceberg field ids, trading per-file name resolution for the benefit of total schema and partition evolution — the property the spec lists as one of its core goals.

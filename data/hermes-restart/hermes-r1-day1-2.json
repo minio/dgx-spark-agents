@@ -1,0 +1,18 @@
+{
+ "label": "day1-2",
+ "wall_s": 89.9,
+ "server": {
+  "prompt_tokens_total": 1194546.0,
+  "generation_tokens_total": 3763.0,
+  "prefix_cache_hits_total": 1165824.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 18.1,
+  "time_to_first_token_seconds_count": 14.0,
+  "request_prefill_time_seconds_sum": 16.0,
+  "request_decode_time_seconds_sum": 69.0
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "a:297)\n- the new snapshot is built **on top of B**, reusing B's manifests plus A's new files (SnapshotProducer.java:304)\n- `sequenceNumber` is re-derived from B's higher `nextSequenceNumber()` (SnapshotProducer.java:299)\n- and because the manifests/manifest-list are immutable and already written, only the manifest list is rewritten with the new snapshot id (that's exactly the inheritance design from the spec), and the pointer is swapped on B's version.\n\nNet result: **A's retry commits on top of B's**, and both writers' files end up in the table. Neither write is lost, and the table is never partially visible.\n\n## Where it can go wrong \u2014 state unknown\n\nThe retry loop only retries on `CommitFailedException`. If a commit partially succeeds but the outcome is ambiguous (e.g., the metastore call failed on a network blip *after* the alter actually landed), the code treats this as a `CommitStateUnknownException` and **does not blindly retry** (SnapshotProducer.java:536-537). The Hive path detects this case and, instead of guessing, checks the actual commit status by searching current and past metadata locations \u2014 `checkCommitStatus` / `checkCommitStatusStrict` (HiveTableOperations.java:375-386 \u2192 BaseMetastoreTableOperations.java:298/318 \u2192 BaseMetastoreOperations.java:63/99). The result is `SUCCESS`, `FAILURE`, or `UNKNOWN`; only `FAILURE` produces a retryable `CommitFailedException` (HiveTableOperations.java:376-378), while `UNKNOWN` throws `CommitStateUnknownException` (SnapshotProducer.java:536 rethrows). This prevents the classic \"commit succeeded but we retried and double-applied the change\" corruption.\n\nAfter a successful commit, `SnapshotProducer.commit()` refreshes and cleans up \u2014 removing orphaned manifest lists from failed attempts (SnapshotProducer.java:553-564) and deleting uncommitted manifests (SnapshotProducer.java:556).\n\n## Key files/lines\n\n- SnapshotProducer.java:489-497 \u2014 retry loop, `onlyRetryOn(CommitFailedException)`, exponential backoff\n- SnapshotProducer.java:296/477 \u2014 `refresh()` at the top of every `apply()` (this is what makes retries rebase onto the winner)\n- SnapshotProducer.java:533 \u2014 `taskOps.commit(base, updated)`\n- BaseMetastoreTableOperations.java:111-119 \u2014 stale-metadata check \u2192 `CommitFailedException`\n- BaseMetastoreTableOperations.java:127 \u2014 `doCommit` (the atomic point)\n- HiveTableOperations.java:241-415 \u2014 `doCommit`: write metadata file, verify `baseMetadataLocation == metadataLocation` (288-294), `persistTable`\u2192`alterTable` (332, HiveOperationsBase.java:148), status handling (375-396)\n- BaseMetastoreOperations.java:63-151 \u2014 commit-status resolution (UNKNOWN vs FAILURE vs SUCCESS)\n- SnapshotProducer.java:536-537 \u2014 rethrow `CommitStateUnknownException` without retrying\n\nIn short: **optimistic concurrency with compare-and-swap on the metadata pointer; losers get a `CommitFailedException`, refresh the now-current metadata, and rebase their snapshot on top of the winner \u2014 so both concurrent writes survive and compose.**\n",
+ "stderr": ""
+}

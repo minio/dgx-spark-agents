@@ -1,0 +1,75 @@
+I've verified the guards across write, assignment, and read paths. Here's the systematic enumeration of edge cases and failure modes, and what the code does (or doesn't) do about each.
+
+## 1. User schema collides with the reserved metadata ID range
+
+The spec forbids user field ids above `Integer.MAX_VALUE - 200` (spec.md:441). A user field or a runaway `last-column-id` landing in the metadata range would silently make `_row_id`/`_file`/etc. indistinguishable from real columns, breaking projection and lineage.
+
+**Guard — mostly by construction, not a hard check.** `MetadataColumns` keeps all metadata IDs in the top 108 (MetadataColumns.java:33–108), and `TableMetadata.newTableMetadata` reassigns every user column fresh from `lastColumnId` starting at 0 (TableMetadata.java:120–123, via `AssignFreshIds`), so a freshly-created table can't collide. Ids rise only through `lastColumnId::incrementAndGet` (TableMetadata.java:123) and schema updates (`SchemaUpdate.java:179`). **Gap:** I found no `Preconditions` in the assigner or `Schema`/`TableMetadata` that *rejects* a schema whose `highestFieldId()` (Schema.java:268) crosses into `Integer.MAX_VALUE - 200`. The code relies on the count of fields staying far below 2^31 rather than explicitly validating the reserved boundary. A hand-written metadata file (or a schema builder fed huge explicit ids) could slip into the range without an error at parse time.
+
+## 2. Row-ID exhaustion / `next-row-id` overflow
+
+`next-row-id` and `_row_id` are longs seeded at 0 (`INITIAL_ROW_ID`, TableMetadata.java:65). Uniqueness depends on `next-row-id` always exceeding every assigned id (spec.md:1203). Two sub-failures:
+
+**Write side — monotonicity and non-null are enforced.** `TableMetadata.Builder.addSnapshot` (TableMetadata.java:1278–1288) is the front-line guard:
+- requires a v3+ snapshot to have a non-null `first-row-id` (TableMetadata.java:1279–1280);
+- requires `firstRowId() >= nextRowId` — a stale/regressing snapshot fails (TableMetadata.java:1281–1285);
+- advances `nextRowId += snapshot.addedRows()` (TableMetadata.java:1287).
+
+`SnapshotProducer` computes `assignedRows = writer.nextRowId() - base.nextRowId()` (SnapshotProducer.java:338–339), and the manifest-list writer steps each manifest's `first_row_id` by `existingRowsCount() + addedRowsCount()` (ManifestListWriter.java:138–149). The v3 write schema double-checks that an assigned `first_row_id` only ever applies to a data manifest and is never left null for a live data file (V3Metadata.java:145–160).
+
+**Overflow is not guarded.** `nextRowId += addedRows()` (TableMetadata.java:1287) and `firstRowId + pos` (see below) are unchecked `long` arithmetic. In a table large enough to approach `Long.MAX_VALUE` assigned ids, these would silently wrap into negatives, breaking the `firstRowId >= nextRowId` invariant and producing duplicate/reordered row ids rather than failing. Given ~9.2e18 row capacity this is theoretical, but there is no explicit overflow `Preconditions`.
+
+## 3. Row-position source diverges from the file's `_pos`
+
+`_row_id = first_row_id + pos` is only well-defined if the `pos` used at read time is the same 0-based ordinal the manifest used. The whole scheme depends on `AvroIterable` supplying the correct split-start position:
+
+- full-file read: supplier is `() -> 0L` (AvroIterable.java:88), and `PositionReader` yields 1,2,3… but `RowIdReader` computes `firstRowId + pos` with pos from `PositionReader` (ValueReaders.java:1313);
+- range/split read: the supplier is derived from `AvroIO.findStartingRowPos(file::newStream, start)` (AvroIterable.java:82–84), and `PositionReader.setRowPositionSupplier` resets `currentPosition = posSupplier.get() - 1` (ValueReaders.java:1288–1290) so the first row of the split gets `pos = start`, not 0.
+
+**Guard:** the `- 1` in `setRowPositionSupplier` (ValueReaders.java:1289) and the `+ 1` in `read` (ValueReaders.java:1280) are what keep `_pos` 0-based across split boundaries. **Failure mode:** if a format/engine reads a split without routing through `SupportsRowPosition` (AvroIterable.java:81–89), every split restarts positions at 1, so row ids collide across splits. The wiring is centralized (AvroIterable.java:79–89) which lowers risk, but there is no assertion that a resumable split was supplied — a misused reader silently produces wrong ids.
+
+## 4. Missing/null `first_row_id` in a *committed* v3+ manifest
+
+A committed manifest must assign `first_row_id` to every live data file (spec.md:949). If a buggy/pre-v3 manifest lacks it, `_row_id` would be unresolvable.
+
+**Guard — three layers:**
+- `ManifestReader.idAssigner`: for a **committed** manifest with a non-null manifest-level `firstRowId`, assigns every file's null `first_row_id` sequentially (ManifestReader.java:450–453); for **uncommitted**, preserves values (ManifestReader.java:459–462); for a committed manifest whose manifest-level id is null (the *pre-v3 upgrade* case, spec.md:538), it defensively nulls every file's `first_row_id` (ManifestReader.java:463–472). This is exactly the spec's upgraded-table rule.
+- `TrackingStruct.assignFirstRowId` refuses to assign when `nextRowId` is null (pre-v3 path) (TrackingStruct.java:163–169), and only assigns to live entries (TrackingStruct.java:174–177) — so deleted/replaced entries don't consume id space.
+- `V3Metadata.ManifestFileWrapper` rejects writing a manifest where a live data file has a null `first_row_id` (V3Metadata.java:156–158).
+
+At the row layer, a still-null `first_row_id` never reaches `RowIdReader`: `PartitionUtil.constantsMap` only adds the row-id constant when `firstRowId() != null` (PartitionUtil.java:57–61), and `ValueReaders.rowIds` falls back to a `constant(null)` otherwise (ValueReaders.java:328–333). So readers degrade to null ids rather than crash on the upgrade path.
+
+## 5. Directly-missing `_row_id` / `_last_updated_sequence_number` columns in data files
+
+Spec allows new-row files to omit both columns (spec.md:476). Since `PartitionUtil` only emits the row-id constant when `firstRowId` is present and always emits the seq constant (PartitionUtil.java:57–65), the readers must tolerate a missing/nonexistent column.
+
+**Guard:** `ValueReaders` keys readers by `fieldId`, and when a field is missing from the file it returns a constant-reader (ValueReaders.java:308–326): `ROW_ID` becomes `rowIds(constant, null)` → falls back to null (ValueReaders.java:311–313), `LAST_UPDATED_SEQUENCE_NUMBER` → `lastUpdated(...)` → `constant(null)` (ValueReaders.java:263–267, 336–343). Both lineage fields are declared **optional** in `MetadataColumns` (MetadataColumns.java:97–108), so an absent value is legal and becomes null — no exception. Rolling into it: any non-null stored value is preserved verbatim (`RowIdReader` returns `idFromFile` if non-null, ValueReaders.java:1309–1311; `LastUpdatedSeqReader` likewise 1339–1342), which is the "identity preserved across rewrites" contract.
+
+## 6. `first_row_id` stored but a *modification* rewrites without copying lineage
+
+Spec requires a rewrite to copy existing `_row_id` and carry seq (spec.md:482–486). If a rewrite drops lineage, ids change.
+
+**Guard:** This is enforced at the engine layer, partly via `MetadataColumns.schemaWithRowLineage` (MetadataColumns.java:157–159) which rewrites use to project `_row_id` and `_last_updated_sequence_number` for reading and writing (e.g. `DataFileRewriteRunner.java:186–188, 205–208`). Not a core-level precondition — a misbehaving engine could still write new ids; the spec explicitly lets engines model updates as delete+insert (new id) vs. preserve (spec.md:488). So this is a **contract, not enforced** in core.
+
+## 7. Overflow in the `firstRowId + pos` row-level computation
+
+**Guard — type discipline, no range check.** `RowIdReader.read` returns `idFromFile != null ? idFromFile : firstRowId + pos` (ValueReaders.java:1309–1314). `pos` is a `long` from `PositionReader` that increments without bound (ValueReaders.java:1279–1281). `firstRowId + pos` is unchecked `long` addition — wraps silently on overflow, producing a wrong (possibly negative/colliding) id rather than an exception. Same class of unguarded math as #2.
+
+## 8. Delete manifests / equality-delete updates corrupting lineage
+
+Spec deliberately excludes equality-delete updates from lineage — they can't know the original row id, so they're modeled as remove+insert (spec.md:470). The code honors this by never assigning lineage to deletes: `first_row_id` is null for delete files (ManifestWriter.java:408; spec.md:947), and `ManifestReader` rejects passing a non-null `firstRowId` into a delete manifest outright: `"First row ID is not valid for delete manifests"` (ManifestReader.java:147–149). `V3Metadata` also forces `null` first-row-id for non-data manifests (V3Metadata.java:153–154). So the known limitation is contained: delete manifests simply carry no ids and downstream readers get null via the #4/#5 fallbacks.
+
+## 9. Reusing `_delete` / reserved ids by stray code or name collisions
+
+`MetadataColumns` guards lookup by both name and id (`META_COLUMNS` and `META_IDS`, MetadataColumns.java:110–127), and `isMetadataColumn(name)`/`(id)` (MetadataColumns.java:145–151) are the validation surface used to keep metadata columns out of user projections. **Gap:** the reserved set is a fixed literal here; `Partitioning.partitionType` and the `_partition` special-case (MetadataColumns.java:133–143) must agree with `META_IDS` (which includes `PARTITION_COLUMN_ID`, MetadataColumns.java:125). If those two ever drift — e.g. a new metadata column added to `META_COLUMNS` but forgotten in `META_IDS` — ID-based checks would misclassify it. It's an internal-consistency risk, not an externally-triggerable one.
+
+---
+
+## Bottom line
+
+The strongest guards are:
+- **monotonic, non-null row-id assignment** at commit (`addSnapshot`, TableMetadata.java:1278–1288) and manifest write (V3Metadata.java:145–160);
+- **deterministic inheritance** that never bakes commit-dependent values into files and cleanly degrades to null on the pre-v3 upgrade path (`idAssigner` ManifestReader.java:440–474, `assignFirstRowId` TrackingStruct.java:163–180, constant fallbacks ValueReaders.java:328–343);
+- **deferred resolution centralized in one place** (`PartitionUtil.constantsMap` + `ValueReaders`), so the `firstRowId + pos` / `fileSeqNumber` substitution is uniform.
+
+The genuine, documented gaps are: **no explicit reserved-range validation** on user schemas (#1), **no overflow checks** on `next-row-id`/`firstRowId + pos` long arithmetic (#2/#7), and **no core enforcement** that rewrites preserve lineage (#6) — those rely on the 2^31/2^63 headroom and on engine cooperation, respectively. The `_pos` split-position invariant (#3) is guarded only by the single wired entry point in `AvroIterable` (AvroIterable.java:79–89).

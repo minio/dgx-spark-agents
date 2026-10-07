@@ -1,0 +1,70 @@
+I've read Transforms.java in full plus every class it calls for partition transforms (Bucket, Truncate, Identity, VoidTransform, UnknownTransform, Years/Months/Days/Hours, TimeTransform, Dates, Timestamps, ProjectionUtil, and the utility classes BucketUtil, TruncateUtil, UnicodeUtil, BinaryUtil). Here's how the implementation follows the spec.
+
+Factory and parsing (Transforms.java)
+-------------------------------------
+- `fromString` (Transforms.java:54-81) parses the JSON transform string. It matches the width-parameterized form `(\w+)\[(\d+)\]` (Transforms.java:39) and dispatches `truncate[N]`/`bucket[N]`, then the fixed names `identity`, `year`, `month`, `day`, `hour`, `void`, and falls back to `UnknownTransform` for anything else (Transforms.java:80). This mirrors the spec's transform-name vocabulary in format/spec.md:571-580. Note it is case-insensitive (spec's Postel's-law guidance), including `Locale.ROOT` in the deprecated typed variant (Transforms.java:99).
+
+Identity
+--------
+- Spec: identity returns the source value for any primitive except geometry/geography; must return null for null.
+- `Identity.apply` (Identity.java:88-90) returns the value unchanged (null passes through). `canTransform` (Identity.java:100-106) allows any primitive except VARIANT/GEOMETRY/GEOGRAPHY (Identity.java:34-35) — matching the spec's exclusion of geometry/geography. Result type = source type (Identity.java:127-129), per the spec row "Source type".
+
+void
+----
+- Spec: always produces null.
+- `VoidTransform.apply` returns null (VoidTransform.java:61-63); `bind` returns an `Apply` whose apply always returns null (VoidTransform.java:44-47). `canTransform` returns true for any type (VoidTransform.java:71-73), matching "Any". Result type echoes the source (VoidTransform.java:76-78), consistent with the spec's "Source type or int".
+
+bucket
+------
+- Spec: `(murmur3_x86_32_hash(x) & Integer.MAX_VALUE) % N`, sign bit discarded, seed 0.
+- BucketUtil uses `Hashing.murmur3_32_fixed()` (BucketUtil.java:34) — Guava's Murmur3 x86-32 with a fixed seed of 0, matching the spec.
+- `Bucket.apply` does `(hash(value) & Integer.MAX_VALUE) % numBuckets` (Bucket.java:112-117), the exact pseudo-code from format/spec.md:597.
+- Allowed source types come from `canTransform` (Bucket.java:120-136): INTEGER, LONG, DATE, TIME, TIMESTAMP, TIMESTAMP_NANO, STRING, BINARY, FIXED, DECIMAL, UUID — the spec's bucket source list (format/spec.md:574).
+- The spec's per-type byte encoding (Appendix B, format/spec.md:1622-1636) is implemented in BucketUtil:
+  - int/long → `hashLong` of the value (BucketUtil.java:38-44). The spec requires int and long hash identically (note 1) so schema promotion is safe; both call `MURMUR3.hashLong(value)`, and since `hash(long)` takes a long, int is widened — producing identical results.
+  - decimal → `hashBytes(unscaledValue().toByteArray())` (BucketUtil.java:101-103) = "minBigEndian(unscaled(v))" (Appendix B note 2). Scale is not part of the hash.
+  - timestamp_ns → Bucket converts nano to micros before hashing (Bucket.java:243-246, `DateTimeUtil.nanosToMicros`), implementing Appendix B note 3 so nano and micro timestamps hash identically.
+  - string → `hashString(value, UTF_8)` (BucketUtil.java:66-68) = utf8Bytes.
+  - UUID → hashes the two longs byte-reversed (BucketUtil.java:92-99) = big-endian bytes (Appendix B note 4).
+  - fixed/binary → `hashBytes` (BucketUtil.java:70-90).
+  - float/double hashing (BucketUtil.java:58-64) canonicalizes -0.0 to +0.0 and the spec notes NaN canonicalization — matching Appendix B note 5 (these types aren't bucketable yet, but the utility implements the spec's "if that changes" table).
+- Result type is always `int` (`getResultType` → IntegerType, Bucket.java:204-207), per the spec.
+
+truncate
+--------
+- Spec (format/spec.md:606-621): int/long use `v - (v % W)` with positive remainder; decimal scales W by the column's scale; string truncates to ≤L UTF-8 code points; binary to ≤L bytes.
+- TruncateUtil implements the exact positive-remainder formula `value - (((value % width) + width) % width)` (TruncateUtil.java:55-60), which is precisely the correction given in the spec's note 1 (format/spec.md:618). `truncateDecimal` (TruncateUtil.java:63-74) applies width at the value's own scale and forces a positive remainder — implementing notes 1 and 2 (width applied at decimal scale, format/spec.md:619).
+- String truncation is by code points, not UTF-16 chars: `UnicodeUtil.truncateString` uses `codePointCount` and `offsetByCodePoints` (UnicodeUtil.java:41-55), so the result is ≤L code points and always valid UTF-8 (spec note 3).
+- Binary truncation takes the first `width` bytes (BinaryUtil.truncateBinaryUnsafe, BinaryUtil.java:65-69) = spec note 4 ("binary values ... truncated to L bytes").
+- Result type is the source type (`getResultType` returns sourceType, Truncate.java:118-121), matching the spec.
+- All apply methods return null for null input (Truncate.java:181-186, 240-245, 298-304, 414-419, 476-481), per "All transforms must return null for a null input value."
+
+year/month/day/hour
+-------------------
+- The typed entry points (`year()` → Years.get(), etc., Transforms.java:231-263) all extend `TimeTransform`. `toEnum(type)` dispatches based on source type to either `Dates` (for DATE) or `Timestamps` (micros/nanos) via `fromSourceType` (TimeTransform.java:29-43) — covering the spec's allowed source types (date, timestamp, timestamptz, and ns variants; format/spec.md:576-579).
+- Result types follow the spec: year/month/hour → IntegerType; day → DateType (Days.java:45-48, Months.java:46-48, Years.java:46-48, Hours.java:52-54). Note the day transform returns the partition value as `int` days in `Dates`/`Timestamps` (the enum's Apply) but `getResultType` reports `DateType` (Dates.java:101-106) — the data file stores days since 1970 as an int, exactly the spec's "day ... as days from 1970-01-01" with "readers must also accept int values" (format/spec.md:577, 588).
+- The epoch math (micros/nanos → years/months/days/hours) is delegated to DateTimeUtil (Dates.java:53-63, Timestamps.java:66-96).
+
+Type gating
+-----------
+- Each transform validates inputs: Bucket rejects unsupported types in `canTransform`/`bind` (Bucket.java:93-96, 120-136), Truncate likewise (Truncate.java:88-104), and identity rejects geometry/geography (Identity.java:100-106). This implements the spec's requirement that writers can't commit with a spec/type combination that isn't supported.
+
+Unknown transforms
+------------------
+- `UnknownTransform` (UnknownTransform.java:28-99) has `canTransform` → true and `getResultType` → string (UnknownTransform.java:58-67), and its `project`/`projectStrict` return null. Returning null from `project` means the partition predicate becomes `true` (no filtering) — the implementation of the spec's rule that readers must ignore unknown partition fields when filtering (format/spec.md:563, 1065, and the v3-required behavior in Appendix E). The `bind`/`apply` throw UnsupportedOperationException (UnknownTransform.java:46-55), so writers cannot actually apply it — matching "Writers are not allowed to commit data using a partition spec that contains a field with an unknown transform."
+
+Predicate projection (the pruning part of the spec)
+---------------------------------------------------
+- The `Transform` interface's `project`/`projectStrict` (Transform.java:104-128) encode the spec's inclusive/strict projections. Inclusive guarantees "if pred(v) true then projected(apply(v)) true" (Transform.java:108-113) — the spec's inclusive-projection definition (format/spec.md:1061-1063).
+- `TruncateInteger.project` (Truncate.java:189-203) and `ProjectionUtil.truncateInteger` (ProjectionUtil.java:42-61) convert `x < B` into `truncate(x) <= truncate(B-1)` etc., adjusting the bound to keep the projection inclusive. `projectStrict` (Truncate.java:206-222, ProjectionUtil.java:63-84) does the reverse and refuses to project EQ (returns null) because adjacent values map to the same bucket — a soundness check that the "strict" projection never over-includes.
+- `Bucket.project` (Bucket.java:160-181) projects only EQ and IN (exact values) and refuses comparisons (returns null, letting the scan be fully inclusive), which is correct—comparisons can't be made exact on a hash.
+- Time transforms add `fixInclusiveTimeProjection`/`fixStrictTimeProjection` (ProjectionUtil.java:275-412), a compatibility shim for a pre-0.10.0 bug where negative timestamps transformed one too large (ProjectionUtil.java:264-274). This doesn't change today's behavior but keeps reading old data correct — an engine concern layered on the same interface.
+
+Two things worth pointing out as places where behavior encodes intent beyond the literal spec:
+
+1. `murmur3_32_fixed()` (BucketUtil.java:34) is the load-bearing determinism decision. The spec is a conformance contract (Appendix B gives test vectors), and this fixed-seed Guava hash is what guarantees every engine produces identical bucket ids.
+2. The int/long hashing identity (BucketUtil.java:38-44) and the decimal scale-less hashing directly implement the spec's schema-evolution safety rules (Appendix B notes 1-2), so promoting `int`→`long` or changing a column width never silently re-buckets existing data.
+
+The one gap I'd flag: the spec (format/spec.md:395) restricts promotion of a source column referenced by a partition transform when the transform's output would change (e.g. date→timestamp). That constraint lives in schema-evolution code (PartitionSpec/SchemaUtil), not in the `Transforms` package itself — the transforms here only guarantee hash stability for the promotions they're designed for.
+
+I did not find any test for an actual unknown-transform writer, but `UnknownTransform` is publicly exported and its `bind`/`apply` throwing is what enforces the "can't write unknown transforms" rule at runtime.

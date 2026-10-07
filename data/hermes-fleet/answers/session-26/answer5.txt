@@ -1,0 +1,23 @@
+Here are ten points for a new contributor, each starting at the file:line that demonstrates it.
+
+1. **What it is (the concept):** Rewriting manifests is a pure metadata operation that re-clusters the pointers in a snapshot's manifest list — no content files change. Read the snapshot/reuse design at `format/spec.md:87` ("Manifest files are reused across snapshots") and the REPLACE semantics at `format/spec.md:972`.
+
+2. **The core class to read first:** `BaseRewriteManifests` is the single-node implementation. Start at `core/src/main/java/org/apache/iceberg/BaseRewriteManifests.java:239` (`performRewrite`) — this is where old manifests are read and re-clustered into new ones.
+
+3. **Reuse vs. rewrite:** Manifests that match a predicate are rewritten; everything else is kept untouched and carried into the new manifest list. Read the split at `BaseRewriteManifests.java:252` (keep vs. rewritten) and `BaseRewriteManifests.java:221` (`keepActiveManifests`).
+
+4. **The status/sequence invariant:** Entries in rewritten manifests must be written as EXISTING and carry their original snapshot/sequence ids explicitly — this is the spec's rule at `spec.md:706`/`spec.md:935`. See it enforced at `BaseRewriteManifests.java:372` (`writer.existing(entry)`) and `ManifestWriter.java:190` (`wrapExisting`).
+
+5. **No data may be lost or duplicated:** The rewrite must leave the active file count unchanged. Read the guard at `BaseRewriteManifests.java:300` (`validateFilesCounts`), which throws if created ≠ replaced counts.
+
+6. **Deletes are skipped and excluded:** Only live (non-DELETED) entries are carried, and delete manifests are never rewritten. Read `ManifestReader.java:354` (`liveEntries`) and the `containsDeletes` check at `BaseRewriteManifests.java:278`.
+
+7. **Concurrency / retry:** The rewrite commits under optimistic concurrency — on a `CommitFailedException` it reapplies against the refreshed metadata. Read `SnapshotProducer.java:484` (`commit()`) and the retry validation at `BaseRewriteManifests.java:286` (`validateDeletedManifests`).
+
+8. **The Spark/query-engine path is different:** Spark does the distributed clustering on executors, then delegates the commit back to core. Read `RewriteManifestsSparkAction.java:254` (`buildManifestEntryDF`) and `RewriteManifestsSparkAction.java:397` (`replaceManifests`); the SQL entry point is `RewriteManifestsProcedure.java:93`.
+
+9. **The manifest list is the object that changes:** The actual table-state change is writing a new manifest list referencing the kept + new manifests. Read `SnapshotProducer.java:304` (`ManifestLists.write`) and `BaseRewriteManifests.java:184` (assembling `newManifestsWithMetadata` + kept).
+
+10. **Cleanup ownership:** Only manifests this op created are deleted on failure/success; input and kept manifests are left alone. Read `BaseRewriteManifests.java:345` (`cleanUncommitted`) and the equivalent Spark cleanup at `RewriteManifestsSparkAction.java:405`.
+
+One caveat for orientation: Flink has no manifest-rewriting integration in this repo — this is all footprint in core + Spark. Everything traces back to the two invariants the whole design protects: unchanged data contents (spec.md:972) and immutable, explicit per-file lineage (spec.md:706/935).

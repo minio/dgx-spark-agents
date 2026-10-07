@@ -1,0 +1,42 @@
+Now I have the full end-to-end picture. This repo is at a snapshot where `ChangelogScanTask.operation()` is called (ChangelogRowReader.java:92) and `ChangelogOperation` has the four values, but the core `BaseAddedRowsScanTask`/`BaseDeletedDataFileScanTask` at this commit don't yet override `operation()` (they implement the older `changeOrdinal()`/`commitSnapshotId()` surface; the reader's `task.operation()` maps to the abstract method). I'll note that as a version-skew caveat rather than over-claim.
+
+How Spark uses changelog scans
+
+Entry point — a changelog table with its own scan builder
+
+- Iceberg exposes the change stream through a special "changelog" table: `SparkChangelogTable` (spark/v4.1/.../source/SparkChangelogTable.java). Its `newScanBuilder()` returns `SparkChangelogScanBuilder` (:95-97). Catalog lookup routes `$changelog`-named tables to it: SparkCatalog.java:924-927 (identifier path) and :970 (path/URI path). Time travel is rejected on a changelog table (:925, :931).
+
+- The builder, `SparkChangelogScanBuilder` (spark/v4.1/.../source/SparkChangelogScanBuilder.java), is the real integration point. `build()` (:44) does three things the core scan alone can't:
+  1. Maps user-supplied start/end as either snapshot IDs or timestamps to a `(from, to]` range. `START_SNAPSHOT_ID` (exclusive), `END_SNAPSHOT_ID` (inclusive), `START_TIMESTAMP` (exclusive), `END_TIMESTAMP` (inclusive) — the constant names are in SparkReadOptions.java:36-45, and build() enforces mutual exclusion and ordering with `Preconditions` (:50-66).
+  2. Converts timestamps to snapshot IDs using the spec's snapshot lineage: `getStartSnapshotId()` uses `SnapshotUtil.oldestAncestorAfter(table, ts)` then takes the parent (:130-139) — exactly the "from exclusive ⇒ use the snapshot before the boundary" pattern from BaseIncrementalScan; `getEndSnapshotId()` walks `SnapshotUtil.currentAncestors(table)` picking the newest ancestor with timestamp <= end (:141-150).
+  3. Constructs the core scan via `table().newIncrementalChangelogScan()` then `.fromSnapshotExclusive(start)` / `.toSnapshot(end)` (:87-108) — the same calls whose validation (ancestor checks, branch checks, empty-table guards) lives in BaseIncrementalScan.java:133-187. It also projects the metadata columns (:82 `projectionWithMetadataColumns`) so the `_change_*` output columns are requested up front.
+
+- The builder short-circuits to an empty scan when the window is trivially empty (`noSnapshotsAfter` :120-123, `noSnapshotsBetween` :125-128, returning `emptyChangelogScan()` which passes a null scan, :110-118, handled defensively in SparkChangelogScan.java:82-84).
+
+- `SparkChangelogScan` (spark/v4.1/.../source/SparkChangelogScan.java) wraps the Iceberg scan: `taskGroups()` calls `scan.planTasks()` lazily and caches (:116-126); `toBatch()` hands the task groups to a Spark `Batch` (:104-114); `readSchema()` converts the projected schema (:95-101). It also validates metadata columns against the table schema in the constructor (:72 `SparkSchemaUtil.validateMetadataColumnReferences`).
+
+Reading a row — materializing the three `_change_*` columns
+
+- `ChangelogRowReader` (spark/v4.1/.../source/ChangelogRowReader.java) is where the spec's reserved columns become actual output. For each task it builds a 3-cell metadata row and right-joins it onto each data row:
+  - `_change_type` ← `task.operation().name()` (:92) — one of ChangelogOperation's INSERT/DELETE/UPDATE_BEFORE/UPDATE_AFTER (api/.../ChangelogOperation.java:22-27). Note this matches the spec's reserved `_change_type` column and its allowed values (spec.md:455).
+  - `_change_ordinal` ← `task.changeOrdinal()` (:93) — the ordering bound, which BaseChangelogContentScanTask.java:45 surfaces and BaseIncrementalChangelogScan.java:124-134 computes.
+  - `_commit_snapshot_id` ← `task.commitSnapshotId()` (:94) — BaseChangelogContentScanTask.java:50.
+  It strips these metadata columns from the data-side read schema (`ChangelogUtil.dropChangelogMetadata`, :72) and re-attaches them as metadata, so they don't collide with user projections.
+- Dispatch is by task type, mirroring the core ADDED/DELETED split: AddedRowsScanTask → open the added file with its deletes (:100-101, :115-119); DeletedDataFileScanTask → open the deleted file with its deletes (:106-107, :121-126). DeletedRowsScanTask is explicitly unsupported (:103-104) — consistent with the core rejecting delete files.
+
+Reconstructing complete changes — UPDATE_BEFORE/UPDATE_AFTER
+
+- This is the part that closes the loop the core deliberately leaves open. `ChangelogIterator` (spark/v4.1/.../spark/ChangelogIterator.java) is a Spark-task-local transform over the raw changelog rows. `computeUpdates()` (:76-82) composes two iterators:
+  - `RemoveCarryoverIterator` — drops "carry-over" rows: rows that were only ADDED because a rewrite moved them, not because they are new. This is exactly the "a file added in a later snapshot actually carries rows from an earlier one" hazard (#10/#11 in the earlier failure list); removing carryovers turns a noisy file-level diff into real insertions.
+  - `ComputeUpdateIterator` — groups a DELETE followed by an INSERT (matched on identifier columns) and rewrites the pair into UPDATE_BEFORE + UPDATE_AFTER (:34-36, :79-80). The identifier fields come from SparkReadConf's column mapping (the spec's identifier-field semantics).
+- This is where the engine layer does what core cannot: pairing deletes+inserts into updates using row identity. The spec's `_change_type` values include UPDATE_BEFORE/UPDATE_AFTER specifically so this reconstruction can be expressed (spec.md:455; ChangelogOperation.java:25-26), even though base core emits only INSERT/DELETE at the file level.
+
+Streaming (micro-batch) consumption
+
+- The read options for streaming are defined in SparkReadOptions.java: skip-delete/overwrite-snapshots (:66-72, matching the `operation`-based filtering the core scan also does for REPLACE), stream-from-timestamp (:78), max files/rows per micro-batch (:81-85), polling/async-planning knobs (:88-98). These feed `SparkMicroBatchStream` / the micro-batch planners (source/SparkMicroBatchStream.java, BaseSparkMicroBatchPlanner.java, Sync/AsyncSparkMicroBatchPlanner.java), which drive the same incremental/changelog scan repeatedly to plan each batch's `(from, to]` window and persist `StreamingOffset` (source/StreamingOffset.java) to remember where the last batch ended.
+
+Connection to the spec
+
+Every engine-side piece maps back to a spec primitive already discussed: the `(from, to]` window is bounded by snapshot parent lineage (spec.md:958); the ADDED/DELETED manifest status is the change signal (spec.md:691); `_change_type`/`_change_ordinal`/`_commit_snapshot_id` are the reserved metadata columns (spec.md:455-457); REPLACE/delete-file exclusions follow the snapshot `operation` field (spec.md:969-975) and the row-level-deletes limitation. The genuinely engine-specific additions — timestamp-to-snapshot mapping, carryover removal, and UPDATE reconstruction — are exactly the "classification and semantics left to engines" the spec reserves (this is why they live in spark/, not core/).
+
+Caveat: `task.operation()` (ChangelogRowReader.java:92) resolves against `ChangelogScanTask.operation()` (api/.../ChangelogScanTask.java:24), and the four enum values exist (ChangelogOperation.java), but the core task classes I read (`BaseAddedRowsScanTask`, `BaseDeletedDataFileScanTask`, `BaseChangelogContentScanTask`) at this commit only supply `changeOrdinal()`/`commitSnapshotId()` — I didn't find an `operation()` override there. So at this exact revision the reader's `operation()` call and the iterator's UPDATE reconstruction may target a newer core surface than these files provide; if you care about this exact commit, that's the one spot to verify builds. The wiring/structure above is accurate regardless.

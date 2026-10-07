@@ -1,0 +1,65 @@
+Here are the changelog-scan edge cases and failure modes, the guard the code throws up for each, and — where honesty requires — the ones with no real guard.
+
+Guard clauses that throw (fail loud)
+
+1. Delete files present in a scanned snapshot
+   Failure: a snapshot that added/deleted rows via row-level deletes (position/equality/DV) has delete manifests. A file-level diff can't represent those rows as a change, so emitting a "change" would silently drop them.
+   Guard: orderedChangelogSnapshots() throws UnsupportedOperationException("Delete files are currently not supported in changelog scans") (BaseIncrementalChangelogScan.java:108-111). This is the "fail rather than produce an incomplete stream" choice.
+
+2. `from` snapshot not an ancestor of `to`
+   Failure: range isn't a linear parent chain, so the diff is meaningless.
+   Guard: fromSnapshotIdExclusive() validates isAncestorOf (inclusive) / isParentAncestorOf (exclusive) and throws IllegalArgumentException with a message naming both IDs (BaseIncrementalScan.java:168-172, 179-184).
+
+3. `to` snapshot not on the requested branch
+   Failure: end snapshot lives on a different lineage than the branch pointer.
+   Guard: toSnapshotIdInclusive() checks SnapshotUtil.isAncestorOf(branch.current, to) when a branch is set (BaseIncrementalScan.java:137-141).
+
+4. Named ref missing or the wrong type
+   Failure: fromSnapshotInclusive/Exclusive/toSnapshot/useBranch take a ref name; a missing tag/branch or a tag used where a branch is required breaks the semantics.
+   Guard: Preconditions.checkArgument on ref presence and on isTag()/isBranch() in each overload (BaseIncrementalScan.java:40-41, 58-59, 82-84, 90-91), plus snapshot-presence checks at :48, :74.
+
+5. End snapshot unset and table has no current snapshot
+   Failure: no upper bound to anchor the range.
+   Guard: Preconditions.checkArgument(currentSnapshot != null, ...) (BaseIncrementalScan.java:153-154).
+
+Empty / no-op cases (guard by short-circuit)
+
+6. No snapshots in the range
+   Guard: orderedChangelogSnapshots() returns an empty deque; doPlanFiles returns CloseableIterable.empty() (BaseIncrementalChangelogScan.java:62-64).
+
+7. Empty table with no from/to set
+   Guard: planFiles() returns empty and skips the listener notification (BaseIncrementalScan.java:97-101).
+
+Handled-by-design cases (correct behavior, but worth naming as traps)
+
+8. REPLACE snapshots silently filtered
+   Why it's safe: the spec defines REPLACE as adding/removing files "without changing table data" — compaction, format change, relocation (spec.md:971). So those snapshots contribute zero data changes.
+   Guard: skipped by operation check (BaseIncrementalChangelogScan.java:107). This is silent by design, but a reader assuming "every commit between from and to appears" will be surprised; the code assumes you accept the spec's operation model.
+
+9. Expired `from` snapshot
+   Failure: the from-ID can point at a garbage-collected/parent snapshot not in table.snapshot(). ancestorsBetween walks the parent chain and when lookup returns null it simply stops iterating (SnapshotUtil.java:248-254) — so the range can silently truncate rather than error.
+   Guard: partial. fromSnapshotExclusive() explicitly refuses to validate against table.snapshot() for exactly this reason, documented at BaseIncrementalScan.java:65-66, and passes the ID through (:184). But the resulting silent truncation when an intermediate ancestor is also gone is not guarded — this is a genuine gap, matching the spec's warning that incremental reads break around expired snapshots (spec.md:711).
+
+10. A file both added and deleted inside the range
+    Failure mode: produces two change records (one ADDED from its add snapshot, one DELETED from its delete snapshot). At the file level that's correct; the DELETE row values come from the file, which the reader may never have seen when the add fell before the `from` bound. So a consumer gets a DELETE whose matching INSERT is outside the window.
+    Guard: none — inherent to file-level diffing. The code just emits both as separate tasks (BaseIncrementalChangelogScan.java:156-179).
+
+11. UPDATEs appear as delete+insert
+    Failure mode: an engine can't pair them into UPDATE_BEFORE/UPDATE_AFTER without row identity.
+    Guard: none here. The core explicitly doesn't reconcile `_row_id` (spec.md:461-546); it surfaces file-level ADD/DELETE only. The spec's lineage fields would enable pairing, but this scan doesn't use them (deletes are rejected, :108-111, so it never even sees row-level changes).
+
+Truly unguarded (spec-level constraints, code doesn't check)
+
+12. Content-file uniqueness violation
+    A file with duplicate live manifest entries makes the snapshot "undefined behavior" per spec (spec.md:682-683). The changelog diff reads those entries; duplicates would double-count or mis-order changes.
+    Guard: none — doPlanFiles() passes every matching entry through (BaseIncrementalChangelogScan.java:74-92). The spec allows readers to error but doesn't require it, and this scan doesn't.
+
+13. Change-ordinal collisions across branches
+    computeSnapshotOrdinals() keys strictly by snapshot ID (BaseIncrementalChangelogScan.java:124-134). If the same ADDED entry could be tagged to a snapshot outside the deque, entry.snapshotId() would miss the map and ordinal would be null (latent NPE). In practice the entry filter at :80 restricts to changelogSnapshotIds so the map always hits — but there's no defensive check; it's an implicit invariant, not a guard.
+
+14. Concurrent metadata change during planning
+    The table snapshot graph is read from the loaded metadata once; parallel manifest planning via planWith(executor) (BaseIncrementalChangelogScan.java:88-90) is safe only if the manifests are read-only. There's no re-validation that the walked lineage is still current — an expired snapshot mid-plan silently shortens the result (same root cause as #9).
+
+Summary
+
+Fail loud: #1-5 (all Preconditions/UnsupportedOperationException). Short-circuit: #6-7. Silent-by-design: #8 (REPLACE), #9's from-pass-through, #10-11 (file-level diff semantics). Genuinely unprotected: #9's mid-chain truncation, #12 (uniqueness), #13 (latent NPE), #14. The common thread for the unguarded ones is the same as the spec's own caveat: the change stream is correct only under well-behaved, non-expired, un-replaced lineage — and the code guards the cheap, obvious violations (deletes, bad range, bad refs) while trusting the spec invariants for the rest.

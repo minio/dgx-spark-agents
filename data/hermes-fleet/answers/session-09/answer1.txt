@@ -1,0 +1,44 @@
+I read the whole file (2153 lines). Here's what the spec says about sort orders and the reasoning behind the design.
+
+## What the spec says
+
+**Definition (the "Sorting" section, ~line 639):** A sort order is a way of declaring how data within a partition is sorted, so engines can exploit that ordering for performance. It has:
+
+- a **sort order id**
+- an ordered **list of sort fields** (the list order defines the sort sequence, like an ORDER BY)
+
+Each sort field has:
+- a **source column id** (or a list of source-column ids for multi-arg transforms in v3) from the table schema
+- a **transform**, the same set as partition transforms (`identity`, `bucket[N]`, `truncate[W]`, `year`, `month`, `day`, `hour`, `void`)
+- a **sort direction**: `asc` or `desc`
+- a **null order**: `nulls-first` or `nulls-last`
+
+Key details:
+- **Order id 0 is reserved for "unsorted"** — it's the sentinel for "no sort order." So every real sort order has a non-zero id.
+- **Floating point ordering is pinned**: `-NaN < -Infinity < -value < -0 < 0 < value < Infinity < NaN` (matching Java float/double comparison). This removes ambiguity about NaN and signed zero when sorting.
+- **Association is per-file, by id**: a data or delete file references its sort order by id in the manifest (`data_file.sort_order_id`, field 140). The table must declare all sort orders it uses so readers can look them up.
+- **Default sort order**: the table can carry a `default-sort-order-id` (table metadata), indicating how new data should be sorted by write. Writers *should* use it, but are not required to when it's prohibitively expensive — explicitly called out for streaming writes. So it's a hint/config, not a hard requirement.
+- **Read semantics**: sort ordering is "not used when reading" — reads use the specs stored in manifest files. It's purely an optimization/enablement signal, not correctness-critical.
+- **Position deletes are exempt**: they must be sorted by file and position, not a table order, and must set `sort_order_id` to null; readers must ignore the sort order id for position delete files. If sort order id is missing/unknown on a data file, the order is assumed unsorted.
+
+**Serialization (Appendix C, "Sort Orders", ~line 1743):** sort orders are a JSON list of objects with `order-id` and `fields`; each field is `{transform, source-id | source-ids, direction, null-order}`. For single-argument transforms only `source-id` is written; for multi-argument transforms only `source-ids` is written (added in v3). `direction` ∈ {asc, desc}, `null-order` ∈ {nulls-first, nulls-last}. Same forward-compat rule as partition transforms: v3 readers must be able to read unknown transforms and ignore them.
+
+**Table metadata:** `sort-orders` (a list of sort order objects) and `default-sort-order-id` become *required* fields starting in v2 (in v1 they were optional); they stay required in v4.
+
+## Why it's designed that way
+
+A few design choices stand out and they all trace back to Iceberg's core philosophy:
+
+**1. Sorting is a per-file *declaration*, not enforced table layout.** Iceberg files are immutable and partitioning is about physical pruning of files. Sort order is the analogous mechanism for the same file set: it's metadata that tells the optimizer a file (or a table's default) is arranged in a known order. Because it's declared-with-id and carried per manifest entry, it's decoupled from any single engine and survives schema/spec evolution — the same pattern as partition specs being stored per-manifest.
+
+**2. Reuses the partition transform vocabulary.** Basing sort fields on the same transforms as partition fields is deliberate: it means a sort order can be expressed over derived values (e.g. `bucket[4]` or `day(ts)`) using exactly one, consistent transform definition across partitioning and sorting. Less new machinery, and predicates/ordering stay in a familiar form.
+
+**3. The unsorted sentinel (id 0) and "missing/unknown = unsorted."** Because `sort_order_id` is optional on a data file and default sort order is optional on a table, readers must have a well-defined fallback. Reserving 0 for unsorted and treating null/unknown as unsorted makes the metadata unambiguous without requiring every file to carry an order. This is what keeps sorting from ever being a correctness dependency — absence just means "no ordering to exploit."
+
+**4. Partitioning and null ordering are fully specified up front.** Sorting is only useful if all implementations agree on the exact order, including edge cases. The float ordering rule and the explicit null-order make the declared order machine-precise and portable across engines (Spark, Flink, Trino, etc.) so any of them can safely exploit a file's order. Without a shared definition, one engine's "sorted" assumption could be another's bug.
+
+**5. Default order is a "should," not a "must," for writers.** Streaming writes explicitly don't have to honor it. This reflects Iceberg's stance that write-side enhancements must not break writers or be onerous — the sort order is opportunistic. It also keeps the sort order advisory: correctness never depends on it.
+
+**6. Evolved like other metadata.** Making `sort-orders`/`default-sort-order-id` required only from v2 onward mirrors how partition specs and schemas moved into versioned lists — the table keeps a history of sort orders (referenced by id) so old manifests/files remain readable even as the default order changes. The v3 `source-ids` addition keeps it consistent with multi-argument transforms for partitioning.
+
+In short: sort order in Iceberg is deliberately advisory, versioned, id-referenced metadata that reuses the partition-transform vocabulary, with fully pinned ordering semantics and a defined "unsorted" fallback — designed so any reader can safely exploit file ordering as an optimization without ever depending on it for correctness.

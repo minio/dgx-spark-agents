@@ -1,0 +1,60 @@
+I have everything needed. Here's the edge-case and failure-mode analysis for cherry-picking snapshots.
+
+## Edge cases and failure modes, and the guards
+
+### 1. Cherry-picking a snapshot that doesn't exist
+- **Risk:** Typo/I/O error in a snapshot id, or the snapshot was expired out of metadata.
+- **Guard:** `CherryPickOperation.cherrypick()` looks the snapshot up and immediately fails if it's absent:
+  `CherryPickOperation.java:71-73` — `this.cherrypickSnapshot = current.snapshot(snapshotId); ValidationException.check(cherrypickSnapshot != null, "Cannot cherry-pick unknown snapshot ID: %s", snapshotId);`
+
+### 2. Cherry-picking a snapshot that is already an ancestor of the current state (re-applying the same change)
+- **Risk:** Applying a change that's already on the current branch would double-apply it.
+- **Guard:** `CherryPickOperation.validateNonAncestor(...)` (declared CherryPickOperation.java:207-216, called from `validate()` at line 166). If the id is in the current ancestor chain it throws `CherrypickAncestorCommitException` (lines 208-210). It also catches the indirect case where an ancestor's summary already carries this snapshot as `source-snapshot-id` (a prior cherry-pick of the same source) via `lookupAncestorBySourceSnapshot` (lines 212-215, 268-279).
+
+### 3. Cherry-picking a snapshot that is a non-ancestor, non-append, non-dynamic-overwrite operation
+- **Risk:** Only some operations are safe to re-apply. `replace` (compaction/rewrite) and `delete` snapshots aren't meaningful to cherry-pick as their own commit.
+- **Guard:** The final `else` branch (CherryPickOperation.java:131-138) can only continue if `isFastForward`; otherwise it throws immediately:
+  `ValidationException.check(isFastForward(current), "Cannot cherry-pick snapshot %s: not append, dynamic overwrite, or fast-forward", ...)` (lines 133-136). The same check runs again inside `apply()` (lines 195-198) in case the state changed between planning and applying.
+
+### 4. Concurrency: the replace-partitions overwrite is based on a non-ancestor
+- **Risk:** A `ReplacePartitions` (overwrite) cherry-pick can only be applied if the snapshot it is based on is an ancestor of the current state — otherwise the partitions it replaces may already have diverged on this branch.
+- **Guard:** Validated in two places. First at plan time: `cherrypickSnapshot.parentId() == null || isCurrentAncestor(current, cherrypickSnapshot.parentId())` (CherryPickOperation.java:101-105). Then again at commit time in `validateReplacedPartitions` (lines 218-252), which enforces `parentId == null || isCurrentAncestor(meta, parentId)` (lines 221-224). The commit-time path iterates every snapshot between the parent and the current head (lines 225-238) and rejects if any newly added file lands in a partition the cherry-pick intends to replace (lines 242-245). This is the concurrency guard against an overwrite happening on the same partitions between plan and commit.
+
+### 5. Concurrency: the partitions being replaced were modified after the base
+- **Risk:** Between reading the base metadata and committing, another writer touched one of the same partitions, so re-playing the overwrite would clobber newer data.
+- **Guard:** `validateReplacedPartitions` scans for new files in the replaced partitions and throws "Cannot cherry-pick replace partitions with changed partition" (CherryPickOperation.java:242-245). Because a replace-partitions overwrite must only be cherry-picked when those partitions are untouched, this is recorded into a `PartitionSet` at plan time (line 120-124) and re-checked against the fresh history at commit time.
+
+### 6. Double-publishing the same WAP id
+- **Risk:** A staged (Write-Audit-Publish) snapshot carrying `wap.id` must be published only once; publishing it again would double-apply the staged change.
+- **Guard:** `WapUtil.validateWapPublish` (WapUtil.java:50-58) reads the cherry-picked snapshot's staged wap id and, if it is already `published-wap-id` or `wap.id` anywhere in the current lineage (`isWapIdPublished`, WapUtil.java:60-68), throws `DuplicateWAPCommitException` (WapUtil.java:53-55). Called at plan time for append/overwrite (CherryPickOperation.java:80, 108) and re-called at commit time in `validate()` (line 169) to catch a concurrent double-publish. On success it records the wap id as `published-wap-id` (lines 82, 110).
+
+### 7. "Replace partitions" with no safe base (parent gone / empty-table assumption broken)
+- **Risk:** An overwrite whose parent is a non-ancestor or a later state, where the "detect modification via files added since parent" logic can't hold.
+- **Guard:** `validateReplacedPartitions` returns early only when there's no current head or no replaced partitions (CherryPickOperation.java:220). If there is a current head but the parent isn't an ancestor, it throws at lines 221-224. If no snapshots lie between parent and head, no new files can conflict, so it's safe.
+
+### 8. Invalid data files inside a cherry-picked overwrite (missing deleted files)
+- **Risk:** Replaying an overwrite's deletes would delete files that no longer exist in the table (e.g. already removed concurrently), producing a broken snapshot.
+- **Guard:** `failMissingDeletePaths()` (called CherryPickOperation.java:117) makes the filter managers fail the commit if any data file slated for deletion isn't present — implemented in `MergingSnapshotProducer.failMissingDeletePaths()` (MergingSnapshotProducer.java:179-182). This enforces the spec's rule (spec.md:1317-1318) that replace/delete operations must verify the files they remove are still in the table.
+
+### 9. Unsupported format / wrong file content when replaying adds and deletes
+- **Risk:** Cherry-picking a snapshot that added/removed delete files (e.g. a V2 table with equality/position deletes, or DVs in V3/V4) into a context where those file types are invalid.
+- **Guard (indirect):** The cherry-pick re-feeds file lists through `MergingSnapshotProducer.add()`/`delete()`, and `validateNewDeleteFile` → `validateDeleteFileForVersion` (MergingSnapshotProducer.java:290-316) rejects delete files that don't match the target table's format version (deletes in V1, position-delete files vs DVs in V3/V4). For data files, `add()` validates a matching partition spec (MergingSnapshotProducer.java:243-247).
+
+### 10. A cherry-pick that would be a self-referential/cyclic fast-forward
+- **Risk:** Trying to fast-forward to a snapshot whose lineage doesn't terminate or that is itself.
+- **Guard:** `isFastForward` (CherryPickOperation.java:173-182) only treats it as a fast-forward if the cherry-picked snapshot's `parentId()` equals the current head's id (lines 176-177), or both are null (line 180) — i.e., the only safe cases. If a snapshot's parent is the head but that snapshot is also the head already, `updateEvent()` returns null and no duplicate snapshot is created (lines 152-157). `validateNonAncestor` (line 166) additionally rejects an ancestor self-reference.
+
+### 11. No-op cherry-pick (nothing configured)
+- **Risk:** Calling the operation without a target snapshot must not fabricate a snapshot or crash.
+- **Guard:** `cherrypickSnapshot` is checked in `operation()` (CherryPickOperation.java:65), `updateEvent()` (lines 145-148), and `apply()` (lines 188-191), which returns the current snapshot unchanged (a NOOP) in that case.
+
+---
+
+## Gaps worth flagging (things the code does NOT guard)
+
+- **Append-path delete files are not replayed.** The append branch copies only `changes.addedDataFiles()` (CherryPickOperation.java:89-91) and never the snapshot's delete-file additions/removals. Any delete/DV changes carried by a source "append" snapshot are silently dropped. (`SnapshotChanges.removedDeleteFiles()`/`addedDeleteFiles()` exist but are unused here range CherryPickOperation.java:89-129.)
+- **No partition-conflict guard on the append path.** Append is allowed unconditionally even if a concurrent writer already added rows to the same partitions — safe for data (appends just add), but it means an append cherry-pick never double-checks `replace-partitions`-style conflicts.
+- **The overwrite check only covers data files**, not delete files written into the cherry-picked overwrite (CherryPickOperation.java:121-129 handles `DataFile`s only via `addedDataFiles`/`removedDataFiles`).
+- **No retry backtracking for WAP/ancestor failures.** The `DuplicateWAPCommitException` and `CherrypickAncestorCommitException` are thrown directly rather than retried, so a concurrent double-publish surfaces as a hard error to the caller rather than being auto-resolved.
+
+Net: the strongest guards are the two ancestor checks (`validateNonAncestor`, CherryPickOperation.java:166, 207-216) and the commit-time replace-partitions revalidation (lines 218-252), which together enforce the spec's "only re-apply under well-defined conditions" (spec.md:97) and its commit-conflict-resolution rules (spec.md:1312-1319). The WAP double-publish guard (WapUtil.java:50-68) closes the other main correctness hole. The append-path deletion and delete-file replay gaps are the notable soft spots.

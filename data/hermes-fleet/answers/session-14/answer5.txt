@@ -1,0 +1,21 @@
+Here are ten bullets, each pointing at the first file:line a contributor should open.
+
+1. What column metrics are: per-file stats keyed by column id — value, null, and NaN counts plus lower/upper bounds. Read the `Metrics` field declarations first: api/src/main/java/org/apache/iceberg/Metrics.java:34-43.
+
+2. Where they live on disk: they ride inside each `data_file` entry in manifests, not in the data file itself. The spec's authoritative table is format/spec.md:730-736, with the "missing = unknown" rule right below at spec.md:759-767.
+
+3. Bounds are stored as raw bytes, decoded per type. The encode/decode lives in Conversions: api/src/main/java/org/apache/iceberg/types/Conversions.java:86-147 (write) and Conversions.java:154-215 (read). This is spec Appendix D.
+
+4. Type promotion is handled by bound width: a 4-byte bound was written as `int`/`float`/`date`, 8 bytes as `long`/`double`/`timestamp`. See Conversions.java:175-187 for the decode side.
+
+5. Metrics are optional and writer-controlled: which columns get which stats is decided by `MetricsConfig` — core/src/main/java/org/apache/iceberg/MetricsConfig.java:263-302. The modes (none/counts/truncate/full) are defined in core/src/main/java/org/apache/iceberg/MetricsModes.java:39-55.
+
+6. The `MetricsUtil` helpers drop stats for chosen columns and build NaN counts — the "omit rather than lie" path. Start at core/src/main/java/org/apache/iceberg/MetricsUtil.java:51-117.
+
+7. Consumers use metrics to prune whole files, inclusively: only skip a file when it provably cannot match. The evaluator is at api/src/main/java/org/apache/iceberg/expressions/InclusiveMetricsEvaluator.java:66-97, with the per-predicate guards in api/src/main/java/org/apache/iceberg/expressions/InclusiveEvalVisitor.java:156-181 (the canonical "unknown bound -> keep file" pattern).
+
+8. NaN is the tricky failure mode: ORC can poison both bounds when the first value is NaN, so the evaluator bails to "might match" on any NaN bound. See InclusiveEvalVisitor.java:164-168 and the explanation at InclusiveMetricsEvaluator.java:43-47.
+
+9. Pruning wiring in core: `ManifestReader` builds the metrics evaluator lazily and only projects stats columns when the filter needs them (and drops the maps when it doesn't). See core/src/main/java/org/apache/iceberg/ManifestReader.java:400-428.
+
+10. How engines consume them end-to-end: Spark prunes `DELETE`s with `StrictMetricsEvaluator` (spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/source/SparkTable.java:242-254) and surfaces a readable-metrics column (spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/SparkContentFile.java:97-102); Flink derives event-time watermarks from lower bounds (flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/source/reader/ColumnStatsWatermarkExtractor.java:97-109).

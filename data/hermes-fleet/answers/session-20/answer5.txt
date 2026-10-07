@@ -1,0 +1,21 @@
+1. What it is: `bucket[N]` hashes a source value into one of N buckets, always returning an `int`. The exact formula is `(hash & Integer.MAX_VALUE) % N`. — Read `api/src/main/java/org/apache/iceberg/transforms/Bucket.java:112-117`
+
+2. The spec contract: the transform is defined as 32-bit Murmur3 (x86, seed 0), sign-bit discarded, `% N`, and requires `null -> null`. — Read `format/spec.md:590-604`
+
+3. Supported source types are a fixed set (int, long, decimal, date, time, timestamp, string, uuid, fixed, binary). `canTransform` enforces this; everything else is rejected. — Read `Bucket.java:120-136`
+
+4. Bucket count must be positive; both factories validate with `checkArgument(numBuckets > 0, ...)`. — Read `Bucket.java:40-44` and `:54-57`
+
+5. The bucket count is the only state and defines equality/`toString`: two buckets are equal iff `numBuckets` matches, rendered as `bucket[N]`. — Read `Bucket.java:138-158`
+
+6. Per-type hashing is delegated to the shared `BucketUtil`, the single canonical hashing used by all engines. — Read `api/src/main/java/org/apache/iceberg/util/BucketUtil.java:34-104`
+
+7. Hash encodings are crafted for schema-evolution stability: int hashes identical to long (promotion-safe), so `bucket[16]` doesn't change if an int column is promoted to long. — Read `BucketUtil.java:38-44`
+
+8. Nanosecond timestamps are floored to microseconds before hashing, so `timestamp_ns` and `timestamp` buckets match. — Read `Bucket.java:235-247` and `DateTimeUtil.nanosToMicros` at `api/src/main/java/org/apache/iceberg/util/DateTimeUtil.java:104-106`
+
+9. UUIDs and decimals hash their canonical byte forms (big-endian UUID; scale-free minimal unscaled decimal), keeping results independent of physical representation. — Read `BucketUtil.java:92-103`
+
+10. How engines use it: Spark exposes it as `system.bucket(N, col)` via `BucketFunction` (same hashing), and Flink routes sink writes by it via `PartitionKey`/`BucketPartitioner`. A row's bucket must be identical across engines — that's the whole point of the canonical hashing. — Read `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/functions/BucketFunction.java:117-120` and `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/BucketPartitioner.java:60-71`
+
+Starting point if you want the core in one file: `Bucket.java` plus its hashing workhorse `BucketUtil.java`.

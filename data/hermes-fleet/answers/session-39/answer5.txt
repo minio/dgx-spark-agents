@@ -1,0 +1,33 @@
+Here's a ten-point onboarding summary of the variant type, each with one file and line to start from.
+
+1. **What it is — a schemaless, self-describing type.** A `variant` is semi-structured data whose structure can differ row to row; it's neither a primitive nor a nested Iceberg type. The spec defines it and delegates the wire format to Parquet's VariantEncoding (V1).
+   Read: format/spec.md:244-260 (Semi-structured Types).
+
+2. **The three "basic" value kinds.** A variant value is one of: primitive, object (name→value, values have no fixed type), or array (ordered values, no fixed element type). These are the containers the Parquet encoding discriminates by header.
+   Read: api/src/main/java/org/apache/iceberg/variants/BasicType.java:21-26 (plus VariantUtil.java:168-182).
+
+3. **The public factory you'll create values from.** `Variants` sits in `core/` but returns the `api/` types, and is the clean entry point for wrapping primitives, objects, and arrays.
+   Read: core/src/main/java/org/apache/iceberg/variants/Variants.java:31-33 and 127-137 (array()/of/object()).
+
+4. **The three value interfaces.** `VariantValue` is the root; `VariantObject` and `VariantArray` extend it; `VariantPrimitive<T>` is the leaf. Access down-casts via `asPrimitive/asObject/asArray`, which throw if you guess wrong — kind is discovered at read time, not enforced.
+   Read: api/.../VariantValue.java:24-64 (and VariantObject.java:24-33).
+
+5. **Physical vs logical types, and the primitive set.** `PhysicalType` enumerates every stored primitive (including date/time/timestamps/decimals/binary/uuid — a superset of JSON), mapped to ids in `Primitives`; each physical type projects to a `LogicalType`.
+   Read: api/.../PhysicalType.java:26-49 (and Primitives.java:22-42).
+
+6. **Metadata = the field-name dictionary.** An object's variable fields are resolved by name through a metadata dictionary (name→id), with sorted-string lookup for efficiency. It's versioned (V1) and checks byte order/version on parse.
+   Read: api/.../VariantMetadata.java:26-32 (and SerializedMetadata.java:28-51).
+
+7. **The wire format builders.** All headers, offsets, and size encodings (metadata, primitive, object, array, short-string) plus the depth/element safety caps live in one utility. Everything is little-endian.
+   Read: api/.../VariantUtil.java:147-182 (metadataHeader/objectHeader/arrayHeader/basicType), with caps at 36-57.
+
+8. **Reading is lazy and buffer-sliced.** `SerializedObject`/`SerializedArray` validate structure up front, but materialize each child `VariantValue` on demand by slicing the original ByteBuffer — so a big column isn't fully decoded unless touched.
+   Read: api/.../SerializedObject.java:222-240 (lazy get) and SerializedArray.java:93-113.
+
+9. **Mutation/shredding in core.** `ShreddedObject` and `ValueArray` are the mutable in-memory wrappers (put/remove/add), with cached serialization state that's invalidated on mutation. This is what powers partial shredding.
+   Read: core/.../ShreddedObject.java:41-101 and ValueArray.java:45-48.
+
+10. **How engines consume it — opaque bytes + optional shredding.** Spark/Flink carry the value as metadata+value bytes in an engine handle (`VariantVal`/`BinaryVariant`) and hand them to the Parquet layer; shredding into typed child columns is a config-gated write feature.
+    Read: spark/v4.2/.../SparkParquetReaders.java:556-575 (VariantVal read) and the shredding flag at SparkWriteConf.java:736-744.
+
+Bonus context: the `api/` module holds the encoding/interfaces, `core/` holds the mutable wrappers + visitor, and `parquet/` holds `VariantReaderBuilder`/`VariantWriterBuilder`/`VariantShreddingAnalyzer` that both engines share.

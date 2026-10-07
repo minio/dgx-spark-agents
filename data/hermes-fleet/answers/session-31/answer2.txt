@@ -1,0 +1,44 @@
+Now I have the complete picture. Here's how the implementation follows the spec, with citations.
+
+## The catalog is a "metastore table," exactly as the spec prescribes
+
+The spec's Metastore Tables contract (format/spec.md:1340-1354) says a catalog stores one authoritative pointer — the location of the table's *current metadata file* — and commits by a **check-and-put** atomic swap. `JdbcCatalog` is this primitive translated into a relational database.
+
+The pointer lives in the `iceberg_tables` table. Its schema (JdbcUtil.java:128-149) has exactly the fields the spec's metastore scheme needs: a primary key of `(catalog_name, table_namespace, table_name)` and the two location columns `metadata_location` and `previous_metadata_location`. Only that tiny pointer row lives in the DB — the actual data files and metadata JSON are never stored there. They're written to object storage through the `FileIO` (`io`), which `JdbcCatalog` loads in initialize (JdbcCatalog.java:138-145) and which the spec's File System requirements (spec.md:121-129: in-place write, seekable reads, deletes) address. This is the "catalog holds a pointer, storage holds the data" separation the spec calls "storage separation" (spec.md:76).
+
+## doCommit is the check-and-put
+
+`JdbcTableOperations` extends `BaseMetastoreTableOperations` (JdbcTableOperations.java:43), the class the spec's javadoc explicitly names for this scheme ("The metastore table scheme is partly implemented in BaseMetastoreTableOperations" — spec.md:1354).
+
+For an **existing** table, `doCommit` (JdbcTableOperations.java:103-144):
+1. Loads the current pointer row from the DB (`JdbcUtil.loadTable`, line 108).
+2. Validates the base hasn't moved: `validateMetadataLocation` (JdbcTableOperations.java:200-209) throws `CommitFailedException` if the DB's `metadata_location` differs from the base's location — this is the spec's "validates that the version of the table that a write is based on is still current" (spec.md:1342).
+3. Executes the conditional UPDATE. The SQL (JdbcUtil.java:111-127, `V0_DO_COMMIT_SQL`) sets `metadata_location = ?` and `previous_metadata_location = ?` **WHERE ... AND `metadata_location` = ?** — the `WHERE metadata_location = ?` is literally the check-and-put: it only flips the pointer if it still points at the base version.
+
+The update returns the number of rows affected. If exactly 1, the pointer swap won (JdbcTableOperations.java:157-158). If 0, another writer committed first and `updateTable` throws `CommitFailedException` (JdbcTableOperations.java:160-162) — the spec's "if the swap fails, another writer has already created V+1. The current writer goes back to step 1" (spec.md:1350). The actual retry is driven by the caller on top of `BaseMetastoreTableOperations.commit` (BaseMetastoreTableOperations.java:109-135), which rejects stale metadata before dispatching to `doCommit`.
+
+For a **new** table, `doCommit` (lines 116-120) writes the new metadata file first (`writeNewMetadataIfRequired`, BaseMetastoreTableOperations.java:149-165, which produces `<V+1>-<uuid>.metadata.json` per spec.md:1344), then INSERTs the pointer row. The DB primary key is what enforces atomicity here — a duplicate insert violates the `(catalog_name, namespace, name)` constraint, and `JdbcUtil.isConstraintViolation` (JdbcUtil.java:531-535) maps that to `AlreadyExistsException` (JdbcTableOperations.java:131-136). This is the spec's "storing a pointer in a metastore or database that is updated with a check-and-put" for the create case.
+
+## Readers never take locks — optimistic concurrency realized
+
+The spec's serializable-isolation goal says "Readers will not acquire locks" (spec.md:71). Reads go through `doRefresh` (JdbcTableOperations.java:69-100), which loads the pointer row and calls `refreshFromMetadataLocation` (line 99). That path (BaseMetastoreTableOperations.java:167-216) reads the metadata JSON from storage and updates the in-memory `currentMetadataLocation`/`currentMetadata` — a plain read, no DB lock, no writes. The spec's "Readers use the snapshot that was current when they load the table metadata and are not affected by changes until they refresh" (spec.md:93) is exactly this `doRefresh` flow, and reverts-as-POST semantics are preserved because each metadata version is an immutable file (spec.md:85).
+
+## Optimistic creation and multi-writer safety
+
+`createTable` (JdbcTableOperations.java:165-198) pre-checks existence (lines 179-181, mapping a constraint violation to `AlreadyExistsException`), and does the conditional INSERT returning exactly 1 row (lines 183-197) as the success test — 0 rows means a `CommitFailedException`. The spec's duplicate-commit handling (spec.md:97: "If the snapshot on which an update is based is no longer current, the writer must retry") is backed by `JdbcClientPool`, which is built on Iceberg's `ClientPoolImpl` for bounded concurrency (JdbcClientPool.java:35,69) and marks deadlock/serialization SQLSTATEs (`40001`, `0800x`) retryable (JdbcClientPool.java:50-51) — i.e., transient serialization failures get retried rather than surfacing as corruption, consistent with the spec's optimistic-concurrency retry model.
+
+## Thinness / O(1) catalog traffic
+
+The spec's Scale goal wants job planning off the catalog and O(1) catalog calls (spec.md:72-73). Consistent with that, `JdbcCatalog`'s metadata operations are single-row point lookups by primary key — `loadTable`/`viewExists`/`tableExists` all run one `SELECT ... WHERE catalog_name=? AND namespace=? AND name=?` (JdbcUtil.java:168-195, 722-743). Scanning/pruning happens against manifests via `FileIO`, not the DB. Namespaces are likewise metadata: a second `iceberg_namespace_properties` table (JdbcUtil.java:404-500) stores per-namespace properties with its own primary key, and existence is checked with exact + `LIKE` sub-namespace queries (JdbcUtil.java:793-811) — catalog-level bookkeeping the spec leaves to the implementation.
+
+## Views and schema versioning (outside the spec)
+
+The spec describes tables, not views; `JdbcCatalog` nonetheless extends `BaseMetastoreViewCatalog` (JdbcCatalog.java:79) and adds view support through a schema-version mechanism: the `iceberg_type` column distinguishes `TABLE`/`VIEW` rows (JdbcUtil.java:61-63), and `updateSchemaIfRequired` (JdbcCatalog.java:237-276) auto-migrates the V0 schema to V1 (`ALTER TABLE ... ADD COLUMN iceberg_type`, JdbcUtil.java:150-151) or warns (JdbcCatalog.java:86-87, 260). This is implementation-level plumbing for views, not something the table format spec standardizes.
+
+## One nuance worth flagging
+
+In this codebase the retry is *not* inside `BaseMetastoreTableOperations.commit` — that method throws `CommitFailedException` immediately on a stale base (BaseMetastoreTableOperations.java:111-119) and on a failed pointer swap. The spec (spec.md:95-97, 1312-1319) frames retry as the expected behavior ("the failed commit can be applied to the new current version and retried"), and the JDBC code correctly *detects* contention, but the actual re-apply retry lives in the higher-level transaction/catalog layer that invokes `commit`, not in these files. So the primitive implemented here is precisely the spec's check-and-put and stale-detection; the retry loop is orchestrated by the caller, which matches how Iceberg separates the atomic swap (this layer) from commit retry (the operation layer).
+
+## Bottom line
+
+The implementation is a faithful translation of the spec's Metastore Tables contract: a DB table holding only the per-table `metadata_location` pointer, committed via a conditional `UPDATE ... WHERE metadata_location = ?` (the check-and-put, JdbcTableOperations.java:111 + JdbcUtil.java:111-127), with `previous_metadata_location` recording the prior version; creates enforced by a primary-key constraint; reads as lock-free pointer loads (doRefresh); and all data/metadata living in object storage behind `FileIO`. The files called along the way: `JdbcTableOperations` (the check-and-put + doRefresh), `JdbcUtil` (the SQL statements + row optics + constraint mapping), and `JdbcClientPool` (connection pooling + retryable SQLSTATEs), all orchestrated by `JdbcCatalog`.

@@ -1,0 +1,414 @@
+{
+ "tag": "oc-e2e-r13-nomemkv",
+ "wall_s": 263.2,
+ "returncode": 0,
+ "server": {
+  "prompt_tokens_total": 1573126.0,
+  "generation_tokens_total": 7076.0,
+  "prefix_cache_hits_total": 1422848.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 79.2,
+  "time_to_first_token_seconds_count": 11.0,
+  "request_prefill_time_seconds_sum": 76.6,
+  "request_decode_time_seconds_sum": 147.6
+ },
+ "meta": {
+  "durationMs": 239953,
+  "agentMeta": {
+   "sessionId": "iceberg-1007-1412-13",
+   "sessionFile": "agent:main:explicit:iceberg-1007-1412-13",
+   "provider": "vllm",
+   "model": "dsv4flash",
+   "contextTokens": 1000000,
+   "contextTokensSource": "resolved",
+   "agentHarnessId": "openclaw",
+   "credentialSource": {
+    "kind": "direct",
+    "evidence": "environment",
+    "authorization": "declared"
+   },
+   "usage": {
+    "input": 1573126,
+    "output": 7076,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "reasoningTokens": 2820,
+    "total": 1580202,
+    "cost": {
+     "total": 0
+    }
+   },
+   "lastCallUsage": {
+    "input": 146091,
+    "output": 3047,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": {
+     "total": 0
+    },
+    "reasoningTokens": 0,
+    "total": 149138
+   },
+   "promptTokens": 146091,
+   "contextBudgetStatus": {
+    "schemaVersion": 1,
+    "source": "pre-prompt-estimate",
+    "updatedAt": 1791412703699,
+    "provider": "vllm",
+    "model": "dsv4flash",
+    "route": "fits",
+    "shouldCompact": false,
+    "estimatedPromptTokens": 324902,
+    "contextTokenBudget": 1000000,
+    "promptBudgetBeforeReserve": 980000,
+    "reserveTokens": 20000,
+    "effectiveReserveTokens": 20000,
+    "remainingPromptBudgetTokens": 655098,
+    "overflowTokens": 0,
+    "toolResultReducibleChars": 0,
+    "messageCount": 86,
+    "unwindowedMessageCount": 86,
+    "sessionId": "iceberg-1007-1412-13"
+   },
+   "codeModeEngaged": false,
+   "assistantTurns": 11,
+   "bridgeCalls": {
+    "search": 0,
+    "describe": 0,
+    "call": 0
+   },
+   "costUsd": 0,
+   "terminalReceipt": {
+    "runId": "c167532a-dfce-44f4-943f-5fd02f698fa1",
+    "sessionId": "iceberg-1007-1412-13",
+    "turnId": "c167532a-dfce-44f4-943f-5fd02f698fa1",
+    "requested": {
+     "provider": "vllm",
+     "model": "dsv4flash"
+    },
+    "effective": {
+     "provider": "vllm",
+     "model": "dsv4flash",
+     "responseModel": "dsv4flash"
+    },
+    "successfulToolNames": [
+     "read"
+    ],
+    "rerouted": false,
+    "terminalDisposition": "visible"
+   }
+  },
+  "aborted": false,
+  "systemPromptReport": {
+   "source": "run",
+   "generatedAt": 1791412700745,
+   "sessionId": "iceberg-1007-1412-13",
+   "sessionKey": "agent:main:explicit:iceberg-1007-1412-13",
+   "provider": "vllm",
+   "model": "dsv4flash",
+   "workspaceDir": "/sandbox/.openclaw/workspace",
+   "bootstrapMaxChars": 20000,
+   "bootstrapTotalMaxChars": 60000,
+   "bootstrapTruncation": {
+    "warningMode": "always",
+    "warningShown": false,
+    "truncatedFiles": 0,
+    "nearLimitFiles": 0,
+    "totalNearLimit": false
+   },
+   "sandbox": {
+    "mode": "off",
+    "sandboxed": false
+   },
+   "systemPrompt": {
+    "chars": 47986,
+    "hash": "b15ed1618ecb7d609bf9f3201de5c6e417473722f3a07eb729a5f05189eb8a28",
+    "projectContextChars": 22367,
+    "nonProjectContextChars": 25619
+   },
+   "injectedWorkspaceFiles": [
+    {
+     "name": "AGENTS.md",
+     "path": "/sandbox/.openclaw/workspace/AGENTS.md",
+     "missing": false,
+     "rawChars": 6449,
+     "injectedChars": 6449,
+     "truncated": false
+    },
+    {
+     "name": "SOUL.md",
+     "path": "/sandbox/.openclaw/workspace/SOUL.md",
+     "missing": false,
+     "rawChars": 1526,
+     "injectedChars": 1526,
+     "truncated": false
+    },
+    {
+     "name": "IDENTITY.md",
+     "path": "/sandbox/.openclaw/workspace/IDENTITY.md",
+     "missing": false,
+     "rawChars": 1398,
+     "injectedChars": 1398,
+     "truncated": false
+    },
+    {
+     "name": "USER.md",
+     "path": "/sandbox/.openclaw/workspace/USER.md",
+     "missing": false,
+     "rawChars": 1136,
+     "injectedChars": 1136,
+     "truncated": false
+    },
+    {
+     "name": "BOOTSTRAP.md",
+     "path": "/sandbox/.openclaw/workspace/BOOTSTRAP.md",
+     "missing": false,
+     "rawChars": 7475,
+     "injectedChars": 7475,
+     "truncated": false
+    }
+   ],
+   "skills": {
+    "promptChars": 6597,
+    "hash": "3901714edd8552a2ed5584d30a27f3876d91f3f6d79297d2dd02698a54d76b20",
+    "entries": [
+     {
+      "name": "add-model-provider",
+      "blockChars": 299
+     },
+     {
+      "name": "browser-automation",
+      "blockChars": 324
+     },
+     {
+      "name": "canvas",
+      "blockChars": 243
+     },
+     {
+      "name": "clawhub",
+      "blockChars": 302
+     },
+     {
+      "name": "cloud-image-bake",
+      "blockChars": 285
+     },
+     {
+      "name": "configure-channel",
+      "blockChars": 287
+     },
+     {
+      "name": "control-ui",
+      "blockChars": 338
+     },
+     {
+      "name": "diagnose-gateway",
+      "blockChars": 279
+     },
+     {
+      "name": "diagram-maker",
+      "blockChars": 264
+     },
+     {
+      "name": "gh-issues",
+      "blockChars": 287
+     },
+     {
+      "name": "github",
+      "blockChars": 494
+     },
+     {
+      "name": "healthcheck",
+      "blockChars": 276
+     },
+     {
+      "name": "meme-maker",
+      "blockChars": 249
+     },
+     {
+      "name": "node-connect",
+      "blockChars": 333
+     },
+     {
+      "name": "node-inspect-debugger",
+      "blockChars": 275
+     },
+     {
+      "name": "notion",
+      "blockChars": 270
+     },
+     {
+      "name": "python-debugpy",
+      "blockChars": 263
+     },
+     {
+      "name": "skill-creator",
+      "blockChars": 282
+     },
+     {
+      "name": "spike",
+      "blockChars": 249
+     },
+     {
+      "name": "visualize",
+      "blockChars": 280
+     },
+     {
+      "name": "weather",
+      "blockChars": 287
+     }
+    ]
+   },
+   "tools": {
+    "listChars": 0,
+    "schemaChars": 6113,
+    "entries": [
+     {
+      "name": "ls",
+      "summaryChars": 192,
+      "summaryHash": "90bdd7a772f66ad236d45f18e28ee873b8c795fe219804f2c19074a867423e20",
+      "schemaChars": 254,
+      "schemaHash": "ebe8d6a85b7011ec7e0d43a759b3b53b1ce96e682f54a64312b10e89260e9af9",
+      "propertiesCount": 3
+     },
+     {
+      "name": "read",
+      "summaryChars": 164,
+      "summaryHash": "d136f5b09e28d671addad4ca800b75b8aa6a36002bc739ead964f618d3e34829",
+      "schemaChars": 481,
+      "schemaHash": "b1b9b637dfe1dfade40f50c37cf840a298f1992b534cb9425b7470233a6b0cbb",
+      "propertiesCount": 5
+     },
+     {
+      "name": "edit",
+      "summaryChars": 130,
+      "summaryHash": "4149500b1f6501ec6450e4c048bdb6844764dd4a888a10846726cbbc7256152e",
+      "schemaChars": 501,
+      "schemaHash": "adf3140833ca927b84c66c989d6833fdcbd9de011dd2ffc59f9a2c4d3c25f127",
+      "propertiesCount": 2
+     },
+     {
+      "name": "write",
+      "summaryChars": 49,
+      "summaryHash": "f9ce3d8ac929a51498c03331b97c59bfaa2bb4d25580a5ddf0102e6a8e173aec",
+      "schemaChars": 191,
+      "schemaHash": "b61d2da23febf5fbda55e391526f36d283e9e9fb7f1a1dbadcf5c618a0632287",
+      "propertiesCount": 2
+     },
+     {
+      "name": "apply_patch",
+      "summaryChars": 71,
+      "summaryHash": "5c1173efe93d080a386a23216bc3e58db2e0033eb3ddea697eb2439938b7cae4",
+      "schemaChars": 153,
+      "schemaHash": "05521268363ff4f191472c90d69ef08a503ba9acf1d2febc50b3ee68db32ab65",
+      "propertiesCount": 1
+     },
+     {
+      "name": "exec",
+      "summaryChars": 503,
+      "summaryHash": "db730359f8e2e0af6b787dd3717ee4d33189b95f908103250e1e203079218503",
+      "schemaChars": 1242,
+      "schemaHash": "aeabc27dd35e066195bd6dc30a5fd0e3598974789e8784eb7303eee80fe82518",
+      "propertiesCount": 12
+     },
+     {
+      "name": "process",
+      "summaryChars": 258,
+      "summaryHash": "c9c81d9c38f731d0efcc810924c78c3161c38524baa561c6f9251638d9e164b2",
+      "schemaChars": 1164,
+      "schemaHash": "6cf3281369349e15ea532e644c8ec7f94c96fa6a4e3287272c8cfe90b0960516",
+      "propertiesCount": 12
+     },
+     {
+      "name": "openclaw",
+      "summaryChars": 456,
+      "summaryHash": "45212b5ccc76e78f8dc05e9a9d90d721c53f16f18ee08a23a5868020bbe24f6d",
+      "schemaChars": 196,
+      "schemaHash": "9956b2b6fde1ca6ca3d035b66217a09c717a6503aa4e59a2ce184dbf67849bd3",
+      "propertiesCount": 2
+     },
+     {
+      "name": "sessions_yield",
+      "summaryChars": 337,
+      "summaryHash": "1dddf4158ea2c44cf79c93b483fd18bc48c6e32fe32fafca3fe83b5309310ce8",
+      "schemaChars": 457,
+      "schemaHash": "6f3649fb583d30499a48925363f0158ecff856d7bc44e9531dd9cbd8c23c6428",
+      "propertiesCount": 3
+     },
+     {
+      "name": "tool_search",
+      "summaryChars": 502,
+      "summaryHash": "acdcab138b356606711452241e668c366bdb15428e39a28a94d7be27d7968626",
+      "schemaChars": 1139,
+      "schemaHash": "0a78304973631f66103ff3f0c767433fdc00fb89d629bd5b12d1ada29940d382",
+      "propertiesCount": 3
+     },
+     {
+      "name": "tool_describe",
+      "summaryChars": 92,
+      "summaryHash": "fc74d14dc28e4026dba1a8904339a6bef1ce8118588e0bff809c37be73ce7a02",
+      "schemaChars": 125,
+      "schemaHash": "8b60055097c87990f29b27c1f82ecea48435ffb1163c486121a2189f118aa0a4",
+      "propertiesCount": 1
+     },
+     {
+      "name": "tool_call",
+      "summaryChars": 61,
+      "summaryHash": "0dc569a573cbc94928d868c94a178930879ac898b541cd9009338699a3e7d1fd",
+      "schemaChars": 210,
+      "schemaHash": "f48bfb0705c11b32ccbdfd456b791ce458604b1f51b1e31f61bc2d7b25ae07b9",
+      "propertiesCount": 2
+     }
+    ]
+   },
+   "currentTurn": {
+    "promptChars": 277,
+    "runtimeContextChars": 52,
+    "modelOnlyPromptChars": 0
+   }
+  },
+  "finalPromptText": "Based on the spec and code you have read, explain how row-level deletes work: position deletes, equality deletes and deletion vectors. Which format versions support each, when does a reader apply them, and what does compaction do with them? Cite the spec sections and the code.",
+  "finalAssistantVisibleText": "I have everything I need. Here's the synthesis.\n\n# Row-level deletes in Iceberg: how they work, who supports them, when they apply, and what compaction does\n\n## 1. The three mechanisms and their spec support\n\nThe spec's Row-level Deletes overview introduces the two *types* (spec.md:109\u2013117):\n\n> \"There are two types of row-level deletes: **Position deletes** \u2014 Mark a row deleted by data file path and the row position\u2026 encoded in a position delete file (V2) or deletion vector (V3 or above). **Equality deletes** \u2014 Mark a row deleted by one or more column values, like id = 5\u2026 (may be created in v2 and v3 tables only).\" (spec.md:113\u2013117)\n\nThe Delete Formats section (spec.md:1356) gives the version matrix in one line:\n\n> \"Row-level deletes are added by v2 and are not supported in v1. Deletion vectors are added in v3 and are not supported in v2 or earlier. Position delete files must not be added to v3 tables, but existing position delete files are valid. Equality delete files must not be added to v4 tables, but existing equality delete files are valid.\" (spec.md:1358)\n\nSo:\n- **v1**: no row-level deletes at all.\n- **v2**: position delete files + equality delete files (both writable and applied).\n- **v3**: adds deletion vectors; position delete files are **deprecated** \u2014 new ones must not be written (\"Position delete files must not be added to v3 tables\", spec.md:1358; note at 1393: \"Existing position deletes must be written to delete vectors when updating\"); *existing* v2 position delete files remain valid and are still applied. Equality deletes still allowed.\n- **v4**: equality delete files **prohibited** for new writes (\"must not be added to v4 tables\u2026 Equality delete files referenced by v2 or v3 delete manifests must still be applied in a v4 table\", spec.md:1422; Appendix E v4 section, 1921). DVs and remaining v2 position delete files still apply.\n\nEach mechanism individually:\n\n- **Position delete files** (spec.md:1391\u20131416): `.  Each row is `(file_path, pos [, row])`. A row is deleted if its file+position appears. Must be **sorted by `file_path` then `pos`** so scanners can filter by file and \"avoid keeping deletes in memory\" (spec.md:1406\u20131416). Deleting by file+position works only because data files are immutable.\n- **Equality delete files** (spec.md:1418\u20131469): rows are deleted by *value equality* on the delete columns (identified by `equality_ids` in manifest metadata); multiple columns behave as an `AND` of equality predicates, and \"a null value in a delete column matches a row if the row's value is null\" (spec.md:1440\u20131443). They store any subset of columns using table field ids (spec.md:1428). Code reflection: the `data_file` struct's `equality_ids` field (id 135), which \"must be present in the delete file\" and \"Required when `content=2`\" (spec.md:739).\n- **Deletion vectors** (spec.md:1375\u20131389): a bitmap per referenced data file \u2014 \"A set bit at position P indicates that the row at position P is deleted\" (spec.md:1377). They live in Puffin files as `deletion-vector-v1` blobs, tracked in delete manifests by `file_path` + blob `content_offset` + `content_size_in_bytes` (spec.md:1381\u20131386), and the data file metadata fields `142 content_offset` / `145 content_size_in_bytes` plus `143 referenced_data_file` (spec.md:742\u2013744). Key constraints: **at most one DV per data file in a snapshot**, writers merge new deletes into existing vectors, and \"If a DV is written for a data file, it must replace all previously written position delete files so that when a DV is present, readers can safely ignore matching position delete files\" (spec.md:1388\u20131389). There can be at most one deletion vector per data file; writers must merge new deletes with existing vectors or position delete files (spec.md:1362).\n\n## 2. When a reader applies them: scope rules\n\nThe spec's Scan Planning section (spec.md:1073\u20131091) defines exactly when each applies to a data file at read time:\n\n- **Deletion vector**: applies when `file_path` equals the vector's `referenced_data_file`, **data file's data sequence number \u2264 the DV's**, and partitions match (spec.md:1075\u20131077).\n- **Position delete file**: same, with the addition that if a DV must be applied, the position delete file is not (spec.md:1079\u20131082).\n- **Equality delete file**: applies when the data file's data sequence number is **strictly less than** the delete's (`<`, not `\u2264`), and partitions match **or the delete's spec is unpartitioned** (spec.md:1084\u20131087).\n- General rule: \"deletes are applied only to data files that are older and in the same partition\", with two exceptions: unpartitioned equality deletes act globally, and \"Position deletes (vectors and files) must be applied to data files from the same commit, when the data and delete file data sequence numbers are equal\" \u2014 allowing deletes of rows added in the same commit (spec.md:1088\u20131091).\n\n**The code implements exactly these rules** \u2014 `DeleteFileIndex` is \"An index of {@link DeleteFile delete files} by sequence number\" (DeleteFileIndex.java:64) and resolves applicability via `forDataFile(long sequenceNumber, DataFile file)` (DeleteFileIndex.java:158):\n\n- It buckets delete files by **content and scope** at build time: position deletes with a `referenced_data_file` go to `posDeletesByPath` (keyed by data-file path); others go to `posDeletesByPartition`; equality deletes from an **unpartitioned spec** go to `globalDeletes` (global scope); partitioned ones to `eqDeletesByPartition`; DVs to `dvByPath` (DeleteFileIndex.java:542\u2013553, 581\u2013613).\n- Each bucket sorts by sequence number (PositionDeletes l.710\u2013711; EqualityDeletes l.785\u2013787) and `filter(seq)` binary-searches `findStartIndex(seqs, seq)` \u2014 returning everything with sequence **\u2265** the data file's for positions, **\u2265** for DVs (l.687\u2013741).\n- For equality deletes, the search key is shifted: `this.applySequenceNumber = wrapped.dataSequenceNumber() - 1` (DeleteFileIndex.java:881). That `-1` encodes the spec's **strictly-less-than** rule \u2014 an equality delete only matches data files whose sequence is strictly below the delete's. The match also requires `canContainEqDeletesForFile` to pass (l.258), which uses column stats (null/value counts, lower/upper bound ranges) to skip equality deletes that provably can't overlap the data file (l.269\u2013316) \u2014 the spec: \"If metrics show that a delete file has no rows that match a scan predicate, it may be ignored\" (spec.md:1067\u20131068).\n- The \"DV replaces position delete files\" rule is in `forDataFile`: when `findDV` returns a non-null vector, the result is just the DV (+ global/eq), and `findPosPartitionDeletes`/`findPathDeletes` are never consulted (DeleteFileIndex.java:165\u2013173).\n- Cross-file partition validation protects correctness: `validatePartitionMatch` throws if spec ids or partition tuples differ (\"metadata is corrupted\", DeleteFileIndex.java:234\u2013248) \u2014 though in normal operation the partition/global bucketing already scopes files.\n\n## 3. What compaction does with deletes\n\n**Data-file compaction** is `RewriteDataFiles` \u2014 implemented by `BaseRewriteDataFilesAction`:\n\n- It plans `FileScanTask`s and groups them by partition, keeping only partitions with **more than one data file**, then splits and re-bins tasks to produce `CombinedScanTask`s (BaseRewriteDataFilesAction.java:247\u2013274).\n- It rewrites the data **without the deleted rows** \u2014 the files are read through the scan (`ignoreResiduals()` at l.271, \".filter(filter).planFiles()\" at l.268\u2013272), so the delete files that apply to those data files are applied while reading, and the output data files simply *don't contain* the deleted rows.\n- It then commits via `table.newRewrite()` (BaseRewriteFiles) with `deleteFile(dataFile)` for every rewritten input and `addFile(dataFile)` for the new compacted outputs (BaseRewriteFiles.java:42\u201353, BaseRewriteDataFilesAction.java:333\u2013334, 349\u2013353). In the metadata, the old data files become `DELETED` entries and the new data files `ADDED`.\n\nSo compaction removes the deletes *from the data* \u2014 after a rewrite, the compacted snapshot commits new data files that already exclude deleted rows; the delete files are then obsolete for those data files. This is what the spec calls the `replace` operation (\"Data and delete files were added and removed without changing table data; i.e., compaction\u2026\", spec.md:1006).\n\n**Rewriting/cleanup of delete files themselves** is exposed on the same `RewriteFiles` API: `deleteFile(DeleteFile)` and `addFile(DeleteFile)` (BaseRewriteFiles.java:46\u201358), and `rewriteFiles(dataToReplace, deletesToReplace, dataToAdd, deletesToAdd)` (l.76\u2013106) \u2014 so a rewrite can both replace data files *and* replace/drop the delete files that applied to them, plus `dataSequenceNumber(...)` to pin the sequence number of new files (BaseRewriteFiles.java:64\u201367). Afterwards, snapshot expiration (`RemoveSnapshots` + `ReachableFileCleanup`/`IncrementalFileCleanup`) physically deletes the removed data *and* delete files once no remaining snapshot references them \u2014 in the incremental path, deletion happens via `DELETED` entries whose snapshot id is no longer valid (IncrementalFileCleanup.java:302\u2013303) and manifests with `hasDeletedFiles()` from ancestors of the current state (l.223\u2013230).\n\nTwo correctness guards live in `BaseRewriteFiles.validate`:\n\n- The rewrite is validated against the snapshot it started from (`validateFromSnapshot(startingSnapshotId)`, BaseRewriteFiles.java:112), and\n- `validateNoNewDeletesForDataFiles(base, startingSnapshotId, replacedDataFiles, parent)` \u2014 if anything added *new* row-level deletes for a data file being rewritten between plan time and commit, the compaction **fails rather than silently dropping those deletes** (BaseRewriteFiles.java:120\u2013126). That's why `useStartingSequenceNumber` exists, to \"avoid commit conflicts with updates that add newer equality deletes at a higher sequence number\" (BaseRewriteDataFilesAction.java:207\u2013209).\n\n## Put together\n\n| | Position delete file | Deletion vector | Equality delete file |\n|---|---|---|---|\n| **Format** | `file_path`+`pos` rows (Avro/ORC/Parquet), sorted by file/pos (spec.md:1391\u20131416) | Puffin `deletion-vector-v1` bitmap, \u22641 per data file (spec.md:1375\u20131389) | any column subset, matched by `equality_ids` values (spec.md:1418\u20131469) |\n| **Writable in** | v2 only (deprecated in v3+) (spec.md:1358,1393) | v3+ (spec.md:1358) | v2, v3 (prohibited in v4) (spec.md:1422,1921) |\n| **Applied in** | v2\u2013v4 (existing files) | v3+ (spec.md:1075\u20131077) | v2\u2013v4 (existing files) (spec.md:1422) |\n| **Applies to a data file when** | file path matches (or same partition), dataSeq \u2264 deleteSeq, same partition \u2014 but not when a DV exists (spec.md:1079\u20131082,1091) | `referenced_data_file` = data file path, dataSeq \u2264 DV Seq, same partition (spec.md:1075\u20131077) | dataSeq **<** deleteSeq, same partition, or global if unpartitioned (spec.md:1084\u20131087) |\n| **Code** | `posDeletesByPath`/`posDeletesByPartition`, `PositionDeletes.filter` \u2265 (DeleteFileIndex.java:181\u2013212,710\u2013741) | `dvByPath`, `findDV` (DeleteFileIndex.java:217\u2013230) | `globalDeletes`/`eqDeletesByPartition`, `filter` on `dataSeq\u22121`, + stats pruning (DeleteFileIndex.java:177,190\u2013207,785\u2013821,881) |\n| **Compaction** | applied at read \u2192 rewritten data excludes rows; delete file then droppable via `RewriteFiles`; physically removed at expiration | same | same, plus commit-risk guards (`validateNoNewDeletes\u2026`, `useStartingSequenceNumber`) (BaseRewriteFiles.java:112\u2013126; BaseRewriteDataFilesAction.java:207\u2013209,333\u2013353) |\n\nIn short: delete files are metadata-tracked rows/bitmaps that *mask* rows during reads by sequence-number + partition scope rules (implemented as a sorted, sequence-binary-searched index in `DeleteFileIndex`); compaction applies them once, writing new data files without the deleted rows, at which point the delete files become garbage that snapshot expiration safely reclaims.",
+  "finalAssistantRawText": "I have everything I need. Here's the synthesis.\n\n# Row-level deletes in Iceberg: how they work, who supports them, when they apply, and what compaction does\n\n## 1. The three mechanisms and their spec support\n\nThe spec's Row-level Deletes overview introduces the two *types* (spec.md:109\u2013117):\n\n> \"There are two types of row-level deletes: **Position deletes** \u2014 Mark a row deleted by data file path and the row position\u2026 encoded in a position delete file (V2) or deletion vector (V3 or above). **Equality deletes** \u2014 Mark a row deleted by one or more column values, like id = 5\u2026 (may be created in v2 and v3 tables only).\" (spec.md:113\u2013117)\n\nThe Delete Formats section (spec.md:1356) gives the version matrix in one line:\n\n> \"Row-level deletes are added by v2 and are not supported in v1. Deletion vectors are added in v3 and are not supported in v2 or earlier. Position delete files must not be added to v3 tables, but existing position delete files are valid. Equality delete files must not be added to v4 tables, but existing equality delete files are valid.\" (spec.md:1358)\n\nSo:\n- **v1**: no row-level deletes at all.\n- **v2**: position delete files + equality delete files (both writable and applied).\n- **v3**: adds deletion vectors; position delete files are **deprecated** \u2014 new ones must not be written (\"Position delete files must not be added to v3 tables\", spec.md:1358; note at 1393: \"Existing position deletes must be written to delete vectors when updating\"); *existing* v2 position delete files remain valid and are still applied. Equality deletes still allowed.\n- **v4**: equality delete files **prohibited** for new writes (\"must not be added to v4 tables\u2026 Equality delete files referenced by v2 or v3 delete manifests must still be applied in a v4 table\", spec.md:1422; Appendix E v4 section, 1921). DVs and remaining v2 position delete files still apply.\n\nEach mechanism individually:\n\n- **Position delete files** (spec.md:1391\u20131416): `.  Each row is `(file_path, pos [, row])`. A row is deleted if its file+position appears. Must be **sorted by `file_path` then `pos`** so scanners can filter by file and \"avoid keeping deletes in memory\" (spec.md:1406\u20131416). Deleting by file+position works only because data files are immutable.\n- **Equality delete files** (spec.md:1418\u20131469): rows are deleted by *value equality* on the delete columns (identified by `equality_ids` in manifest metadata); multiple columns behave as an `AND` of equality predicates, and \"a null value in a delete column matches a row if the row's value is null\" (spec.md:1440\u20131443). They store any subset of columns using table field ids (spec.md:1428). Code reflection: the `data_file` struct's `equality_ids` field (id 135), which \"must be present in the delete file\" and \"Required when `content=2`\" (spec.md:739).\n- **Deletion vectors** (spec.md:1375\u20131389): a bitmap per referenced data file \u2014 \"A set bit at position P indicates that the row at position P is deleted\" (spec.md:1377). They live in Puffin files as `deletion-vector-v1` blobs, tracked in delete manifests by `file_path` + blob `content_offset` + `content_size_in_bytes` (spec.md:1381\u20131386), and the data file metadata fields `142 content_offset` / `145 content_size_in_bytes` plus `143 referenced_data_file` (spec.md:742\u2013744). Key constraints: **at most one DV per data file in a snapshot**, writers merge new deletes into existing vectors, and \"If a DV is written for a data file, it must replace all previously written position delete files so that when a DV is present, readers can safely ignore matching position delete files\" (spec.md:1388\u20131389). There can be at most one deletion vector per data file; writers must merge new deletes with existing vectors or position delete files (spec.md:1362).\n\n## 2. When a reader applies them: scope rules\n\nThe spec's Scan Planning section (spec.md:1073\u20131091) defines exactly when each applies to a data file at read time:\n\n- **Deletion vector**: applies when `file_path` equals the vector's `referenced_data_file`, **data file's data sequence number \u2264 the DV's**, and partitions match (spec.md:1075\u20131077).\n- **Position delete file**: same, with the addition that if a DV must be applied, the position delete file is not (spec.md:1079\u20131082).\n- **Equality delete file**: applies when the data file's data sequence number is **strictly less than** the delete's (`<`, not `\u2264`), and partitions match **or the delete's spec is unpartitioned** (spec.md:1084\u20131087).\n- General rule: \"deletes are applied only to data files that are older and in the same partition\", with two exceptions: unpartitioned equality deletes act globally, and \"Position deletes (vectors and files) must be applied to data files from the same commit, when the data and delete file data sequence numbers are equal\" \u2014 allowing deletes of rows added in the same commit (spec.md:1088\u20131091).\n\n**The code implements exactly these rules** \u2014 `DeleteFileIndex` is \"An index of {@link DeleteFile delete files} by sequence number\" (DeleteFileIndex.java:64) and resolves applicability via `forDataFile(long sequenceNumber, DataFile file)` (DeleteFileIndex.java:158):\n\n- It buckets delete files by **content and scope** at build time: position deletes with a `referenced_data_file` go to `posDeletesByPath` (keyed by data-file path); others go to `posDeletesByPartition`; equality deletes from an **unpartitioned spec** go to `globalDeletes` (global scope); partitioned ones to `eqDeletesByPartition`; DVs to `dvByPath` (DeleteFileIndex.java:542\u2013553, 581\u2013613).\n- Each bucket sorts by sequence number (PositionDeletes l.710\u2013711; EqualityDeletes l.785\u2013787) and `filter(seq)` binary-searches `findStartIndex(seqs, seq)` \u2014 returning everything with sequence **\u2265** the data file's for positions, **\u2265** for DVs (l.687\u2013741).\n- For equality deletes, the search key is shifted: `this.applySequenceNumber = wrapped.dataSequenceNumber() - 1` (DeleteFileIndex.java:881). That `-1` encodes the spec's **strictly-less-than** rule \u2014 an equality delete only matches data files whose sequence is strictly below the delete's. The match also requires `canContainEqDeletesForFile` to pass (l.258), which uses column stats (null/value counts, lower/upper bound ranges) to skip equality deletes that provably can't overlap the data file (l.269\u2013316) \u2014 the spec: \"If metrics show that a delete file has no rows that match a scan predicate, it may be ignored\" (spec.md:1067\u20131068).\n- The \"DV replaces position delete files\" rule is in `forDataFile`: when `findDV` returns a non-null vector, the result is just the DV (+ global/eq), and `findPosPartitionDeletes`/`findPathDeletes` are never consulted (DeleteFileIndex.java:165\u2013173).\n- Cross-file partition validation protects correctness: `validatePartitionMatch` throws if spec ids or partition tuples differ (\"metadata is corrupted\", DeleteFileIndex.java:234\u2013248) \u2014 though in normal operation the partition/global bucketing already scopes files.\n\n## 3. What compaction does with deletes\n\n**Data-file compaction** is `RewriteDataFiles` \u2014 implemented by `BaseRewriteDataFilesAction`:\n\n- It plans `FileScanTask`s and groups them by partition, keeping only partitions with **more than one data file**, then splits and re-bins tasks to produce `CombinedScanTask`s (BaseRewriteDataFilesAction.java:247\u2013274).\n- It rewrites the data **without the deleted rows** \u2014 the files are read through the scan (`ignoreResiduals()` at l.271, \".filter(filter).planFiles()\" at l.268\u2013272), so the delete files that apply to those data files are applied while reading, and the output data files simply *don't contain* the deleted rows.\n- It then commits via `table.newRewrite()` (BaseRewriteFiles) with `deleteFile(dataFile)` for every rewritten input and `addFile(dataFile)` for the new compacted outputs (BaseRewriteFiles.java:42\u201353, BaseRewriteDataFilesAction.java:333\u2013334, 349\u2013353). In the metadata, the old data files become `DELETED` entries and the new data files `ADDED`.\n\nSo compaction removes the deletes *from the data* \u2014 after a rewrite, the compacted snapshot commits new data files that already exclude deleted rows; the delete files are then obsolete for those data files. This is what the spec calls the `replace` operation (\"Data and delete files were added and removed without changing table data; i.e., compaction\u2026\", spec.md:1006).\n\n**Rewriting/cleanup of delete files themselves** is exposed on the same `RewriteFiles` API: `deleteFile(DeleteFile)` and `addFile(DeleteFile)` (BaseRewriteFiles.java:46\u201358), and `rewriteFiles(dataToReplace, deletesToReplace, dataToAdd, deletesToAdd)` (l.76\u2013106) \u2014 so a rewrite can both replace data files *and* replace/drop the delete files that applied to them, plus `dataSequenceNumber(...)` to pin the sequence number of new files (BaseRewriteFiles.java:64\u201367). Afterwards, snapshot expiration (`RemoveSnapshots` + `ReachableFileCleanup`/`IncrementalFileCleanup`) physically deletes the removed data *and* delete files once no remaining snapshot references them \u2014 in the incremental path, deletion happens via `DELETED` entries whose snapshot id is no longer valid (IncrementalFileCleanup.java:302\u2013303) and manifests with `hasDeletedFiles()` from ancestors of the current state (l.223\u2013230).\n\nTwo correctness guards live in `BaseRewriteFiles.validate`:\n\n- The rewrite is validated against the snapshot it started from (`validateFromSnapshot(startingSnapshotId)`, BaseRewriteFiles.java:112), and\n- `validateNoNewDeletesForDataFiles(base, startingSnapshotId, replacedDataFiles, parent)` \u2014 if anything added *new* row-level deletes for a data file being rewritten between plan time and commit, the compaction **fails rather than silently dropping those deletes** (BaseRewriteFiles.java:120\u2013126). That's why `useStartingSequenceNumber` exists, to \"avoid commit conflicts with updates that add newer equality deletes at a higher sequence number\" (BaseRewriteDataFilesAction.java:207\u2013209).\n\n## Put together\n\n| | Position delete file | Deletion vector | Equality delete file |\n|---|---|---|---|\n| **Format** | `file_path`+`pos` rows (Avro/ORC/Parquet), sorted by file/pos (spec.md:1391\u20131416) | Puffin `deletion-vector-v1` bitmap, \u22641 per data file (spec.md:1375\u20131389) | any column subset, matched by `equality_ids` values (spec.md:1418\u20131469) |\n| **Writable in** | v2 only (deprecated in v3+) (spec.md:1358,1393) | v3+ (spec.md:1358) | v2, v3 (prohibited in v4) (spec.md:1422,1921) |\n| **Applied in** | v2\u2013v4 (existing files) | v3+ (spec.md:1075\u20131077) | v2\u2013v4 (existing files) (spec.md:1422) |\n| **Applies to a data file when** | file path matches (or same partition), dataSeq \u2264 deleteSeq, same partition \u2014 but not when a DV exists (spec.md:1079\u20131082,1091) | `referenced_data_file` = data file path, dataSeq \u2264 DV Seq, same partition (spec.md:1075\u20131077) | dataSeq **<** deleteSeq, same partition, or global if unpartitioned (spec.md:1084\u20131087) |\n| **Code** | `posDeletesByPath`/`posDeletesByPartition`, `PositionDeletes.filter` \u2265 (DeleteFileIndex.java:181\u2013212,710\u2013741) | `dvByPath`, `findDV` (DeleteFileIndex.java:217\u2013230) | `globalDeletes`/`eqDeletesByPartition`, `filter` on `dataSeq\u22121`, + stats pruning (DeleteFileIndex.java:177,190\u2013207,785\u2013821,881) |\n| **Compaction** | applied at read \u2192 rewritten data excludes rows; delete file then droppable via `RewriteFiles`; physically removed at expiration | same | same, plus commit-risk guards (`validateNoNewDeletes\u2026`, `useStartingSequenceNumber`) (BaseRewriteFiles.java:112\u2013126; BaseRewriteDataFilesAction.java:207\u2013209,333\u2013353) |\n\nIn short: delete files are metadata-tracked rows/bitmaps that *mask* rows during reads by sequence-number + partition scope rules (implemented as a sorted, sequence-binary-searched index in `DeleteFileIndex`); compaction applies them once, writing new data files without the deleted rows, at which point the delete files become garbage that snapshot expiration safely reclaims.",
+  "replayInvalid": true,
+  "livenessState": "working",
+  "stopReason": "stop",
+  "executionTrace": {
+   "winnerProvider": "vllm",
+   "winnerModel": "dsv4flash",
+   "attempts": [
+    {
+     "provider": "vllm",
+     "model": "dsv4flash",
+     "result": "success",
+     "stage": "assistant"
+    }
+   ],
+   "fallbackUsed": false,
+   "runner": "embedded"
+  },
+  "requestShaping": {
+   "thinking": "off"
+  },
+  "completion": {
+   "stopReason": "stop",
+   "finishReason": "stop"
+  },
+  "toolSummary": {
+   "calls": 10,
+   "tools": [
+    "exec",
+    "read"
+   ],
+   "failures": 6,
+   "unresolvedError": {
+    "toolName": "exec"
+   }
+  },
+  "terminalReply": {
+   "disposition": "visible",
+   "text": "I have everything I need. Here's the synthesis.\n\n# Row-level deletes in Iceberg: how they work, who supports them, when they apply, and what compaction does\n\n## 1. The three mechanisms and their spec support\n\nThe spec's Row-level Deletes overview introduces the two *types* (spec.md:109\u2013117):\n\n> \"There are two types of row-level deletes: **Position deletes** \u2014 Mark a row deleted by data file path and the row position\u2026 encoded in a position delete file (V2) or deletion vector (V3 or above). **Equality deletes** \u2014 Mark a row deleted by one or more column values, like id = 5\u2026 (may be created in v2 and v3 tables only).\" (spec.md:113\u2013117)\n\nThe Delete Formats section (spec.md:1356) gives the version matrix in one line:\n\n> \"Row-level deletes are added by v2 and are not supported in v1. Deletion vectors are added in v3 and are not supported in v2 or earlier. Position delete files must not be added to v3 tables, but existing position delete files are valid. Equality delete files must not be added to v4 tables, but existing equality delete files are valid.\" (spec.md:1358)\n\nSo:\n- **v1**: no row-level deletes at all.\n- **v2**: position delete files + equality delete files (both writable and applied).\n- **v3**: adds deletion vectors; position delete files are **deprecated** \u2014 new ones must not be written (\"Position delete files must not be added to v3 tables\", spec.md:1358; note at 1393: \"Existing position deletes must be written to delete vectors when updating\"); *existing* v2 position delete files remain valid and are still applied. Equality deletes still allowed.\n- **v4**: equality delete files **prohibited** for new writes (\"must not be added to v4 tables\u2026 Equality delete files referenced by v2 or v3 delete manifests must still be applied in a v4 table\", spec.md:1422; Appendix E v4 section, 1921). DVs and remaining v2 position delete files still apply.\n\nEach mechanism individually:\n\n- **Position delete files** (spec.md:1391\u20131416): `.  Each row is `(file_path, pos [, row])`. A row is deleted if its file+position appears. Must be **sorted by `file_path` then `pos`** so scanners can filter by file and \"avoid keeping deletes in memory\" (spec.md:1406\u20131416). Deleting by file+position works only because data files are immutable.\n- **Equality delete files** (spec.md:1418\u20131469): rows are deleted by *value equality* on the delete columns (identified by `equality_ids` in manifest metadata); multiple columns behave as an `AND` of equality predicates, and \"a null value in a delete column matches a row if the row's value is null\" (spec.md:1440\u20131443). They store any subset of columns using table field ids (spec.md:1428). Code reflection: the `data_file` struct's `equality_ids` field (id 135), which \"must be present in the delete file\" and \"Required when `content=2`\" (spec.md:739).\n- **Deletion vectors** (spec.md:1375\u20131389): a bitmap per referenced data file \u2014 \"A set bit at position P indicates that the row at position P is deleted\" (spec.md:1377). They live in Puffin files as `deletion-vector-v1` blobs, tracked in delete manifests by `file_path` + blob `content_offset` + `content_size_in_bytes` (spec.md:1381\u20131386), and the data file metadata fields `142 content_offset` / `145 content_size_in_bytes` plus `143 referenced_data_file` (spec.md:742\u2013744). Key constraints: **at most one DV per data file in a snapshot**, writers merge new deletes into existing vectors, and \"If a DV is written for a data file, it must replace all previously written position delete files so that when a DV is present, readers can safely ignore matching position delete files\" (spec.md:1388\u20131389). There can be at most one deletion vector per data file; writers must merge new deletes with existing vectors or position delete files (spec.md:1362).\n\n## 2. When a reader applies them: scope rules\n\nThe spec's Scan Planning section (spec.md:1073\u20131091) defines exactly when each applies to a data file at read time:\n\n- **Deletion vector**: applies when `file_path` equals the vector's `referenced_data_file`, **data file's data sequence number \u2264 the DV's**, and partitions match (spec.md:\u2026"
+  }
+ },
+ "answer": "I have everything I need. Here's the synthesis.\n\n# Row-level deletes in Iceberg: how they work, who supports them, when they apply, and what compaction does\n\n## 1. The three mechanisms and their spec support\n\nThe spec's Row-level Deletes overview introduces the two *types* (spec.md:109\u2013117):\n\n> \"There are two types of row-level deletes: **Position deletes** \u2014 Mark a row deleted by data file path and the row position\u2026 encoded in a position delete file (V2) or deletion vector (V3 or above). **Equality deletes** \u2014 Mark a row deleted by one or more column values, like id = 5\u2026 (may be created in v2 and v3 tables only).\" (spec.md:113\u2013117)\n\nThe Delete Formats section (spec.md:1356) gives the version matrix in one line:\n\n> \"Row-level deletes are added by v2 and are not supported in v1. Deletion vectors are added in v3 and are not supported in v2 or earlier. Position delete files must not be added to v3 tables, but existing position delete files are valid. Equality delete files must not be added to v4 tables, but existing equality delete files are valid.\" (spec.md:1358)\n\nSo:\n- **v1**: no row-level deletes at all.\n- **v2**: position delete files + equality delete files (both writable and applied).\n- **v3**: adds deletion vectors; position delete files are **deprecated** \u2014 new ones must not be written (\"Position delete files must not be added to v3 tables\", spec.md:1358; note at 1393: \"Existing position deletes must be written to delete vectors when updating\"); *existing* v2 position delete files remain valid and are still applied. Equality deletes still allowed.\n- **v4**: equality delete files **prohibited** for new writes (\"must not be added to v4 tables\u2026 Equality delete files referenced by v2 or v3 delete manifests must still be applied in a v4 table\", spec.md:1422; Appendix E v4 section, 1921). DVs and remaining v2 position delete files still apply.\n\nEach mechanism individually:\n\n- **Position delete files** (spec.md:1391\u20131416): `.  Each row is `(file_path, pos [, row])`. A row is deleted if its file+position appears. Must be **sorted by `file_path` then `pos`** so scanners can filter by file and \"avoid keeping deletes in memory\" (spec.md:1406\u20131416). Deleting by file+position works only because data files are immutable.\n- **Equality delete files** (spec.md:1418\u20131469): rows are deleted by *value equality* on the delete columns (identified by `equality_ids` in manifest metadata); multiple columns behave as an `AND` of equality predicates, and \"a null value in a delete column matches a row if the row's value is null\" (spec.md:1440\u20131443). They store any subset of columns using table field ids (spec.md:1428). Code reflection: the `data_file` struct's `equality_ids` field (id 135), which \"must be present in the delete file\" and \"Required when `content=2`\" (spec.md:739).\n- **Deletion vectors** (spec.md:1375\u20131389): a bitmap per referenced data file \u2014 \"A set bit at position P indicates that the row at position P is deleted\" (spec.md:1377). They live in Puffin files as `deletion-vector-v1` blobs, tracked in delete manifests by `file_path` + blob `content_offset` + `content_size_in_bytes` (spec.md:1381\u20131386), and the data file metadata fields `142 content_offset` / `145 content_size_in_bytes` plus `143 referenced_data_file` (spec.md:742\u2013744). Key constraints: **at most one DV per data file in a snapshot**, writers merge new deletes into existing vectors, and \"If a DV is written for a data file, it must replace all previously written position delete files so that when a DV is present, readers can safely ignore matching position delete files\" (spec.md:1388\u20131389). There can be at most one deletion vector per data file; writers must merge new deletes with existing vectors or position delete files (spec.md:1362).\n\n## 2. When a reader applies them: scope rules\n\nThe spec's Scan Planning section (spec.md:1073\u20131091) defines exactly when each applies to a data file at read time:\n\n- **Deletion vector**: applies when `file_path` equals the vector's `referenced_data_file`, **data file's data sequence number \u2264 the DV's**, and partitions match (spec.md:1075\u20131077).\n- **Position delete file**: same, with the addition that if a DV must be applied, the position delete file is not (spec.md:1079\u20131082).\n- **Equality delete file**: applies when the data file's data sequence number is **strictly less than** the delete's (`<`, not `\u2264`), and partitions match **or the delete's spec is unpartitioned** (spec.md:1084\u20131087).\n- General rule: \"deletes are applied only to data files that are older and in the same partition\", with two exceptions: unpartitioned equality deletes act globally, and \"Position deletes (vectors and files) must be applied to data files from the same commit, when the data and delete file data sequence numbers are equal\" \u2014 allowing deletes of rows added in the same commit (spec.md:1088\u20131091).\n\n**The code implements exactly these rules** \u2014 `DeleteFileIndex` is \"An index of {@link DeleteFile delete files} by sequence number\" (DeleteFileIndex.java:64) and resolves applicability via `forDataFile(long sequenceNumber, DataFile file)` (DeleteFileIndex.java:158):\n\n- It buckets delete files by **content and scope** at build time: position deletes with a `referenced_data_file` go to `posDeletesByPath` (keyed by data-file path); others go to `posDeletesByPartition`; equality deletes from an **unpartitioned spec** go to `globalDeletes` (global scope); partitioned ones to `eqDeletesByPartition`; DVs to `dvByPath` (DeleteFileIndex.java:542\u2013553, 581\u2013613).\n- Each bucket sorts by sequence number (PositionDeletes l.710\u2013711; EqualityDeletes l.785\u2013787) and `filter(seq)` binary-searches `findStartIndex(seqs, seq)` \u2014 returning everything with sequence **\u2265** the data file's for positions, **\u2265** for DVs (l.687\u2013741).\n- For equality deletes, the search key is shifted: `this.applySequenceNumber = wrapped.dataSequenceNumber() - 1` (DeleteFileIndex.java:881). That `-1` encodes the spec's **strictly-less-than** rule \u2014 an equality delete only matches data files whose sequence is strictly below the delete's. The match also requires `canContainEqDeletesForFile` to pass (l.258), which uses column stats (null/value counts, lower/upper bound ranges) to skip equality deletes that provably can't overlap the data file (l.269\u2013316) \u2014 the spec: \"If metrics show that a delete file has no rows that match a scan predicate, it may be ignored\" (spec.md:1067\u20131068).\n- The \"DV replaces position delete files\" rule is in `forDataFile`: when `findDV` returns a non-null vector, the result is just the DV (+ global/eq), and `findPosPartitionDeletes`/`findPathDeletes` are never consulted (DeleteFileIndex.java:165\u2013173).\n- Cross-file partition validation protects correctness: `validatePartitionMatch` throws if spec ids or partition tuples differ (\"metadata is corrupted\", DeleteFileIndex.java:234\u2013248) \u2014 though in normal operation the partition/global bucketing already scopes files.\n\n## 3. What compaction does with deletes\n\n**Data-file compaction** is `RewriteDataFiles` \u2014 implemented by `BaseRewriteDataFilesAction`:\n\n- It plans `FileScanTask`s and groups them by partition, keeping only partitions with **more than one data file**, then splits and re-bins tasks to produce `CombinedScanTask`s (BaseRewriteDataFilesAction.java:247\u2013274).\n- It rewrites the data **without the deleted rows** \u2014 the files are read through the scan (`ignoreResiduals()` at l.271, \".filter(filter).planFiles()\" at l.268\u2013272), so the delete files that apply to those data files are applied while reading, and the output data files simply *don't contain* the deleted rows.\n- It then commits via `table.newRewrite()` (BaseRewriteFiles) with `deleteFile(dataFile)` for every rewritten input and `addFile(dataFile)` for the new compacted outputs (BaseRewriteFiles.java:42\u201353, BaseRewriteDataFilesAction.java:333\u2013334, 349\u2013353). In the metadata, the old data files become `DELETED` entries and the new data files `ADDED`.\n\nSo compaction removes the deletes *from the data* \u2014 after a rewrite, the compacted snapshot commits new data files that already exclude deleted rows; the delete files are then obsolete for those data files. This is what the spec calls the `replace` operation (\"Data and delete files were added and removed without changing table data; i.e., compaction\u2026\", spec.md:1006).\n\n**Rewriting/cleanup of delete files themselves** is exposed on the same `RewriteFiles` API: `deleteFile(DeleteFile)` and `addFile(DeleteFile)` (BaseRewriteFiles.java:46\u201358), and `rewriteFiles(dataToReplace, deletesToReplace, dataToAdd, deletesToAdd)` (l.76\u2013106) \u2014 so a rewrite can both replace data files *and* replace/drop the delete files that applied to them, plus `dataSequenceNumber(...)` to pin the sequence number of new files (BaseRewriteFiles.java:64\u201367). Afterwards, snapshot expiration (`RemoveSnapshots` + `ReachableFileCleanup`/`IncrementalFileCleanup`) physically deletes the removed data *and* delete files once no remaining snapshot references them \u2014 in the incremental path, deletion happens via `DELETED` entries whose snapshot id is no longer valid (IncrementalFileCleanup.java:302\u2013303) and manifests with `hasDeletedFiles()` from ancestors of the current state (l.223\u2013230).\n\nTwo correctness guards live in `BaseRewriteFiles.validate`:\n\n- The rewrite is validated against the snapshot it started from (`validateFromSnapshot(startingSnapshotId)`, BaseRewriteFiles.java:112), and\n- `validateNoNewDeletesForDataFiles(base, startingSnapshotId, replacedDataFiles, parent)` \u2014 if anything added *new* row-level deletes for a data file being rewritten between plan time and commit, the compaction **fails rather than silently dropping those deletes** (BaseRewriteFiles.java:120\u2013126). That's why `useStartingSequenceNumber` exists, to \"avoid commit conflicts with updates that add newer equality deletes at a higher sequence number\" (BaseRewriteDataFilesAction.java:207\u2013209).\n\n## Put together\n\n| | Position delete file | Deletion vector | Equality delete file |\n|---|---|---|---|\n| **Format** | `file_path`+`pos` rows (Avro/ORC/Parquet), sorted by file/pos (spec.md:1391\u20131416) | Puffin `deletion-vector-v1` bitmap, \u22641 per data file (spec.md:1375\u20131389) | any column subset, matched by `equality_ids` values (spec.md:1418\u20131469) |\n| **Writable in** | v2 only (deprecated in v3+) (spec.md:1358,1393) | v3+ (spec.md:1358) | v2, v3 (prohibited in v4) (spec.md:1422,1921) |\n| **Applied in** | v2\u2013v4 (existing files) | v3+ (spec.md:1075\u20131077) | v2\u2013v4 (existing files) (spec.md:1422) |\n| **Applies to a data file when** | file path matches (or same partition), dataSeq \u2264 deleteSeq, same partition \u2014 but not when a DV exists (spec.md:1079\u20131082,1091) | `referenced_data_file` = data file path, dataSeq \u2264 DV Seq, same partition (spec.md:1075\u20131077) | dataSeq **<** deleteSeq, same partition, or global if unpartitioned (spec.md:1084\u20131087) |\n| **Code** | `posDeletesByPath`/`posDeletesByPartition`, `PositionDeletes.filter` \u2265 (DeleteFileIndex.java:181\u2013212,710\u2013741) | `dvByPath`, `findDV` (DeleteFileIndex.java:217\u2013230) | `globalDeletes`/`eqDeletesByPartition`, `filter` on `dataSeq\u22121`, + stats pruning (DeleteFileIndex.java:177,190\u2013207,785\u2013821,881) |\n| **Compaction** | applied at read \u2192 rewritten data excludes rows; delete file then droppable via `RewriteFiles`; physically removed at expiration | same | same, plus commit-risk guards (`validateNoNewDeletes\u2026`, `useStartingSequenceNumber`) (BaseRewriteFiles.java:112\u2013126; BaseRewriteDataFilesAction.java:207\u2013209,333\u2013353) |\n\nIn short: delete files are metadata-tracked rows/bitmaps that *mask* rows during reads by sequence-number + partition scope rules (implemented as a sorted, sequence-binary-searched index in `DeleteFileIndex`); compaction applies them once, writing new data files without the deleted rows, at which point the delete files become garbage that snapshot expiration safely reclaims.",
+ "error": null
+}

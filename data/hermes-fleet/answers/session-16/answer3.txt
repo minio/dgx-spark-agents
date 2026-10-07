@@ -1,0 +1,96 @@
+Here are the view failure modes I can identify, grouped by area, with the guard (and the gaps where guarding is deferred or absent) cited to file:line.
+
+## Concurrency and the commit path
+
+1. Stale base on commit (lost update / concurrent writer)
+   The core serializability failure: two writers both build on the same metadata; both try to swap, second one would clobber the first.
+   Guard: BaseViewOperations.commit checks `base != current()` and throws CommitFailedException for a newer current version (BaseViewOperations.java:107-117). Committing when the view already exists (base == null but current != null) throws AlreadyExistsException (:112-116). The distinguishing of "stale" vs "already exists" is exactly the optimistic-concurrency protocol the spec requires (view-spec.md:41-43).
+
+2. Create-vs-create race
+   Two engines create the same view simultaneously.
+   Guard: as above — when base is null but the view now exists, AlreadyExistsException (:115). The actual atomic swap is delegated to the metastore's check-and-swap via the abstract `doCommit` (:62, :126), so the catalog is the single arbitrator.
+
+3. Failed metadata write leaves a half-applied state
+   Guard: each metadata file name is unique (`%05d-%s` version + random UUID, BaseViewOperations.java:153-163), so a failed writer's file can never be mistaken for another's; `overwrite` is used specifically to dodge S3 negative caching (:139-141). The swap either succeeds or the batch of files is abandoned.
+
+4. View deleted or missing during refresh
+   Guard: refresh() catches NoSuchViewException, clears current/version state so callers see the view vanish rather than a stale reference (BaseViewOperations.java:86-103).
+
+5. Transient read failures while loading metadata
+   Guard: refreshFromMetadataLocation retries with exponential backoff and stops on NotFound (BaseViewOperations.java:190-213).
+
+6. Metadata location vs. pending changes inconsistency
+   If a caller attached a metadata location produced by serializing `changes` into a file, the file wouldn't match when re-parsed.
+   Guard: build() forbids having both a metadata location and pending changes (ViewMetadata.java:445-447); the parser always constructs with an empty changes list (ViewMetadataParser.java:161). This keeps the serialized format spec-complete and "self-sufficient" (view-spec.md:37).
+
+## Metadata integrity / validation
+
+7. Unsupported format version
+   Guard: ViewMetadata.check() rejects formatVersion outside (0, 1], since 1 is the only supported version (ViewMetadata.java:129-135 with SUPPORTED_VIEW_FORMAT_VERSION=1 at :52). Mirrors "must be 1" (view-spec.md:59).
+
+8. Current version id pointing at a version that doesn't exist (corrupt / rolled-back metadata)
+   Guard: currentVersion() throws if `versionsById` lacks currentVersionId (ViewMetadata.java:93-103), and currentSchemaId() similarly if the schema is missing (61-72).
+   Gap: this validation is deferred to access time, not enforced at parse. ViewMetadataParser.fromJson will happily parse a file whose current-version-id names a version not in the list, and only fails later when currentVersion() is called (ViewMetadata.java:94-95 comment states this is intentional "fail when accessing" behavior). So a malformed file can be loaded and held before blowing up.
+
+9. Adding a version that references an unknown schema
+   Guard: addVersionInternal hits Preconditions.checkArgument if the version's schemaId isn't in schemasById (ViewMetadata.java:302-305).
+
+10. Setting current version to an unknown version
+    Guard: setCurrentVersionId validates against versionsById before assigning (ViewMetadata.java:240-242).
+
+11. Missing required top-level fields
+    Guard: build() checks location non-null and at least one version (ViewMetadata.java:439-440); the parsers Preconditions null/object checks (e.g. ViewVersionParser.java:78-80, SQLViewRepresentationParser.java:53-55). Required JSON reads use getInt/getString which throw on absence.
+    Note: the spec makes `properties` optional, and the parser defaults a missing `properties` to empty (ViewMetadataParser.java:121-122) — backward-compatible rather than failing.
+
+12. UUID identity / accidental reassignment
+    Guard: assignUUID rejects reassigning an already-set uuid (ViewMetadata.java:426-436), preserving view identity across metadata versions (consistent with the spec's view-uuid, view-spec.md:58).
+    Gap: a fresh Builder with uuid == null silently generates a random one at build (ViewMetadata.java:499-500). That's correct for create, but it means a caller who never assigned a UUID gets one implicitly — fine here, though it hides the create-only intent.
+
+## Versioning and history
+
+13. Dialect duplication inside one version
+    The spec allows "only one SQL representation per dialect" (view-spec.md:115).
+    Guard: addVersionInternal rejects a second SQL representation with the same lowercase dialect (ViewMetadata.java:307-316).
+
+14. A replace silently dropping a dialect that another engine depends on
+    The interoperability goal (view-spec.md:27-32) fails if an engine replaces a view and wipes the only representation another engine can execute.
+    Guard: unless `replace.drop-dialect.allowed=true`, build() calls checkIfDialectIsDropped and rejects a replace that removes a previously-present dialect (ViewMetadata.java:453-459, 556-566; property default in ViewProperties.java:32-33).
+
+15. Unbounded version/retention growth (and rollback correctness)
+    Guard: build() caps retained versions via `version.history.num-entries` (default 10) in ViewMetadata.java:461-484, and prunes the log with expireVersions/updateHistory (:512-550). Always keeps the current version (:520-521).
+    Two minor edge behaviors worth noting: expireVersions sorts ids descending and takes a subList of the top ids (:523), so if the current version is an old id after rollback it is still always retained (added first, then skips itself) — good — but retention is "latest N by id," so a very old but rolled-back-to version stays while newer-pruned ones don't; and updateHistory clears all history past a dropped version (:544-546), which is a deliberate, if aggressive, truncation. Neither is a correctness failure of the format.
+
+16. Duplicate / redundant replace versions
+    Guard: reuseOrCreateNewViewVersionId reuses an existing version id when the new definition is identical ignoring id/timestamp/operation (ViewMetadata.java:334-362), so an idempotent REPLACE doesn't balloon the version list.
+
+17. LAST_ADDED sentinel misuse
+    The builder uses -1 as "the version/schema just added" for the commit protocol.
+    Guard: both paths require the sentinel to be resolvable — setCurrentVersionId(LAST_ADDED) needs a prior add (ViewMetadata.java:229-234), and a version with LAST_ADDED schema needs a prior added schema (:296-300) or it's rejected.
+
+## Representations / forward compatibility
+
+18. Unknown representation type on read
+    Future spec types would otherwise break old readers.
+    Guard: ViewRepresentationParser.fromJson returns an UnknownViewRepresentation for any unrecognized type instead of failing (ViewRepresentationParser.java:65-66).
+    Gap on the write side: serializing an unknown representation throws UnsupportedOperationException (ViewRepresentationParser.java:41-44) — correct for an engine that can't express it, but it means the builder path can't persist an unknown type.
+
+19. Case handling of dialect / type
+    Guard: dialect duplicates and dispatch both normalize with toLowerCase(Locale.ROOT) (ViewMetadata.java:312-314, ViewRepresentationParser.java:36, 60), so "Spark"/"spark" aren't treated as two dialects.
+
+## Parsing / I/O
+
+20. Non-object or garbage JSON
+    Guard: every parser Preconditions-checks node non-null and isObject (ViewMetadataParser.java:115-116, ViewHistoryEntryParser.java:52-53, SQLViewRepresentationParser.java:54-55, ViewVersionParser.java:79-80).
+
+21. Wrong shape for array fields (schemas / versions / version-log / representations)
+    Guard: each is explicitly validated as an array (ViewMetadataParser.java:126-127, 136-137, 144-145; ViewVersionParser.java:88-91).
+
+22. Corrupt / truncated metadata file on read
+    Guard: read() wraps JSON parse in UncheckedIOException with the file location (ViewMetadataParser.java:177-186), and compressed-file detection follows the filename codec (:178).
+
+## The two real gaps worth flagging
+
+- Parse-vs-access validation (items 8, 12): ViewMetadataParser.fromJson does not validate referential integrity (current-version-id present in versions, schema ids resolvable, uuid present). It relies on the accessors and Builder to enforce these, so a corrupt file can be loaded silently and fail later at the point of use. This is a deliberate design (ViewMetadata.java:94-95) but it means the parser alone is not a full validator — the table metadata parser, by contrast, validates more eagerly.
+- Version retention is by-highest-id, not by-rollback-tree: after a rollback to an old version, expireVersions retains the newest-10-by-id plus current, so a no-longer-current newest version can be kept while intervening ones are dropped. Not a format bug, just note that "retain N" is an id-ordering heuristic, not a lineage-based guarantee.
+
+If you want, I can verify a couple of these against the test suite (there's usually a TestViewMetadata / TestViewMetadataParser) to confirm the intended guard behavior and spot additional covered edge cases.

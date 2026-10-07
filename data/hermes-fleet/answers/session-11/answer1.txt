@@ -1,0 +1,36 @@
+I've read format/spec.md in full (2,153 lines). Here's what the spec says about time travel and the reasoning behind it.
+
+## What the spec defines
+
+**Snapshots are the unit of time travel.** A snapshot is defined as "the state of a table at some point in time, including the set of all data files" (spec.md:147). Every commit appends a new snapshot to table metadata rather than destroying the old one. Each snapshot records its `snapshot-id`, a parent lineage via `parent-snapshot-id`, a monotonic `sequence-number`, a `timestamp-ms`, and its manifest list of live files. Because data files are immutable and manifests are reused across snapshots, an old snapshot remains fully describable — so the table can be read "as of" any still-valid snapshot.
+
+**Time travel reads are a lookup, not a scan.** Appendix F, "Point in Time Reads (Time Travel)" (spec.md:2075-2080) is the operative section. It notes Iceberg tracks two histories:
+
+1. The **snapshot-log** — a list of (last-updated-ms, current-snapshot-id) pairs recording the sequence of "current" states of the table.
+2. The **snapshots** list — the parent-child lineage of snapshots.
+
+The spec explicitly warns these two can disagree about which snapshot corresponds to a given timestamp, because `current-snapshot-id` can be set to any arbitrary snapshot (e.g. you can rewind the table to a snapshot from a branch, or one with no lineage at all). To avoid ambiguity, the spec mandates:
+
+> When processing point in time queries implementations should use "snapshot-log" metadata to lookup the table state at the given point in time.
+
+So a query like `SELECT ... TIMESTAMP AS OF '1986-10-26 01:21:00Z'` finds the last snapshot in the snapshot-log **prior to** that timestamp and scans using that snapshot's metadata. If no snapshot predates the timestamp, or the snapshot-log is unpopulated (it's an optional field), systems must raise an informative error rather than guess.
+
+**Retention is what bounds time travel.** Access to old data isn't free forever. The "Snapshot Retention Policy" (spec.md:1118-1132) lets snapshots be expired from metadata so removed/replaced data files can be physically deleted. Retention is governed by `min-snapshots-to-keep`, `max-snapshot-age-ms`, and `max-ref-age-ms` (configurable per table and per snapshot reference). Expiration keeps each branch's referenced snapshot and its ancestors up to the age/count limits, then drops everything else. So the practical "how far back can I time travel" limit is determined by the retention policy, and a reference marks a snapshot as protected so it survives expiration. A deleted data file may only be physically removed after the last snapshot listing it is garbage collected (spec.md:1162).
+
+## Why it's designed this way
+
+The design follows directly from the format's core goals (spec.md:69-77): **serializable isolation, speed (O(1) planning), scale, and evolution.**
+
+- **Serializable isolation without locks.** The overview (spec.md:85-93) is the root cause: table state lives in a metadata file that is replaced by an atomic swap, and "readers use the snapshot that was current when they load the table metadata." Time travel is a free byproduct — since a snapshot is just an immutable, self-contained description of the table state at a point in time, querying it gives a consistent read that is completely isolated from concurrent writes. No locking or snapshot mechanism beyond the existing metadata design is required.
+
+- **Immutable, append-only data files.** Because files are written in place and never mutated (spec.md:83, 125-131), an old snapshot's manifest list still points at live, valid files until garbage collection. Time travel doesn't need any special file handling — it's just "follow an older manifest list."
+
+- **Speed.** A time travel read costs the same O(1) catalog call + manifest inspection as a normal read; it reuses the exact same manifest-list summary metadata (partition bounds, file counts) for pruning. There's no rewinding, copying, or reconstructing of state.
+
+- **Manifest reuse and sequence numbers.** Snapshot reads rely on manifests being reused and on inherited sequence numbers so per-file information stays correct even as the metadata tree changes (spec.md:101-107, 928-939).
+
+- **Branches and tags give named forms of time travel.** Snapshot references (spec.md:1100-1116) let snapshot-log's linear history be supplemented with tags (immutable labels on a snapshot) and branches (mutable named references). This is what makes the two histories potentially diverge, which is exactly why the spec pins time travel to the snapshot-log rather than to lineage — lineage is for navigating commit relationships, not for answering "what was current at time T."
+
+- **Explicit, honest limits.** Because expiration can permanently remove snapshots, the spec treats "no snapshot found" as a real outcome and requires a clear error. This keeps the contract precise: time travel is guaranteed only within the boundary the retention policy preserves.
+
+In short: time travel in Iceberg is not a separate feature — it falls out of the immutable-files-plus-atomic-metadata-swap design, where every commit leaves behind an addressable, consistent snapshot. The spec's only real job is to define the two histories precisely enough that engines agree on which snapshot "as of time T" means (the snapshot-log), and to bound how long the past is preserved (retention/expiration).

@@ -1,0 +1,55 @@
+I now have a complete picture. Here's how the Spark and Flink integrations in this repository rely on column metrics.
+
+## The short answer
+
+- Spark consumes metrics in two distinct ways: **optimization** (prune files during reads and optimize `DELETE` executions via `StrictMetricsEvaluator`) and **presentation** (expose them as a `readable_metrics` metadata-table column through `SparkContentFile`).
+- Flink consumes metrics in one genuine way: **event-time watermark extraction for streaming sources** (`ColumnStatsWatermarkExtractor`). Flink's read/scan pruning (unlike Spark's) happens inside core Iceberg, not the Flink module.
+
+## Spark: pruning during file planning
+
+`SparkTable.canDeleteUsingMetadata` (spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/source/SparkTable.java:219-261) decides whether a Spark `DELETE ... WHERE` can be executed purely from metadata — without reading data. It builds a scan with `.includeColumnStats()` (:231) then, for every planned `FileScanTask`, asks:
+
+```
+new StrictMetricsEvaluator(schema, deleteExpr) ... metricsEvaluator.eval(file)
+```
+(SparkTable.java:242-254)
+
+`StrictMetricsEvaluator` is the "prove the whole file matches" counterpart to the inclusive evaluator. Here Spark leans on **bounds + counts**: only if metrics *prove* that every row in the file satisfies the predicate (or partition projection does, :253) is the file treated as fully deletable. That's a direct read of column metrics to turn an arbitrary `DELETE` into a cheap metadata-only operation — the column-metrics-driven optimization from the spec's "metrics used to select data and delete files" (spec.md:761).
+
+## Spark: exposing metrics as a queryable column
+
+Spark builds a `readable_metrics` metadata column through `SparkContentFile` (spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/SparkContentFile.java). The class resolves the position of every raw metric field in the metadata row:
+
+- `columnSizesPosition / valueCountsPosition / nullValueCountsPosition / nanValueCountsPosition / lowerBoundsPosition / upperBoundsPosition` (SparkContentFile.java:97-102)
+- `columnSizes() → null if null` (SparkContentFile.java:171-173), same deliberate null-when-absent for `valueCounts()` (:176-178), `nullValueCounts()` (:181-186), `nanValueCounts()` (:189-194)
+- `lowerBounds()/upperBounds()` (:196-208) return null when the cell is null, preserving the spec's "missing metric === optional/unknown"
+
+These are exactly the per-file metric maps from spec's `data_file` fields (spec.md:730-736), surfaced so a Spark query like `SELECT readable_metrics(...)` can introspect per-file stats (the `MetricsUtil.READABLE_METRIC_COLS` / `readableMetricsStruct` machinery, MetricsUtil.java:144-197, 407-433).
+
+## Flink: watermark derivation from bounds
+
+`ColumnStatsWatermarkExtractor` (flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/source/reader/ColumnStatsWatermarkExtractor.java:39-111) is the clearest direct metric consumer in Flink. For a streaming source configured with an event-time column, it reads the file's **lower bound** and derives a watermark:
+
+```
+Preconditions.checkArgument(... lowerBounds().get(eventTimeFieldId) != null, "Missing statistics ...")
+return timeUnit.toMillis(Conversions.fromByteBuffer(Types.LongType.get(), lowerBounds.get(id)))
+...min(...)
+```
+(ColumnStatsWatermarkExtractor.java:97-109)
+
+Two things matter here: (1) it uses `Conversions.fromByteBuffer` — the same spec Appendix-D decoding we traced earlier — so the bound bytes are interpreted per spec; and (2) it **requires** the lower bound to be present (`Preconditions.checkArgument`, :97-99) and throws if it's missing. This is a rare case where a metric being absent is a hard failure rather than "skip pruning": a streaming reader cannot fabricate a watermark without the min timestamp. It also gates the column type to `LONG/TIMESTAMP/TIMESTAMP_NANO` (:57-62), so it only trusts bounds on types where the serialization is well-defined.
+
+## Flink: the boundary of its reliance
+
+Flink's normal batch/streaming *read pruning* does not construct evaluators in the Flink module — I found zero references to `InclusiveMetricsEvaluator`/`StrictMetricsEvaluator` in `flink/`. That path is owned by core: `ManifestReader` constructs `new InclusiveMetricsEvaluator(spec.schema(), rowFilter, ...)` (core/src/main/java/org/apache/iceberg/ManifestReader.java:400-406) and only projects the stats columns when the filter needs them (`requireStatsProjection`, :408-414) and drops the (potentially huge) stat maps when not needed (`dropStats`, :416-428). So both engines end up relying on the same core column-metrics pruning — Spark just additionally re-implements a strict-evaluator optimization and a readable-metrics projection on its side, while Flink's only bespoke metric use is watermark extraction.
+
+## Summary of the four reliance points
+
+| Engine | Where | What it reads | Failure if wrong |
+|---|---|---|---|
+| Spark | SparkTable.java:242-254 | bounds + counts (`StrictMetricsEvaluator`) | wrong `DELETE` pruning (must prove full-file match) |
+| Spark | SparkContentFile.java:97-102, 171-208 | all metric maps | corrupt `readable_metrics` query results |
+| Flink | ColumnStatsWatermarkExtractor.java:97-109 | `lower_bounds` | missing/incorrect min -> broken watermark |
+| Both (core) | ManifestReader.java:400-414 | bounds + counts (`InclusiveMetricsEvaluator`) | skipped files that match |
+
+The theme matches the spec: engines lean on bounds/counts to avoid reading files (the O(1)-planning goal), and the code is written so a *missing* metric degrades to "don't prune" — except watermark extraction, which is the one consumer that requires the metric and fails loudly instead of silently guessing.

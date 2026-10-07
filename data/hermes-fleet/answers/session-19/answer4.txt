@@ -1,0 +1,43 @@
+I now have the full picture. Here's how query engines use partition transforms, with citations.
+
+The core projection machinery (used by both engines)
+---------------------------------------------------
+The engine-facing entry point is `Projections` in the API module. It provides two evaluators:
+
+- `Projections.inclusive(spec)` — Javadoc says the guarantee is "if the original expression matches a row, then the projected expression will match that row's partition" (Projections.java:37-38, 61, 57-60). Each predicate is projected via `Transform.project` (Projections.java:62-63, 201-226).
+- `Projections.strict(spec)` — "if a partition matches a projected expression, then all rows in that partition will match the original expression" (Projections.java:40-42, 100-101). Each predicate via `Transform.projectStrict` (Projections.java:103-104, 236-258).
+
+The inclusive evaluator looks up all partition fields whose source is the predicate's column (`spec.getFieldsBySourceId`, Projections.java:203), and ANDs the per-transform projections (Projections.java:209-223) — handling multiple transforms of one column (e.g. both `day(ts)` and `hour(ts)`). The strict evaluator ORs them instead (Projections.java:243-254), which is the correct computation for "all rows in the partition match" (the Projections.java:245-249 comment explains this).
+
+This is what maps a Spark/Flink predicate like `ts > X` onto `ts_day >= day(X)` — the exact "inclusive projection" the spec section describes (format/spec.md:1061-1063).
+
+How Spark uses it
+-----------------
+1. Filter pushdown: `SparkScanBuilder.pushPredicates` (SparkScanBuilder.java:152-196) converts Spark `Predicate`s to Iceberg expressions via `SparkV2Filters.convert` (SparkScanBuilder.java:169), binds them (SparkScanBuilder.java:173) and accumulates them into `filterExpressions`. It classifies filters as fully-pushable vs post-scan (the three-way split is documented at SparkScanBuilder.java:153-161). The resulting expression is applied to the scan with `.filter(filterExpression())` (SparkScanBuilder.java:479, 513, 589, 671).
+
+2. Building the partition filter from the data filter: the core scan (via `TableScan.filter`) carries the data-level expression down to `ManifestGroup`. There, per manifest it computes the *partition* predicate by calling `Projections.inclusive(spec, caseSensitive).project(dataFilter)` (ManifestGroup.java:286-291), keyed by each manifest's own `partitionSpecId` (ManifestGroup.java:211, 284-285). This respects that different manifests may have different (evolved) specs. The result is used by `ManifestEvaluator` to skip whole manifests (ManifestGroup.java:303-309).
+
+3. Advertised partitioning for planner optimizations: `SparkTable.partitioning()` returns `Spark3Util.toTransforms(icebergTable.spec())` (SparkTable.java:227-229). `SpecTransformToSparkTransform` (Spark3Util.java:305-362) converts each Iceberg partition field into a Spark/SQL `Transform`: identity→`Expressions.identity` (Spark3Util.java:313-314), bucket→`Expressions.bucket` (319), truncate→`Expressions.apply("truncate", ...)` (323-326), year/month/day/hour (329-346), and alwaysNull (void) deliberately returns null so it's dropped (349-352). This is how Spark's planner learns the table's hidden partition dimensions for join/aggregation optimization.
+
+4. Strict projection for metadata deletes: `SparkTable.canDeleteUsingMetadata` (SparkTable.java:363-405) decides whether a `DELETE WHERE` can be served entirely by metadata. It evaluates each file with `Projections.strict(spec).project(deleteExpr)` (SparkTable.java:397) plus a `StrictMetricsEvaluator`; if every candidate file fully matches, the delete is a pure metadata operation (no row rewrite). This is a direct consumer of `projectStrict`.
+
+5. UDFs for engine-local partition computation: `IcebergSpark.registerBucketUDF`/`registerTruncateUDF` (IcebergSpark.java:31-55) register Spark UDFs that call `Transforms.bucket(numBuckets).bind(type)` / `Transforms.truncate(width).bind(type)` (IcebergSpark.java:35, 48). This is how Spark computes a partition value in a filter/mutation with exactly the same transform semantics — so a predicate computed in-engine matches what Iceberg stored.
+
+The strategy points are: (a) the projection happens in core (ManifestGroup), so Spark and Flink get identical behavior for free; (b) Spark additionally advertises and mirrors transforms at the engine layer (Spark3Util.toTransforms, IcebergSpark UDFs) for planner hints and in-engine computation.
+
+How Flink uses it
+-----------------
+Flink's read path funnels into the same core projection, not its own:
+
+- `IcebergTableSource.applyFilters` (IcebergTableSource.java:166-179) converts Flink `ResolvedExpression`s to Iceberg expressions via `FlinkFilters.convert` (IcebergTableSource.java:171) and keeps the accepted ones.
+- `FlinkSplitPlanner.planCategorizedSplits` applies them to the scan with `refinedScan.filter(filter)` (FlinkSplitPlanner.java:181-185). From there the expression flows into the same `ManifestGroup`/`Projections.inclusive` path as Spark — so Flink gets partition pruning through the shared core, not a Flink-specific reimplementation.
+
+The one Flink-specific transform use is on the write side: `BucketPartitionerUtil` (BucketPartitionerUtil.java:29-125) walks the `PartitionSpec` with a `PartitionSpecVisitor` (BucketPartitionerUtil.java:70) and, when the spec has exactly one `bucket` field, extracts `(fieldId, numBuckets)` (BucketPartitionerUtil.java:52-67, 83-86). Flink uses this to co-partition flow records into buckets that match the Iceberg partition layout, so that data destined for the same partition is processed together (with a Preconditions guard against specs that have zero or multiple bucket fields, BucketPartitionerUtil.java:54-58). The visitor deliberately ignores identity/truncate/time/void transforms (returns null, BucketPartitionerUtil.java:78-123), reflecting that only the single-bucket spec is safe to co-partition on.
+
+Summary of the mapping
+----------------------
+- Both engines convert their native predicates → Iceberg `Expression` (SparkScanBuilder.java:169, IcebergTableSource.java:171).
+- Core `ManifestGroup` turns the data expression into a partition expression per manifest via `Projections.inclusive(...).project(...)` (ManifestGroup.java:286-291), which internally delegates to each `Transform.project` (Projections.java:219).
+- Spark additionally surfaces transforms to the planner (SparkTable.java:227-229 via Spark3Util.toTransforms:313-346) and uses strict projection for metadata-delete feasibility (SparkTable.java:397); Flink reads through shared core and separately mirrors single bucket specs for write-side co-partitioning (BucketPartitionerUtil.java:61-86).
+
+So the transforms themselves are defined once in `api/` and driven by `Projections`; both engines are thin consumers that translate their own filter model onto that shared machinery.

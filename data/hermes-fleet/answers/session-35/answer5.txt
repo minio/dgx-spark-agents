@@ -1,0 +1,23 @@
+Ten things to know about equality deletes, with the first place to look for each:
+
+1. What they are: a delete file marks rows deleted by column VALUES (id=5), not by file/position — the "delete WHERE col=X without reading existing data" mechanism. Read the spec: format/spec.md:117 ("Equality deletes — Mark a row deleted by one or more column values").
+
+2. Encoding: a delete file is a normal data file whose manifest entry has content=2 and a list of `equality_ids` (the matching columns). Read FileMetadata.java:129 (`ofEqualityDeletes` sets content and id list).
+
+3. Who writes them: the core delta writer emits them through RollingEqDeleteWriter wrapping EqualityDeleteWriter. Read core/src/main/java/org/apache/iceberg/io/BaseTaskWriter.java:501 (RollingEqDeleteWriter), then EqualityDeleteWriter.java:77 (close() builds the DeleteFile).
+
+4. Scope rule that keeps them correct: an equality delete only applies to data strictly OLDER than itself (spec 1085), enforced by the "-1 trick" at DeleteFileIndex.java:881 (`applySequenceNumber = dataSequenceNumber() - 1`). This is the single most important correctness guard.
+
+5. Global-delete escape hatch: an equality delete written with an unpartitioned spec applies to ALL data files. Read DeleteFileIndex.java:604 (route to `globalDeletes` when `spec.isUnpartitioned()`).
+
+6. Plan-time pruning: delete files carry metrics of the DELETED values, so bounds/null counts can prove a delete can't match a data file and skip it — conservatively, never risking a missed delete. Read DeleteFileIndex.java:258 (`canContainEqDeletesForFile`).
+
+7. Read-time application: matching is set-membership — project each row onto its equality ids, check a StructLikeSet, nulls equal nulls. Read data/src/main/java/org/apache/iceberg/data/DeleteFilter.java:218 (`loadEqualityDeletes` + `deleteSet.contains`).
+
+8. Flink writes them for upsert/primary-key updates: it shuffles by equality-key hash so same-key rows hit one writer, and deletes by the projected key. Read flink/v1.20/.../sink/BaseDeltaTaskWriter.java:84 (row-kind → delete mapping) and EqualityFieldKeySelector.java:81 (keying).
+
+9. Spark reads/applies them: the vectorized reader consults the eq filter and strips the delete columns from output. Read SparkBatchQueryScan.java:185 (`shouldRewrite` excludes equality deletes from DV rewrites) and data DeleteFilter.java:249 (`eqDeletedRowFilter`).
+
+10. Their future: usable only in v2/v3; writing new ones is prohibited in v4 (readers still apply old ones). v3+ prefers deletion vectors, and Flink has a maintenance job to convert equality deletes away. Read format/spec.md:1422 (v4 "must not be added") and RowDataTaskWriterFactory.java:175 (v3+ switches to DVs).
+
+The thread that ties them together: equality deletes trade away the position based on which files you'd have to read to delete (cheap write, expensive value-match apply), which is why the strict sequence boundary guards correctness, metrics prune the apply, and the ecosystem is steadily moving to deletion vectors.

@@ -1,0 +1,48 @@
+I now have a complete picture. Here's how query engines use default values in this repo, focused on Spark (Flink's main integration code does not touch defaults).
+
+## The key split: how each engine sees the two defaults
+
+Engines read/write defaults through the JSON schema. On **read (Iceberg → engine)**, `TypeToSparkType` converts Iceberg fields to Spark `StructField` and stamps the defaults onto Spark's metadata (Spark `current_default_value` / `existence_default_value`). On **write (engine → Iceberg)**, `SparkTypeToType` converts Spark's `ColumnDefaultValue` back into Iceberg's two defaults. The two default concepts map 1:1 onto Spark's SQL metadata:
+- `write-default` ↔ Spark's `current_default_value` (value used for new rows, mutable)
+- `initial-default` ↔ Spark's `existence_default_value` (value for pre-existing rows, frozen)
+
+## Write direction: Spark → Iceberg
+
+`SparkTypeToType.convertDefaultValue` (spark/v4.2/.../SparkTypeToType.java:233-269) is where Spark supplies its column defaults when building the Iceberg schema:
+- It reads the Spark column's `ColumnDefaultValue` (line 240) and rejects non-literal default *expressions* — `"Default value expressions are not supported in Iceberg"` (line 251-254).
+- Maps `ColumnDefaultValue.getValue()` → `withInitialDefault` (line 257-261), with the comment "ColumnDefaultValue.getValue is equivalent to initial-default in Iceberg."
+- Maps `ColumnDefaultValue.getExpression()` → `withWriteDefault` (line 264-267).
+
+This is invoked only at the top level of the schema (`if (isRoot && includeDefaults) convertDefaultValue(...)`, SparkTypeToType.java:120-123) because **Spark only supports defaults on top-level columns** — matching the spec's struct-field model.
+
+## Read direction: Iceberg → Spark
+
+`TypeToSparkType` (spark/v4.1/.../TypeToSparkType.java:84-95) converts both Iceberg defaults to Spark SQL string literals on the `StructField`:
+- `field.writeDefault()` → `sparkField.withCurrentDefaultValue(...sql())` (line 84-88)
+- `field.initialDefault()` → `sparkField.withExistenceDefaultValue(...sql())` (line 90-95)
+
+It converts the internal value to Spark's representation first via `SparkUtil.internalToSpark` (line 85, 91). So when Spark catalogs an Iceberg table, its own metadata (which the Spark planner/optimizer uses for things like `DEFAULT` in `INSERT ... VALUES` and `ALTER`) carries both defaults with the correct semantics.
+
+## Where Spark actually consumes the write-default at execution time
+
+Spark applies the write default when a row omits the column. That's exercised directly in `TestSparkDefaultValues`:
+- Schema built with `withWriteDefault(Literal.of(true))` / `Literal.of(42)` / `Literal.of(100L)` (TestSparkDefaultValues.java:62-68), then `INSERT INTO ... VALUES (1, DEFAULT, DEFAULT, DEFAULT)` (line 78) yields `row(1, true, 42, 100L)` (line 82). Note Spark's `DEFAULT` keyword is resolved by Spark's planner from the `current_default_value` metadata that `TypeToSparkType` stamped — that's the round trip.
+- The reordered-schema case (line 87-109) confirms the write default is applied by name, independent of column order: `int_col` defaults to 123 and `string_col` to "doom" even when inserted in a different order.
+
+So the actual *substitution* of the write default into omitted columns is done by Spark's own planner using the metadata Iceberg exposed; Iceberg contributes by (a) persisting the default in the schema, (b) exposing it as Spark's `current_default_value`, and (c) on creation, converting Spark's `ColumnDefaultValue` back into `write-default`.
+
+## Read direction execution: the vectorized reader
+
+Spark reads via the Arrow vectorized reader (`VectorizedReaderBuilder`), which implements the spec's missing-column projection (the `initial-default` → `null` → throw chain):
+`defaultReader` (arrow/.../VectorizedReaderBuilder.java:128-138) — when a requested field is absent from the data file, it returns `constantReader(field, convert(initialDefault))` if an initial default exists (line 131-132), otherwise `nulls` for optional fields (line 133-134), otherwise throws `"Missing required field"` (line 137). So old data files before a column was added read back the initial default — the spec's "initial default handles pre-existing rows" (spec.md:329, 407). This is the same missing-field logic as the Avro path (`ValueReaders.createMissingFieldReader`, ValueReaders.java:315-325); Arrow is the one Spark uses. For decimal-backed-by-fixed types, `VectorizedArrowReader` deliberately drops the defaults because they're typed for the logical type (VectorizedArrowReader.java:255-259).
+
+## Flink
+
+I searched all Flink source (`flink/v1.20`, `v2.2`, `v2.3`) — the *only* references to defaults are in `TestHelpers.java` test utilities (TestHelpers.java in each version). There is **no** `initialDefault`/`writeDefault`/`ColumnDefaultValue` usage in Flink's main integration source. So Flink in this repository does not yet round-trip or apply Iceberg default values; it's Spark (plus the engine-agnostic Arrow/Avro read paths) that relies on them. That's worth stating plainly as the answer to "how do query engines use defaults": in this repo, it's Spark; Flink currently doesn't.
+
+## Summary of the reliance chain
+
+1. **Create/migrate (Spark → Iceberg):** `SparkTypeToType.convertDefaultValue` maps Spark's `ColumnDefaultValue.value` → `initial-default` and `.expression` → `write-default` (SparkTypeToType.java:257-267), top-level only.
+2. **Read/exposure (Iceberg → Spark):** `TypeToSparkType` exposes both as Spark `current_default_value`/`existence_default_value` SQL literals (TypeToSparkType.java:84-95).
+3. **Write execution (Spark planner):** Spark resolves the `DEFAULT` keyword from that metadata and materializes the write-default for omitted columns — verified by `TestSparkDefaultValues` (e.g. TestSparkDefaultValues.java:62-82).
+4. **Read execution (Arrow vectorized reader):** `VectorizedReaderBuilder` materializes `initial-default` (or null, or throws for required) for columns missing from older files (VectorizedReaderBuilder.java:128-138), the same contract as the Avro `ValueReaders` path.

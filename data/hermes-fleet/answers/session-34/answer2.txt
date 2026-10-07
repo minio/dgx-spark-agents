@@ -1,0 +1,64 @@
+I've read `PositionDeleteIndex.java` and the full call graph it uses for position deletes. Here's how the implementation maps onto the spec.
+
+## The spec's DVs vs. position index
+
+The spec's v3 model (spec.md:1375-1389) is that deletion vectors are a per-data-file Roaring bitmap: "A set bit at position P indicates that the row at position P is deleted," 64-bit positions divided into a 32-bit "key" (high 4 bytes) and a 32-bit sub-position (low 4 bytes), with one small Roaring bitmap per key. `BitmapPositionDeleteIndex` and `RoaringPositionBitmap` are a direct transcription of that paragraph: spec says "collection of 32-bit Roaring bitmaps" / "for each key... a 32-bit Roaring bitmap," and code does exactly that.
+
+## PositionDeleteIndex.java (the interface)
+
+This is the abstract contract; two implementations back it.
+
+- `delete(long)` and `delete(posStart, posEnd)` (lines 34, 42) — the operations the spec models as "set bit at position P" and, for the range form, deleting a contiguous run. `BitmapPositionDeleteIndex` delegates to `bitmap.set` / `bitmap.setRange` (BitmapPositionDeleteIndex.java:67-74).
+- `isDeleted(long)` (line 62) is precisely the spec's "test whether a certain position is set" (spec.md:1383). The implementation is `bitmap.contains` (BitmapPositionDeleteIndex.java:87-89).
+- `merge(PositionDeleteIndex)` (line 49) implements the spec rule that "readers can safely ignore position delete files if there is a DV for a data file" and "writers must merge new deletes with existing vectors" (spec.md:1366, 1387) — the index collapses multiple sources into one set of positions.
+- `deleteFiles()` (line 111), `cardinality()` (line 116), `serialize()` (line 125), `deserialize(bytes, deleteFile)` (line 136) all map to the spec's metadata for a DV: the spec tracks cardinality as `record_count` ("cardinality of a deletion vector," spec.md:724) and locates a DV by `content_offset`/`content_size_in_bytes` (spec.md:744-745).
+
+## RoaringPositionBitmap.java — the 64-bit indexing
+
+This is the implementation that directly mirrors spec.md:1381-1383.
+
+- Split into key + sub-position: `key(pos) = (int)(pos >> 32)` (line 359) and `pos32Bits(pos) = (int) pos` (line 364) — exactly "most significant 4 bytes" / "least significant 4 bytes" from the spec.
+- Storage: an array of `RoaringBitmap`, one per key (line 59), grown via `allocateBitmapsIfNeeded` (line 237). To test membership, `contains` looks up `bitmaps[key]` and checks the low 32 bits (lines 143-148) — matching "find a 32-bit bitmap... tested for inclusion; if a bitmap is not found for the key, then it is not set."
+- 64-bit range handling: `setRange` (line 90) fills whole intermediate key bitmaps with `add(0, 1<<32)` and partial first/last ranges (lines 112-122), i.e. it treats the key space as big buckets of 2^32 sub-positions.
+- Serialization (lines 265-289) uses the portable Roaring format, as the spec requires ("deletion-vector-v1 blob from the Puffin spec" uses Roaring). `runLengthEncode` (line 177) compacts contiguous deletes, and `MAX_POSITION`/`validatePosition` (lines 54, 421) enforce the "positive 64-bit positions" and the signed-length overflow guard.
+
+## BitmapPositionDeleteIndex.java — DV blob format
+
+This is where the spec's Puffin blob (spec.md:1379, 1390) is realized, and where it pays off the spec's "merging" requirements.
+
+- Format (lines 117-142): 4-byte big-endian length + 4-byte magic + little-endian portable-Roaring bitmap + big-endian CRC-32 of (magic+bitmap). The comment (lines 126-127) explicitly notes the layout is "for compatibility with Delta."
+- `deserialize` (lines 151-165) validates the CRC against `deleteFile` (which holds the Puffin footer), and `deserializeBitmap` (lines 203-221) additionally verifies the magic number and that the bitmap's `cardinality` equals `deleteFile.recordCount()` — enforcing spec.md:724 that `record_count` is "the cardinality of a deletion vector." So the manifest metadata and the blob must agree.
+- `serialize` calls `bitmap.runLengthEncode()` (line 131) before encoding — the density optimization for sequential deletes.
+- Note this is the same class used for both in-memory mutation (`delete`, `merge`, `isDeleted`) and for deriving the persisted DV bytes; the spec's DV is at heart "a position index you can query, merge, and serialize."
+
+## Deletes.java — building the index from position-delete files (v2 carry-over)
+
+For position *files* (still read even though v3 forbids writing new ones), `Deletes` builds indexes:
+
+- `toPositionIndexes` (lines 145-166) reads `file_position_delete` rows (path + pos) via `MetadataColumns.DELETE_FILE_PATH`/`DELETE_FILE_POS` (the reserved ids 2147483546/2147483545 from spec.md:452-453) and groups them into one `BitmapPositionDeleteIndex` per data file (`computeIfAbsent`, then `index.delete(position)`).
+- `toPositionIndex` / `extractPositions` (lines 168-195) builds a *single* index for one data file, after `DataFileFilter` (lines 230-243) keeps only deletes whose `file_path` equals the target, using `Comparators.filePath()` — implementing spec.md:1080 "file paths are equal."
+- `deletePositions` (lines 202-213) yields a sorted merge of the positions, matching the spec's requirement that position-delete rows are sorted by `file_path` then `pos` (spec.md:1413).
+
+## Where the write side goes — BaseDVFileWriter.java + DVUtil.java
+
+This is where the spec's v3 write rules are enforced:
+
+- One DV per data file: `deletesByPath` is keyed by referenced data file path (BaseDVFileWriter.java:62), so each path accumulates one index. This matches spec.md:1366 "at most one deletion vector for a given data file."
+- Merging past deletes on write: at `close()` it calls `loadPreviousDeletes` and `positions.merge(previousPositions)` (lines 137-140), and records previous *file-scoped* delete files as rewritten (lines 140-145) — spec.md:1366-1367 "writers must merge new deletes with existing vectors" and remove superseded ones.
+- The DV's Puffin metadata: `createDV` (lines 165-181) sets `referencedDataFile`, `contentOffset` (blob offset), `contentSizeInBytes` (blob length), and `recordCount = cardinality` — exactly the spec's `data_file` fields 143/144/145 and 103 (spec.md:742-745, 724). The `toBlob` (lines 199-212) writes the `deletion-vector-v1` Puffin blob type with `rows` = position field id and the referenced-file/cardinality properties, per spec.md:751 (content_offset/size "must exactly match the offset and length stored in the Puffin footer").
+- `DVUtil.readDV`/`mergeAndWriteDVsIfRequired` (lines 52-112) reads DVs at their offset/length and merges duplicates for one referenced file, verifying matching sequence numbers, spec ids, and partition tuples before merging (lines 114-153) — which is the spec's rule that deletes apply only to same-partition, older data files (spec.md:1088-1091).
+
+## The read/apply side — BaseDeleteLoader.java + DeleteFilter.java
+
+This closes the loop on "readers can safely ignore position delete files if there is a DV":
+
+- `loadPositionDeletes` (BaseDeleteLoader.java:160-169) branches: if the delete files contain a single DV, it `validateDV` (referenced file must equal the data file's path, offsets non-null, size ≤ 2GB; lines 266-284) and reads it; otherwise it reads position files. The comment (lines 140-157) explicitly states a DV replaces position delete files — the spec's subsumption rule.
+- Position-file reads apply a pushdown filter `file_path == target` (lines 210-214) and build one index via `Deletes.toPositionIndex`, then merge across delete files via `PositionDeleteIndexUtil.merge` (lines 185-190) — i.e. multiple position files for one data file collapse into one index, consistent with the same-commit + same-partition scoping.
+- `DeleteFilter.applyPosDeletes` (DeleteFilter.java:265-273) filters rows with `positionIndex.isDeleted(pos(record))`, where `pos` reads the reserved `_pos` metadata column (id 2147483645, spec.md:448). It either drops the row or marks it deleted — enabling `_deleted`/changelog reconstruction (spec.md:449, "may optionally contain the deleted row," and the `row` column).
+- `fileProjection` (lines 282-333) ensures the reader's schema includes `_pos` (and `_deleted`) when position deletes are present, because applying the index requires each row's ordinal position.
+
+## One deliberate divergence worth noting
+
+The spec's DV is a written, immutable Puffin blob; the code splits "the thing you query/merge in memory" (`PositionDeleteIndex`/`RoaringPositionBitmap`) from "the thing you persist" (`BitmapPositionDeleteIndex.serialize`/`deserialize`, used by `DVUtil`/`BaseDeleteLoader`). Everything else — the Roaring 64-bit key/split, one-DV-per-file idempotence, merge-before-write, and validation of offset/length/cardinality against manifest metadata — tracks the spec at spec.md:1366-1389 almost field-for-field.
+
+Want me to trace the DV write path into the actual Puffin `PuffinWriter`/`DVFileWriter` and `PartitioningDVWriter` that fans DVs out per partition, or show how `mergeAndWriteDVsIfRequired` gets called from compaction?

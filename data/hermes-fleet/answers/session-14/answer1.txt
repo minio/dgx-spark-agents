@@ -1,0 +1,44 @@
+I've read the entire spec (all 2,153 lines, end to end). Here's what it says about column metrics and why.
+
+## What the spec says
+
+Column metrics live in two places: per-file metrics stored in manifest entries, and summary statistics higher up the metadata tree. They're the basis for data skipping — deciding without opening a file whether it can possibly match a query.
+
+### Per-file metrics in manifests (the core)
+
+Each `data_file` struct in a manifest entry carries a set of metrics, keyed by column ID:
+
+- `column_sizes` — total disk size of the regions that store each column
+- `value_counts` — number of values per column (including null and NaN)
+- `null_value_counts` — number of null values
+- `nan_value_counts` — number of NaN values (float/double only)
+- `lower_bounds` / `upper_bounds` — the min/max per column, serialized to binary (Appendix D single-value serialization)
+
+All are optional maps. Three constraints matter:
+
+1. Lower bounds must be <= every non-null, non-NaN value; upper bounds >= every non-null, non-NaN value (lines 735-736, 767).
+2. For float/double, `-0.0` must precede `+0.0` and NaNs are not allowed as bounds (line 753).
+3. Bounds survives type promotion (canonical example: `int`->`long` bounds are decoded by length — 4 bytes means the value was written as int, 8 as long, lines 367-379).
+
+Because these are optional, a missing metric is just "unknown" — a file optimizer can omit them, and readers simply can't prune on them. This keeps the spec tolerant of writers that can't cheaply compute stats.
+
+### Delete files use the same metrics
+
+Delete files carry identical metrics, but they describe the *deleted* rows (lines 769, 1471-1473). Critically, "For delete files, metrics must store bounds and counts for all deleted rows, or must be omitted." The point: a delete file's metadata must reflect the rows it deletes so scan planning can decide whether a delete file even overlaps a data file's range (line 119, 1067). A `count(*)` query with no predicates can skip a delete file that only touches an id range outside the scan.
+
+### Toward v4: `content_stats`
+
+Versions 1-3 store metrics as maps keyed by field id (a schema-versioning hazard — the map is untyped and by id). v4 introduces `content_stats`, a *typed* struct per table field inside the manifest schema itself (section "Content Stats", lines 799-926). Each field's stats struct is assigned an ID range `10_000 + 200 * field-id` and holds typed `lower_bound`/`upper_bound` (in the actual field type), plus `tight_bounds`, `value_count`, `null_value_count`, `nan_value_count`, and `total_bytes`. Geo types get `geo_lower`/`geo_upper` bounding-box structs; variant stores bounds by normalized JSON path. This is a structural redesign so that metrics evolve with the schema (promoted types just re-read the typed column) instead of living in untyped id-keyed maps.
+
+## Why it's designed this way
+
+The whole design traces back to Iceberg's **goals**: O(1) scan planning and "scale" (line 72-73) — planning must not cost proportional to the number of files or partitions, so queries should skip files without reading them. Metrics are the mechanism that makes data skipping possible, and every design choice serves that:
+
+- **Stored in the manifest, not the file.** Metrics sit next to the file's row in the manifest, so planning reads only the (small) manifest, never data files. That's what makes the "O(1) remote calls" goal achievable — you don't open Parquet/ORC footers to plan.
+- **Optional and "unknown = no pruning."** Iceberg can't force every writer to compute exact stats, so it makes them optional and defines a missing value as "don't prune." This preserves correctness (never drop a file that could match) while degrading gracefully to a full scan for writers that don't provide stats. This is the classic Iceberg pattern: the spec stays engine-agnostic and interoperable.
+- **Accuracy rule is one-directional.** Bounds must enclose all real values, so a file is only excluded when the predicate and the bounds provably can't intersect. That's the foundation of a *correct* inclusive projection during scan planning (lines 1061-1069): you may read extra files, but never miss matching rows. "Tight" vs loose is a quality tradeoff, not a correctness one (v4's `tight_bounds` flag formalizes this).
+- **Same metrics for data and delete files.** Scan planning applies one uniform filter-and-prune logic to both (line 1067), so queries can skip irrelevant delete files just like data files — essential for v2+ row-level deletes, where delete-file count would otherwise dominate planning cost.
+- **Bound encoding has an explicit "type at write time" contract** because of schema evolution. Since v1/v2 don't store bound types, the spec pins down how to infer the original type from a bound's byte length. This is what lets metrics remain valid across `int`->`long` and `date`->`timestamp` promotion without rewriting files (lines 359-379).
+- **The v4 `content_stats` shift fixes a real flaw in the maps.** Typed stats bound to field IDs remove the ambiguity and schema-evolution headache of untyped id-keyed maps, and make geometry/variant bounds representable at all.
+
+The thread through all of it: **metadata is the product**. Iceberg deliberately trades some write-time effort (computing stats) and metadata size for huge read-side wins — skip files without reading them, and keep planning cost independent of table size. Column metrics are the heart of that bargain.

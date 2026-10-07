@@ -1,0 +1,43 @@
+I traced the full path through Spark and Flink. Here's how query engines use Puffin statistics files in this repository.
+
+## The pipeline is: Spark writes NDV blobs -> Spark reads them back for CBO
+
+Query engines here do two distinct things with Puffin statistics: **produce** them (Spark's `compute_stats` action) and **consume** them (Spark's CBO column statistics at scan time). Flink does neither — it only treats them as files to clean up.
+
+### 1. Writing: Spark `compute_stats` -> Puffin
+
+`ComputeTableStatsSparkAction` (`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/actions/ComputeTableStatsSparkAction.java`) is the engine's only producer:
+- `execute()` computes NDV blobs and delegates to `generateNDVBlobs()` (line 105, 128-130).
+- `writeStatsFile()` writes them through `Puffin.write(outputFile).createdBy(...)` -> `PuffinWriter`, then builds a `GenericStatisticsFile` from `writer.fileSize()`, `writer.footerSize()`, and `GenericBlobMetadata.from(writer.writtenBlobsMetadata())` (lines 114-122) — exactly the spec's `file-size-in-bytes` / `file-footer-size-in-bytes` / `blob-metadata` descriptor fields.
+- It commits with `table.updateStatistics().setStatistics(statisticsFile).commit()` (line 107) — registering the file in table metadata, the mechanism the spec defines for snapshot-scoped statistics.
+
+The payload generation is in `NDVSketchUtil` (`.../actions/NDVSketchUtil.java`). For each column it runs a Theta-sketch aggregate over the table via Spark (`computeNDVSketches`, lines 76-80), then creates one `Blob` per column (lines 63-74) tagged with:
+- type `apache-datasketches-theta-v1` (line 65, `StandardBlobTypes.APACHE_DATASKETCHES_THETA_V1`)
+- `inputFields` = the column's field id (line 66)
+- the snapshot's `snapshotId()` and `sequenceNumber()` (lines 67-68)
+- ZSTD compression (line 70)
+- an `"ndv"` property holding the sketch's estimate (lines 71-73)
+
+### 2. Reading: Spark uses NDV for cost-based optimization at scan planning
+
+`SparkScan.estimateStatistics()` (`/spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkScan.java`) is the engine's consumer:
+- It only activates when both reporting is enabled and Spark CBO is on: `if (readConf.reportColumnStats() && cboEnabled)` (lines 204-207).
+- It pulls `table.statisticsFiles()` and picks the one matching the snapshot being scanned: `files.stream().filter(f -> f.snapshotId() == snapshot.snapshotId()).findFirst()` (lines 209-211). This is the per-snapshot association from the spec.
+- It reads each blob's `blobMetadata()` and groups blobs by their first field id (lines 213-219).
+- For each field, it matches blobs of type `apache-datasketches-theta-v1` (lines 227-229), reads the blob's `ndv` property (the distinct-value estimate written earlier), and parses it into a `Long ndv` (lines 230-232).
+- That NDV becomes a `SparkColumnStatistics(ndv, null, null, null, null, null, null)` (lines 240-241), which flows into the query's `Statistics` (line 262) for Spark's CBO to size joins, choose broadcast joins, etc.
+
+Crucially — and consistent with the spec's "informational" model — it only reads blob **metadata** (type + `ndv` property + field id) from table metadata; it never actually opens the Puffin file or decodes the sketch. The numeric NDV is denormalized into the blob's `properties`, so reading it requires no blob data access at all (SparkScan.java:230-232). The only read of actual blob bytes would go through `PuffinReader.readAll`, which nothing in the Spark read path here invokes.
+
+### 3. Flink: no statistics consumption
+
+Flink's catalog returns `UNKNOWN` for column statistics (`FlinkCatalog.getTableColumnStatistics`, e.g. `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/FlinkCatalog.java:1072-1074`), so it does not consume Puffin statistics for CBO. The only Flink references are in the maintenance/orphan-cleaning path, which lists statistics-file locations so they can be garbage-collected (`ListMetadataFiles.java:79` via `ReachableFileUtil.statisticsFilesLocations`), and the equality-delete-to-DV machinery, which writes Puffin DVs (a different blob type, `deletion-vector-v1`, not table statistics).
+
+## Net
+
+So the engine integration is asymmetric and Spark-only:
+- **Spark writes** NDV Theta sketches as Puffin blobs via `compute_stats` (`ComputeTableStatsSparkAction.java:114-122`, `NDVSketchUtil.java:63-74`).
+- **Spark reads** only the denormalized `ndv` from blob metadata at scan time to seed CBO statistics (`SparkScan.java:204-241`).
+- **Flink** touches these files only for deletion/cleanup, never for query planning.
+
+The pattern matches the spec's design intent (spec.md:1207-1211): statistics are optional informational extras — the NDV is produced on demand, attached to a specific snapshot, carried in Puffin blobs, and consumed opportunistically (only when Spark CBO is on) without ever being required for a correct query.

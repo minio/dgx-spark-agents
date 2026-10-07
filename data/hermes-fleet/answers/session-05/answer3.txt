@@ -1,0 +1,55 @@
+Here's what can go wrong with table metadata files — corrupt/truncated files, version mismatches, invalid or inconsistent contents, concurrency races, and silent data corruption — and the specific guards in the code for each.
+
+## 1. Corrupt, truncated, or unreadable files
+If a metadata file is half-written, truncated, or garbage, decoding must fail loudly rather than produce a half-parsed table.
+- The parser streams from an `InputStream`, wraps IO failures, and rethrows as `RuntimeIOException` — TableMetadataParser.java:301-306 ("Failed to read file"). Same on write at :135-137. A truncated JSON stream surfaces as a Jackson parse error through this path.
+- All structure is validated up front: the root must be an object (TableMetadataParser.java:342-343), and every array it reads is checked with `.isArray()` before iteration (:370-372, :408-409, :513-514, and the same in SnapshotParser/refs/stats helpers :593, :610, :625).
+
+## 2. Newer / unknown format version
+A table written by a newer spec than the reader supports must not be silently misinterpreted.
+- On read: after pulling `format-version`, the parser rejects anything above the supported version — TableMetadataParser.java:345-349, with `SUPPORTED_TABLE_FORMAT_VERSION = 4` (TableMetadata.java:58).
+- On model construction: same check, TableMetadata.java:309-313; and on the Builder, for both initial creation and upgrades, TableMetadata.java:1062-1066 and :1072-1076.
+- Note the inverse guard: the Builder refuses to *downgrade* a table (TableMetadata.java:1077-1081), so a v3 table can't be rewritten as v1 with features it can't represent.
+
+## 3. Missing/invalid required fields (structural integrity)
+The spec's "required vs optional by version" is enforced in two layers:
+- **Parser layer (TableMetadataParser.java):** v2+ requires `schemas`+`current-schema-id`, `partition-specs`+`default-spec-id`, `sort-orders`+`default-sort-order-id`, `last-partition-id`. If the array form is absent it forces `formatVersion == 1` and rejects otherwise — e.g. :396-397, :426-427, :440-441, :461-462. It also validates that `current-schema-id` actually resolves to a schema (:386-391).
+- **Model layer (TableMetadata constructor):** `specs` and `sortOrders` must be non-empty (:305-308), and version-conditional invariants are enforced:
+  - `uuid` required in v2+ (:314-315)
+  - `location` required in v1-v3, and in v4 when present must be absolute (`LocationUtil.hasScheme`) — TableMetadata.java:316-325
+  - v1 `last-sequence-number` must be 0 (:326-329)
+
+## 4. Inconsistent / dangling references (snapshots, refs, specs)
+A metadata file where the current snapshot, a branch/tag, or the current schema points at something that doesn't exist would break scans.
+- **Current snapshot** must exist in the snapshot list: `validateCurrentSnapshot`, TableMetadata.java:651-655.
+- **Every snapshot ref** (tags/branches) must point at a real snapshot: `validateRefs`, TableMetadata.java:872-877.
+- **main branch consistency:** if a current snapshot is set, `current-snapshot-id` must equal the `main` branch's snapshot id (TableMetadata.java:880-885); and if there is no current snapshot there must be no main branch (:886-889) — spec: "current-snapshot-id must be the same as the current ID of the main branch in refs."
+- **Snapshot sequence numbers** must not exceed the table's `last-sequence-number`: `indexAndValidateSnapshots`, TableMetadata.java:842-846.
+- **Schema/partition-spec binding:** specs are bound against the schema, and only the default spec is strictly bound (TableMetadataParser.java:417-420); `setCurrentSchema`/`setDefaultPartitionSpec` reject unknown ids at the Builder (TableMetadata.java:1110-1111, :1170-1171).
+
+## 5. Corrupted history (logs must be monotonic)
+Malformed timestamps in the snapshot/metadata logs (or a `last-updated-ms` older than its own history) would silently break time travel and GC.
+- The constructor validates that snapshot-log entries are chronological, with a one-minute tolerance for cross-machine clock skew (TableMetadata.java:374-380), and that `last-updated-ms` isn't before the newest snapshot-log entry (:381-389).
+- Same for the metadata-log/previous-files chain (:391-411). The one-minute tolerance (documented "commits can happen concurrently from different machines") is a deliberate guard against false failures from clock skew.
+
+## 6. Inconsistent state during mutation (Builder layer)
+Most corruption is prevented *before* a file is ever written, because every mutation goes through the Builder and is validated at `build()`.
+- The Builder maintains indices (`specsById`, `schemasById`, `sortOrdersById`, `snapshotsById`) and re-validates on build — TableMetadata.java:361-365, :552-555.
+- The format-version upgrade path is gated (no downgrade, no unsupported version) — TableMetadata.java:1071-1091.
+- `buildReplacement` enforces the **v1 requirement that partition field IDs be sequential**, a real back-compat correctness guard — TableMetadata.java:724-727.
+
+## 7. Concurrency races / lost updates (the commit path)
+This is the class of failure the spec's design is fundamentally about. The parser itself doesn't do commits — but the failure mode is handled by the `TableOperations` implementations the parser feeds. Two guards worth flagging:
+- The read path deliberately does not silently "fix" metadata: a change-based `fromJson` carrying a `metadataLocation` *and* pending changes is rejected (TableMetadata.java:330-332), so a stale/inconsistent base can't be written back.
+- The actual lost-update protection (optimistic concurrency: re-read current base, re-apply, retry) lives in `BaseMetastoreTableOperations` / `HadoopTableOperations` via check-and-put / atomic rename, which the spec explicitly leaves to the catalog. I did not re-read those this turn, so I won't cite specific lines there — but that's where the race guard lives.
+
+## 8. Optional-field back-compat / decoder leniency
+Related failure mode: over-strict readers rejecting perfectly valid older files.
+- The parser is deliberately lenient where the spec allows: `last-sequence-number` and snapshot `sequence-number` default to 0 for v1 (TableMetadataParser.java:357-362; SnapshotParser.java:128-131), `current-snapshot-id` normalizes missing to `-1` internally (TableMetadataParser.java:476-480), `refs`/`main` are synthesized when absent (:498-508), and the legacy v1 single-field forms (`schema`, `partition-spec`) are only accepted at `formatVersion==1` (TableMetadataParser.java:182-199, :395-402, :425-436).
+- The `-1` vs JSON-`null` current-snapshot encoding (TableMetadataParser.java:222-230, `MIN_NULL_CURRENT_SNAPSHOT_VERSION=3` :116) is a deliberate back-compat guard matching Appendix F — older v1/v2 readers expect `-1`, v3+ use `null`, and the reader normalizes both.
+
+## 9. Gzip codec ambiguity
+Because both extensions exist, the codec must be detected at read time or a compressed file is read as plain text.
+- `Codec.fromFileName` handles both older `.metadata.json.gz` and the newer `.gz.metadata.json` suffix, plus the uncompressed case (TableMetadataParser.java:69-82), and `read`/`internalWrite` wrap/unwrap GZIP based on it (:128-131, :301-302). A mis-detection fails fast as a parse/IO error rather than returning corrupt metadata.
+
+If you want, I can next trace the actual commit/conflict-retry loop in `BaseMetastoreTableOperations` — that's the one failure class (lost-update races) that the parser/constructor layer deliberately delegates rather than guards itself.

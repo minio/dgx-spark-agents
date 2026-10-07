@@ -1,0 +1,39 @@
+I've read the full file, from start to the last line (2153). Now, on partition transforms.
+
+What the spec says
+------------------
+
+A partition spec is a list of partition fields, each with: a source column id (or, in v3, multiple source ids for multi-argument transforms), a partition field id unique within the spec, a transform applied to the source column(s), and a partition name. Source columns must be primitive and cannot sit inside a map or list (structs are fine). Each data file is stored in a manifest with a tuple of partition values that must be identical for every record in that file.
+
+The built-in transforms (with their accepted source types and result types):
+
+- identity — source value unchanged (any primitive except geometry/geography); result = source type.
+- bucket[N] — 32-bit hash of the value modulo N; result int. The hash is Murmur3 x86 32-bit seeded with 0, then sign bit discarded: `(murmur3_x86_32(x) & Integer.MAX_VALUE) % N`. Valid on int, long, decimal, date, time, timestamp, timestamptz, ns variants, string, uuid, fixed, binary.
+- truncate[W] — value truncated to width W; result = source type. For int/long it's rounded down to a multiple of W (with a positive-remainder rule); for decimal, W is applied at the column's scale (no extra parameter); for string it's the first L UTF-8 code points; for binary, the first L bytes.
+- year / month / day / hour — extract the time unit as an offset from an epoch (years from 1970, months from 1970-01-01, days as a date type, hours from 1970-01-01 00:00:00). Date/timestamp families only.
+- void — always produces null; used to effectively drop a partition field during evolution (mostly a v1 mechanism) without reassigning IDs.
+- All transforms must return null for null input.
+
+Naming/encoding: transforms are serialized as strings like `bucket[16]`, `truncate[20]`, `day`, `identity`. Specs themselves can evolve — you add/remove/reorder/rename fields, producing a new spec with a new spec-id; partition field IDs must be preserved so that partition tuples stored in older manifests keep matching.
+
+Design rationale
+----------------
+
+The core idea is "storage separation": partitioning is table configuration, and it's decoupled from how queries are written. The spec stores data files in a manifest with a partition tuple, then derives, per manifest, a *partition predicate* from the user's *column predicate* using the transform that wrote that manifest. So `ts > X` on a table partitioned by `day(ts)` becomes the inclusive partition predicate `ts_day >= day(X)`, used only to rule out files that can't possibly match. Queries don't need to mention partition values at all — if the partition scheme changes, the correct filters are still derived automatically. That's the whole point of having named, parameterized transforms rather than forcing users to hand-write partition predicates.
+
+Several design choices follow from this:
+
+- Inclusive projection (scan pruning), not strict. The partition filter is allowed to keep extra files, never to drop a file that could match. This keeps the transform-to-predicate mapping sound and simple.
+- Transforms are defined to be coarse and cheap to filter on, and several are deliberately crafted to hold up under schema and partition evolution:
+  - int->long promotion doesn't change bucket values (integer hashing is defined identically), and float->double likewise. The spec explicitly forbids promoting a source column if the transform's output would change (e.g. date->timestamp changes output, so it's disallowed when that column feeds a partition transform).
+  - bucket collisions are preserved so bucketed reads still prune correctly even as bucket counts change over time.
+  - The `void` transform lets you "drop" a field without breaking the partition tuple structure.
+- The hash must be fully specified and deterministic (Murmur3, seeded 0, exact per-type byte encoding in Appendix B) because every engine must produce identical bucket values or partition pruning silently diverges across engines. Appendix B is essentially a conformance contract, with test vectors.
+- Unknown transforms are deliberately readable-but-not-writable: readers must ignore a partition field whose transform they don't know (required in v3), but writers must not commit data with one. That lets forward evolution happen without breaking old readers, while keeping writes safe.
+- Fields carrying transforms also appear in sort orders, reusing the same transform vocabulary so both partitioning and sorting describe data derivations consistently.
+
+The framing is that partition values are metadata used solely for pruning during scan planning, not something users are expected to consult or maintain — hence identity partitions only really matter for migrations (e.g., serving values back out of partition metadata for Hive-style column projection), which is why projection rules mention pulling values from an identity transform's partition metadata.
+
+One nuance worth flagging: the spec-as-written treats partitioning as a *pruning hint*. It guarantees correctness of the *set of files selected* (inclusive projection never drops a matching file) but not that each output file is entirely in one partition — files are just filtered via the derived predicate. That's intentional and is why the transform→predicate mapping has to be inclusive rather than exact.
+
+The whole partition-transform design is therefore a tradeoff where the spec invests in a small, precisely-specified, evolution-safe set of derived-value functions so that scanning stays O(1) on remote calls (via manifest-list summaries) and partitioning can change without ever requiring queries to change.

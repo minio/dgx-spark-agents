@@ -1,0 +1,23 @@
+Snapshot expiration in one pass — ten bullet points, each pointing at the first thing to read.
+
+1. Expiration exists to physically reclaim files: once a snapshot is removed from metadata, the data files only it referenced become deletable. The enforcement contract lives in the spec — "a data file must not be deleted until the last snapshot in which it was listed is garbage collected." Read format/spec.md:1120 and format/spec.md:1162.
+
+2. The core engine of expiry is `RemoveSnapshots.internalApply()`: it decides which snapshots survive and rewrites table metadata to drop the rest. Start here and trace the whole decision tree. core/src/main/java/org/apache/iceberg/RemoveSnapshots.java:196.
+
+3. The retention algorithm is copied from the spec's Snapshot Retention Policy: start with an empty retain-set, keep all ref heads, walk each branch's ancestors until one is both older than `max-snapshot-age-ms` AND past the `min-snapshots-to-keep` floor. core/src/main/java/org/apache/iceberg/RemoveSnapshots.java:303 (and spec line 1124).
+
+4. `main` never expires; other refs drop when older than `max-ref-age-ms`. Per-ref settings override the global `history.expire.*` properties. core/src/main/java/org/apache/iceberg/RemoveSnapshots.java:278.
+
+5. Snapshot lineage (walking parents) is the lookup that retention relies on — an iterator over `parentId()` chain. core/src/main/java/org/apache/iceberg/util/SnapshotUtil.java:225.
+
+6. Removing snapshots is a pure metadata builder operation on `snapshots`; it also prunes dangling refs, per-snapshot statistics files, and the `snapshot-log` (to keep time-travel consistent). core/src/main/java/org/apache/iceberg/TableMetadata.java:1429.
+
+7. File deletion is a separate phase, guarded by `cleanupLevel`. `CleanupLevel.NONE` skips it entirely — that's how Spark takes over deletion itself. core/src/main/java/org/apache/iceberg/RemoveSnapshots.java:378.
+
+8. The default reachability strategy only deletes files present before expiration and absent after — it re-scans surviving snapshots and never touches anything still reachable. core/src/main/java/org/apache/iceberg/ReachableFileCleanup.java:53.
+
+9. The incremental strategy (main-branch-only tables) deletes via DELETED manifest entries whose snapshot is no longer valid; it's deliberately rejected when branches/specified-ids are involved, so it can't remove live data. core/src/main/java/org/apache/iceberg/IncrementalFileCleanup.java:298 and the guard at RemoveSnapshots.java:413.
+
+10. Engines wrap this core the same way but split the delete half: Spark computes expiry only (`CleanupLevel.NONE`) and deletes via a distributed anti-join (`ExpireSnapshotsSparkAction.java:149`); Flink lets core plan deletions (`CleanupLevel.ALL`) but redirects them into a stream side-output (`ExpireSnapshotsProcessor.java:84`).
+
+Two invariants to keep in mind while reading: expiration decrees what's no longer valid; deletion must never remove a file still reachable by a retained snapshot — those are the same guarantee enforced three different ways (spec language, core cleanup, and each engine's wrapper).

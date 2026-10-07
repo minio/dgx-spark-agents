@@ -1,0 +1,36 @@
+I've read the full file (all 2153 lines, including the appendices). Here's what the spec says about table properties and the reasoning behind it.
+
+## Where table properties appear in the spec
+
+The canonical definition is in the Table Metadata section (the `properties` field of table metadata, ~line 1160 in v1-v3 and line 1188 in v4):
+
+  "A string to string map of table properties. This is used to control settings that affect reading and writing and is not intended to be used for arbitrary metadata. For example, `commit.retry.num-retries` is used to control the number of commit retries."
+
+It's an `_optional_` field in every spec version, serialized as a simple JSON object of string keys to string values (Appendix C example shows keys like `write.format.default` -> `"avro"` and `commit.retry.num-retries` -> `"4"`).
+
+Beyond that definition, the spec references specific properties and how they behave:
+
+- Schema/column level (Append... actually in the main body):
+  - `schema.name-mapping.default` (line 412) — a JSON name mapping used so metadata-only table migrations (e.g. from Hive) can map field names to field IDs when a data file lacks field-ID info.
+  - `identifier-field-ids` is tracked in the schema itself, not as a table property.
+- Snapshot retention (Appendix F / Snapshot References, lines 1112-1114): `history.expire.min-snapshots-to-keep`, `history.expire.max-snapshot-age-ms`, and `history.expire.max-ref-age-ms` are the table-level defaults that individual snapshot references (branches/tags) can override.
+- Write behavior (Appendix F, "Path Construction", lines 2061-2063): `write.metadata.path` and `write.data.path` control where metadata and data files are written (defaulting to `metadata` and `data`).
+- Commit behavior (the definition's own example): `commit.retry.num-retries`.
+- Geospatial (CRS section, lines 309-311): a CRS string may be given as `projjson:<property-name>` to reference a PROJJSON definition stored in a table property, keeping bulky definitions out of the schema.
+
+## Why it's designed this way
+
+The key design decision is the sentence: "This is used to control settings that affect reading and writing and is **not intended to be used for arbitrary metadata**." Three reasons drive it:
+
+1. Properties are configuration knobs, not user data. Iceberg deliberately does not want table properties to become a general-purpose metadata dumping ground. Arbitrary metadata has its own sanctioned homes — table statistics (Puffin files), partition statistics, snapshot summary fields, and the `encryption-keys` structure. Keeping `properties` scoped to behavior that changes how readers and writers operate prevents property bloat that would interfere with the invariant-based update logic, and keeps the metadata JSON clean and cheap to parse on every commit.
+
+2. They are stored in the immutable table metadata file. Because table metadata is replaced atomically on each commit, changing a property is itself a committed, versioned, serializable-operation — the same optimistic-concurrency path as schema evolution. Properties are just another thing for which each new metadata version is authoritative, so config changes are tracked consistently with all other table state.
+
+3. The map is intentionally untyped and unspecified in scope. The spec does not enumerate or mandate any particular property — it relies on the reference implementation and engine integrations to define and interpret the keys. This keeps the spec flexible across engines (Spark, Flink, Trino, etc.) while the few properties the spec does name (`commit.retry.*`, `history.expire.*`, `write.*`, `schema.name-mapping.default`) are those with semantics the spec itself must pin down to guarantee interoperable behavior (e.g. retention evaluation order, path resolution).
+
+A couple of supporting design notes:
+
+- The retention properties are the pattern where a table-level default is set and a per-reference (branch/tag) value overrides it — Appendix F's snapshot-retention procedure (@~line 1122-1132) shows exactly how the table property defaults and on-reference values are combined. This is why the spec must at least state what those property names mean.
+- `write.metadata.path` / `write.data.path` tie directly into path construction and relativization, so the spec has to define whether they're absolute or resolved relative to the table location (Appendix F).
+
+So in summary: the spec treats table properties as an opaque string→string configuration map stored in the immutable, atomically-committed metadata file — scoped to read/write behavior rather than arbitrary metadata, with the few semantics-bearing properties defined explicitly so engines interoperate, and the long tail left to implementations.

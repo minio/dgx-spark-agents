@@ -1,0 +1,37 @@
+I've read format/spec.md in full (all 2153 lines). Here's what it actually says about manifest merging — and a necessary caveat up front.
+
+## First, a caution
+
+The spec has no section literally titled "manifest merging." It never prescribes a merge algorithm or a "merge manifests" operation. "Manifest merging" as an operation lives in the implementation (`MergingSnapshotProducer`, `RewriteManifests` in the Java codebase), not in the spec. What the spec does define is the data model and the invariants that make merging possible and worthwhile — and it does say, in a few places, why manifests are structured the way they are (which motivates merging). Below is what the spec actually says, followed by how it constrains and rationalizes merging.
+
+## What the spec says (directly)
+
+1. Manifests are immutable and reused across snapshots (Overview, line 87):
+   "Manifest files are reused across snapshots to avoid rewriting metadata that is slow-changing."
+
+2. A snapshot may store its files in more than one manifest, and this is explicitly enabled for several reasons (Snapshots, lines 978–984):
+   - Fast append: "Appends can add a new manifest to minimize the amount of data written, instead of adding new records by rewriting and appending to an existing manifest. (This is called a 'fast append'.)"
+   - Multiple partition specs: each manifest uses a single partition spec, so evolving partitioning doesn't force a rewrite of old manifests.
+   - Parallelism and rewrite cost: "Large tables can be split across multiple manifests so that implementations can parallelize job planning or reduce the cost of rewriting a manifest."
+
+3. A manifest stores files for a single partition spec, because "a manifest file's schema is based on its partition spec" (Manifests, line 666). When the spec changes, old files stay in older manifests and new files go into new manifests.
+
+4. Commit conflict resolution (line 1317) explicitly names compaction as a replace operation: "Replace operations must verify that the files that will be deleted are still in the table. Examples ... compactions (several files are replaced with a single file that contains the same rows)." The snapshot `operation` enum includes `replace` for "compaction, changing the data file format, or relocating data files" (line 972).
+
+## Why the design supports merging
+
+The core rationale the spec gives is the fast-append/reuse tension. Because each append can just add a brand-new manifest (cheap, no rewriting of existing metadata), snapshots naturally accumulate a long chain of manifests. The cost of that accumulation is paid at scan-planning time: a reader must open every manifest to enumerate files. That's the tension `merging` resolves — but note the spec frames the benefits as about the write side:
+
+- Writing is O(1): an append touches only the new manifest plus a new manifest list, reusing all existing manifests (line 87, and sequence-number inheritance in lines 928–937 which lets a manifest be written once and reused across commit retries). This is a deliberate choice to minimize write cost and enable optimistic concurrency with retry (line 107).
+- The manifest list exists precisely to keep this scalable on the read side: it stores per-manifest summaries — added/existing/deleted file counts and per-partition-field bounds (`contains_null`, `lower_bound`, `upper_bound`) — so scans can skip whole manifests without opening them (Manifest Lists, lines 1005, 1027–1043; Scan Planning, line 1057: "Manifests that contain no matching files, determined using either file counts or partition summaries, may be skipped").
+
+So the spec's design is: pay a little write-side overhead up front (reusing manifests) and use manifest-list summaries to bound read cost, while leaving the option open for an implementation to merge manifests to further reduce planning overhead. The spec doesn't mandate when or how to merge — it just guarantees the data model (immutable manifests, single-spec manifests, manifest-list summary metadata, sequence-number inheritance) that makes both fast appends and later merging correct and beneficial.
+
+## Where the spec is silent but relevant
+
+A few things you'd need to know to implement manifest merging are NOT in spec.md:
+- The actual merge policy (when to fan-in, how many manifests to combine) is left to the engine.
+- Merging data files (compaction) is an operation on table data, distinct from merging the manifest files that reference them. The spec's conflict-retry rule for replace/compact (line 1317) is the guard that makes rewriting files safe under concurrency.
+- The spec allows `deleted-duplicate-files` in snapshot summaries (line 2114), which is where a merge/rewrite would clean up files referenced more than once.
+
+Bottom line: read the spec as specifying the "why" — immutable, reusable manifests and fast appends for write efficiency, with manifest-list summaries for read efficiency — and as permitting (via compaction/replace and single-spec manifests) the merge behavior, without prescribing the merge algorithm itself. If you want the actual decision logic, that's in the core code (`MergingSnapshotProducer`, manifest merging in `ManifestMerger`/`RewriteManifests`), not the format spec.

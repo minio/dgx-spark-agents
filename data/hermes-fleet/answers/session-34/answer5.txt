@@ -1,0 +1,21 @@
+1. **Concept & lifecycle (read the spec first).** Position deletes mark a row deleted by `file_path` + 0-based `pos`; introduced in v2, carried into v3/v4 via deletion vectors. format/spec.md:109-119 and format/spec.md:1375-1417.
+
+2. **The repository's core abstraction.** `PositionDeleteIndex` is the interface everything speaks (delete/query/merge/serialize); used for both position-delete files and DVs. core/src/main/java/org/apache/iceberg/deletes/PositionDeleteIndex.java:28-143.
+
+3. **In-memory representation = an array of 32-bit Roaring bitmaps.** Each 64-bit position splits into a high-32-bit `key` (array index) + low-32-bit sub-position, exactly as the spec dictates for sparsity. core/src/main/java/org/apache/iceberg/deletes/RoaringPositionBitmap.java:52-80, 143-148, 359-366.
+
+4. **Mutable default implementation.** `BitmapPositionDeleteIndex` wraps that bitmap and adds merge/iterator/serialization; `deserialize` validates length, magic, CRC, and cardinality-vs-`record_count`. core/src/main/java/org/apache/iceberg/deletes/BitmapPositionDeleteIndex.java:31-74, 151-221.
+
+5. **Reading deletes for a data file.** `BaseDeleteLoader` is the single read entry point: loads one DV if present, else reads position-delete files (filtered by path) and merges them; a DV may replace position files. data/src/main/java/org/apache/iceberg/data/BaseDeleteLoader.java:160-213.
+
+6. **Finding the DV blob.** `DVUtil.readDV` seeks to each DV's `content_offset`/`content_size_in_bytes` inside a shared Puffin file and deserializes — the offset/length must match the Puffin footer. core/src/main/java/org/apache/iceberg/DVUtil.java:52-67.
+
+7. **Applying the index to rows during a scan.** `DeleteFilter` projects `_pos`/`_deleted`, loads the index, and drops or marks each row via `isDeleted(pos)`. data/src/main/java/org/apache/iceberg/data/DeleteFilter.java:265-280 and 282-333.
+
+8. **Writing DVs.** `BaseDVFileWriter` keeps one `PositionDeleteIndex` per referenced data file, merges previous deletes at close, and writes them as Puffin `deletion-vector-v1` blobs with referenced-file/cardinality metadata. core/src/main/java/org/apache/iceberg/deletes/BaseDVFileWriter.java:88-105, 114-181.
+
+9. **Unordered-delete safety.** `SortingPositionOnlyDeleteWriter` buffers positions per file and sorts paths/positions at flush so output honors the spec's required file+pos ordering, and rejects non-file-scoped previous deletes. core/src/main/java/org/apache/iceberg/deletes/SortingPositionOnlyDeleteWriter.java:82-88, 137-172.
+
+10. **What engines build on it.** Spark reads (vectorized once-per-batch `forEachInRange` mapping) in spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/data/vectorized/ColumnarBatchUtil.java:58-109 and writes DVs in spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/SparkPositionDeltaWrite.java:535-557; Flink routes CDC/DELETE rows into DVs in flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/sink/BaseDeltaTaskWriter.java:80-111.
+
+Tip: read #1 then #2; the rest are layers around those two.

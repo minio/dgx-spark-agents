@@ -1,0 +1,40 @@
+I now have the full read and write paths. Here's how query engines actually use deletion vectors in this repo.
+
+## The read path (Spark, vectorized)
+
+The vectorized columnar reader applies the DV through `SparkColumnarBatchReader` → `DeleteFilter`, which exposes the DV as a `PositionDeleteIndex`. The core work is in `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/data/vectorized/ColumnarBatchUtil.java` (the same class exists in the v4.0/4.1/4.2 trees).
+
+Because a DV is a bitmap of deleted positions, the engine never probes a separate delete file row-by-row; it treats the vector as a compact set of absolute positions within the data file. Two strategies, chosen by whether equality deletes are also present:
+
+1. DV-only batch filtering uses a range traversal. A Spark columnar batch occupies a contiguous ascending position range `[rowStartPosInBatch, rowStartPosInBatch+batchSize)` of the underlying data file. `buildRowIdMapping` notes "positions in a batch form a contiguous ascending range, so the index can be traversed once for the whole range instead of being probed once per row" and calls `deletedPositions.forEachInRange(...)` over exactly that range (ColumnarBatchUtil.java:69-74, 97-109). The collector consumes deleted positions in ascending order and fills the gaps with live row IDs, producing `(rowIdMapping, liveRowId)` (ColumnarBatchUtil.java:224-267). The same single-pass range strategy drives `buildIsDeleted` and its `IsDeletedCollector` (ColumnarBatchUtil.java:148-159, 270-287), which marks deleted rows with `deletedPositions.forEachInRange(...)`.
+
+2. When equality deletes are also present, it falls back to per-row probing: for each row it computes the absolute position `pos = rowStartPosInBatch + rowId` and applies the DV via the O(1) bitmap membership check `deletedPositions.isDeleted(pos)` (ColumnarBatchUtil.java:82-93, 164-171, 176-191). This is exactly the spec's "set bit at position P indicates row P deleted" semantics (spec.md:1377).
+
+Result projection then discards temp columns used only for delete filtering (`removeExtraColumns`, ColumnarBatchUtil.java:211-219).
+
+Where the `PositionDeleteIndex` itself comes from (core): `DVUtil.readDV` reads the Puffin blob using the manifest's `contentOffset` + `contentSizeInBytes` — a single random-access `IOUtil.readFully(inputFile, offset, ...)` — and calls `PositionDeleteIndex.deserialize`, which runs the CRC/cardinality/length validation (DVUtil.java:52-67 → BitmapPositionDeleteIndex.java:151-221). This is the spec's "direct access to a deletion vector" by offset+length (spec.md:756, 1385). On the write side `BaseDeleteLoader` still feeds DVs through `PositionDeleteIndex`.
+
+## The write path (Spark, position-delta operations)
+
+`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkPositionDeltaWrite.java` implements Spark's row-level `DELETE`/`UPDATE`/`MERGE` over Iceberg, and it's where the engine decides to emit DVs.
+
+- Enabling DVs is a format/version decision: `Context.useDVs()` returns true only when `deleteFileFormat == FileFormat.PUFFIN` (SparkPositionDeltaWrite.java:859-861), which is how v3+ tables (Puffin DVs) are distinguished from v2 tables that must use ordered position delete files.
+- The delete writer factory picks the DV writer: `if (context.useDVs()) return new PartitioningDVWriter<>(files, previousDeleteLoader);` — otherwise `ClusteredPositionDeleteWriter` (ordered, v2) or `FanoutPositionOnlyDeleteWriter` (SparkPositionDeltaWrite.java:497-519). The comment calls out the spec: "Use the DV writer for V3+ tables; the spec requires position deletes to be ordered by file and position for V2 tables" (SparkPositionDeltaWrite.java:493-496). DVs remove the ordering requirement that v2 position delete files impose (spec.md:1413).
+- The laziest, most spec-faithful part is `PreviousDeleteLoader` (SparkPositionDeltaWrite.java:522-553). It implements the DV writer's `loadPreviousDeletes` hook: for a given data-file path it loads the existing position deletes/vector via `deleteLoader.loadPositionDeletes(deleteFileSet, path)` and returns them as a `PositionDeleteIndex` to the DV writer (`BaseDVFileWriter`), which merges them into the new vector. This is the spec's synchronous-merge invariant — "writers must merge new deletes with existing vectors or position delete files" and "when a DV is present, readers can safely ignore matching position delete files" (spec.md:1366, 1387, 1951-1952).
+- Rewriting superseded deletes: `computeBatchWriterFactory` broadcasts the rewritable deletes from the scan; `shouldRewriteDeletes()` requires rewriting "when there are DVs and file-scoped deletes" (SparkPositionDeltaWrite.java:189-202, `context.useDVs() || deleteGranularity == FILE`). On commit, the newly added delete files (the DVs) are added via `rowDelta.addDeletes` and the superseded ones removed via `rowDelta.removeDeletes` (SparkPositionDeltaWrite.java:227-235), mirroring `BaseDVFileWriter`'s `rewrittenDeleteFiles` from the earlier analysis.
+- Commit/concurrency: the commit path feeds the row delta's conflict detection with the referenced data files (`CharSequenceSet` of DV targets), validates them still exist, and applies `validateFromSnapshot`, `validateDeletedFiles`/`validateNoConflictingDeleteFiles`, plus serializable checks on data files (SparkPositionDeltaWrite.java:213, 237, 242-261). This is the engine enforcing the DV scan-scope rules (same file, same partition, and correct relative age via sequence numbers — spec.md:1075-1078) at commit against a stable snapshot.
+- Per-row delete intake: the Spark `DeleteOnlyDeltaWriter.delete` extracts `_file`/`_pos` from the row-id metadata and forwards `delegate.delete(file, position, spec, partition)` (SparkPositionDeltaWrite.java:593-605), which lands in `PartitioningDVWriter` → `BaseDVFileWriter.delete`, building the per-file position bitmap.
+
+## Flink
+
+Flink's only DV touch is a maintenance operator, not query execution: `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/maintenance/operator/EqualityConvertDVWriter.java` (and `EqualityConvertReader.java`), which converts equality deletes into DVs — same vector-gen machinery. Flink doesn't otherwise read/apply DVs in its query path in this repo.
+
+## How the pieces connect to the spec
+
+- DV = ordered set of deleted absolute positions within one data file → `PositionDeleteIndex`/`RoaringPositionBitmap`; engine filters a batch via `forEachInRange` or `isDeleted` (ColumnarBatchUtil.java:104, 154, 182).
+- Single random-access read by `contentOffset`/`contentSizeInBytes` (DVUtil.java:58-63) → spec.md:756, 1385.
+- No positional ordering requirement for DVs, unlike v2 position delete files (SparkPositionDeltaWrite.java:493-496, 510-511) → spec.md:1413 vs. spec.md:1377.
+- Merge-existing on write (PreviousDeleteLoader + BaseDVFileWriter merge) → spec.md:1366, 1387.
+- Commit-time validation of referenced files/partitions/sequence → spec.md:1075-1078.
+
+In short: engines consume DVs as a compact per-file bitmap that makes "which rows are deleted" a cheap membership/range test during vectorized columnar reads, and on the write side DVs let Spark's row-level operations delete without the file/position ordering that v2 position-delete files demanded, with the engine owning the merge and conflict-checking that keep the at-most-one-DV-per-file invariant sound.

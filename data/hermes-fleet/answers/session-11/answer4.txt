@@ -1,0 +1,91 @@
+I now have the complete picture across both engines. Here's how query engines use time travel in this repo, following the code.
+
+## How SQL surfaces time travel
+
+Spark maps Iceberg time travel onto **Spark's built-in `VERSION AS OF` / `TIMESTAMP AS OF`** syntax. The option names are constants in `SparkReadOptions.java`:
+
+- `VERSION_AS_OF = "versionAsOf"` (SparkReadOptions.java:103)
+- `TIMESTAMP_AS_OF = "timestampAsOf"` (SparkReadOptions.java:105)
+
+Spark's DataFrame API / SQL parser turns `SELECT ... TIMESTAMP AS OF '...'` into a `loadTable(ident, version)` or `loadTable(ident, timestampMicros)` call on the catalog. The old Iceberg-specific options (`snapshot-id`, `as-of-timestamp`, `tag`) are explicitly rejected as no-longer-supported, with guidance to use Spark's built-ins — `validateNoLegacyTimeTravel` (Spark3Util.java:576-594).
+
+## Spark: the load path
+
+**1. Catalog receives the request.** In `SparkCatalog`, the DataSourceV2 catalog methods convert Spark's version/timestamp into a `TimeTravel` object:
+- `loadTable(Identifier)` → no time travel (SparkCatalog.java:170-172)
+- `loadTable(ident, String version)` → `TimeTravel.version(version)`, supporting snapshot ID, branch, or tag (SparkCatalog.java:174-177)
+- `loadTable(ident, long timestampMicros)` → `TimeTravel.timestampMicros(...)` (SparkCatalog.java:180-182)
+
+**2. `TimeTravel` models the two modes.** A sealed interface (TimeTravel.java:25) with two records:
+- `AsOfVersion(String version)` — where `isSnapshotId()` parses the string as a long (TimeTravel.java:40-50)
+- `AsOfTimestamp(long timestampMicros)` — `timestampMillis()` converts micros→millis (TimeTravel.java:53-63)
+
+Note the units: Spark gives **microseconds** (TimeTravel.java:31-37), which matters because Iceberg snapshots store **milliseconds**.
+
+**3. Resolution to a snapshot happens at table load.** In `SparkTable.create(Table, TimeTravel)` (SparkTable.java:324-334), the `TimeTravel` is dispatched:
+- `AsOfTimestamp` → **`createWithTimestamp`** (SparkTable.java:354-358):
+
+```
+long timestampMillis = timeTravel.timestampMillis();
+long snapshotId = SnapshotUtil.snapshotIdAsOfTime(table, timestampMillis);
+return new SparkTable(table, snapshotId, timeTravel);
+```
+
+This is where the spec's "use snapshot-log, most recent at-or-before T" rule gets applied — it calls the exact `SnapshotUtil.snapshotIdAsOfTime` we traced earlier (SnapshotUtil.java:314-337), which iterates `table.history()` (the snapshot-log) and throws if no snapshot is at/before the timestamp.
+
+- `AsOfVersion` → **`createWithVersion`** (SparkTable.java:336-351): if it's a numeric snapshot ID, use it directly (line 337-338); otherwise it's a tag/branch, looked up in `table.refs()` with a "Cannot find matching snapshot ID or reference name" guard (lines 340-344), a branch resolving to the branch head (line 345-346) and a tag to its pinned snapshot (line 348).
+
+**4. The snapshot and its schema are locked in.** The `SparkTable(table, snapshotId, timeTravel)` constructor (SparkTable.java:115-122) freezes both:
+
+```
+SnapshotUtil.schemaFor(table, snapshotId),   // historical schema (line 118)
+table.snapshot(snapshotId),                   // the pinned snapshot (line 119)
+```
+
+So every subsequent operation on this `SparkTable` reads exactly that snapshot's data with that snapshot's schema — consistent with the spec's "snapshot represents the state of the table at some time" and "use the snapshot-log at the given time."
+
+**5. Writes are refused on a time-traveled table.** The pinned `timeTravel` is checked throughout `SparkTable`:
+- `newWriteBuilder` → `"Cannot write to table with time travel"` (SparkTable.java:186-189)
+- `newRowLevelOperationBuilder` → `"Cannot modify table with time travel"` (SparkTable.java:192-195)
+- `canDeleteWhere` → `"Cannot delete from table with time travel"` (SparkTable.java:198-199)
+
+This enforces that time travel is read-only.
+
+**6. The scan binds to the pinned snapshot.** `newScanBuilder` hands the resolved `snapshot` and `schema` to `SparkScanBuilder` (SparkTable.java:181-183), which plans files against that frozen snapshot rather than the current one — the same O(1) manifest planning the spec describes.
+
+There's also a programmatic API: `SparkTableUtil.loadTable(spark, table, snapshotId)` builds a `TimeTravel.version(...)` table directly (SparkTableUtil.java:671-674).
+
+## Flink: the scan path
+
+Flink takes a different route — it defers resolution to the core `TableScan`, via read options rather than catalog time-travel:
+- The option is `snapshot-id` / `as-of-timestamp` (millis) / `tag` / `branch` (FlinkReadOptions.java:32-52), exposed on `FlinkSource.Builder.asOfTimestamp` (FlinkSource.java:185-188) and `IcebergSource.Builder.asOfTimestamp` (IcebergSource.java:415-420), funneled through `ScanContext.asOfTimestamp` (ScanContext.java:54).
+- In `FlinkSplitPlanner` (FlinkSplitPlanner.java:124-134), the context is turned into scan refinements:
+
+```
+if (context.snapshotId() != null) scan = scan.useSnapshot(context.snapshotId());
+else if (context.tag() != null)  scan = scan.useRef(context.tag());
+else if (context.branch() != null) scan = scan.useRef(context.branch());
+
+if (context.asOfTimestamp() != null) scan = scan.asOfTime(context.asOfTimestamp());
+```
+
+`TableScan.asOfTime(long)` in the core (`SnapshotScan.java:131-136`) is where Flink converges with the same `SnapshotUtil`:
+
+```
+public ThisT asOfTime(long timestampMillis) {
+  Preconditions.checkArgument(snapshotId() == null,
+      "Cannot override snapshot, already set snapshot id=%s", ...);
+  return useSnapshot(SnapshotUtil.snapshotIdAsOfTime(table(), timestampMillis));
+}
+```
+
+So Flink's `as-of-timestamp` goes through the identical `SnapshotUtil.snapshotIdAsOfTime` snapshot-log lookup, with an extra guard against combining with an explicit snapshot id. (`asOfTime` is rejected on incremental scans and metadata tables — IncrementalDataTableScan.java:40-44, BaseAllMetadataTableScan.java:58-60.)
+
+## How both engines follow the spec
+
+- **Snapshot-log, most-recent-at-or-before T**: Spark (`SparkTable.createWithTimestamp` → SnapshotUtil.java:356) and Flink (`SnapshotScan.asOfTime` → SnapshotUtil.java:135) both resolve timestamps through `SnapshotUtil.snapshotIdAsOfTime`, which reads the snapshot-log exactly as spec.md:2075-2080 directs. Spark resolves eagerly at table load (so the schema is also pinned), Flink resolves lazily inside the scan.
+- **Informative error when nothing is at/before T**: both inherit the `IllegalArgumentException` from `snapshotIdAsOfTime` (SnapshotUtil.java:317-320) — Spark surfaces it at catalog/table load, Flink at planning.
+- **Snapshot ID / ref pinning**: Spark's `AsOfVersion` and Flink's `useSnapshot`/`useRef` map to spec's snapshot ids, branches, and tags (spec.md:1100-1116).
+- **Read-only**: Spark actively rejects writes on a time-traveled table (SparkTable.java:186-199); Flink's scan path is read-only by construction.
+
+The one engine-vs-core divergence is the unit handling: Spark takes microsecond timestamps from the DataSourceV2 API and converts to millis (`TimeTravel.timestampMicros` → `timestampMillis`, TimeTravel.java:31-37, 55-57) before calling `snapshotIdAsOfTime`, because Iceberg snapshot timestamps are in millis (spec.md:960).

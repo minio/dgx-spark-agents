@@ -1,0 +1,52 @@
+I've read format/spec.md in full (all 2153 lines). Here's what the spec says about partitioning and the reasoning behind it.
+
+## What the spec says
+
+**Definition.** A partition spec is "a definition of how partition values are derived from data fields." Data files are stored in manifests with a tuple of partition values, and the partition values for a file must be identical for all records in that file.
+
+**Spec structure.** A partition spec is a list of fields, each with:
+- a source column id (one) or source-ids (a list, for multi-argument transforms in v3),
+- a partition field id (unique within the spec; in v2+ unique across all specs),
+- a transform applied to the source column(s), and
+- a partition name.
+
+Source columns must be primitive and can be nested in a struct, but not in a map or list.
+
+**Transforms** (the table at section "Partition Transforms"):
+- `identity` — source value unmodified (any primitive except geometry/geography).
+- `bucket[N]` — 32-bit Murmur3 x86 hash seeded with 0, wrapped by `(hash & Integer.MAX_VALUE) % N` to make it positive. Result is `int`.
+- `truncate[W]` — truncate to width W (int/long/decimal by width at the column's scale, string by codepoints, binary by bytes).
+- `year` / `month` / `day` / `hour` — extract the calendar component as units since 1970-01-01.
+- `void` — always produces null; used to effectively drop a field.
+
+All transforms return null for null input. (v3 also formalizes multi-argument transforms via `source-ids`.)
+
+**Partition values in metadata.** Manifests store a `partition` struct whose type is derived from the spec's fields, using the partition field ids as struct field ids. Each manifest stores files for a single partition spec, which is why a spec change forces new files into a new manifest. The manifest list carries per-field summaries (contains_null, contains_nan, lower_bound, upper_bound) used to skip whole manifests.
+
+**Spec equivalence and reuse.** Two specs are equivalent if, field-for-field, they have the same source ids, transform definition, and partition name. Writers must not create a new spec if an equivalent one exists, and must reuse partition field ids.
+
+**Partition evolution.** Specs can evolve by adding/removing/renaming/reordering fields. Changing a spec produces a new spec id added to the table's list; the table also tracks `default-spec-id` (for writers) and `last-partition-id` (to hand out unused field ids). Old files stay in their old manifests; new files use a new manifest. Because field ids are the partition-tuple field ids, evolution should not change them. v1 has compatibility quirks (ids assigned from 1000, recommended to only append fields and use `void` to drop).
+
+**Scan planning (the key part).** Scans read manifests and convert *scan predicates* (which filter data rows) into *partition predicates* (which filter partition tuples), using the spec that wrote the manifest — not the current spec. The conversion is an *inclusive projection*: if a row matches the scan predicate, its partition must match the partition predicate (rows may be over-included). Example from the spec: a `ts > X` query on a table partitioned by `ts_day=day(ts)` projects to `ts_day >= day(X)`. Files that don't match are pruned; files with unknown transforms are not filtered. Deletes are applied only to older data files in the same partition (equality deletes with an unpartitioned spec are the global-delete exception).
+
+**Two important design points the spec repeats:**
+- Reading uses the spec stored in each manifest, not the table's current default spec — the current spec is only what *writers* use.
+- Partition filtering is always derived from predicates on *data values*, never supplied as separate partition predicates by the user.
+
+## Why it's designed this way
+
+The design flows directly from the spec's stated **Goals**, especially *Storage separation*: "Partitioning will be table configuration. Reads will be planned using predicates on data values, not partition values. Tables will support evolving partition schemes." The reasoning:
+
+1. **Decouple logical queries from physical layout.** Because scan filters are *derived* from data predicates, a user's query never changes when partitioning changes. You can add, remove, or reorder partitions and old queries keep working — the correct partition predicate is recomputed from the spec. This is why the spec quotes as a benefit: "queries do not need to change because partition filters are derived from data predicates."
+
+2. **Support spec evolution as a first-class feature.** Partitioning is treated as table *configuration* that changes over time (data volume changes ⇒ repartition). This is possible because each manifest pins the spec it was written with, so reads can interpret each file's partition tuple correctly regardless of the current spec. Old files are never rewritten on repartition — they just live in an older manifest.
+
+3. **Physical layout is just a pruning optimization, not correctness.** The inclusive projection is deliberate: it guarantees no matching row is ever excluded (that would be a correctness bug), while accepting that extra files may be scanned. The cost of over-inclusion is bounded and offsets the O(1) planning win; correctness never depends on partitioning being perfectly selective. Partitioning is a filter for *which files* to fetch, never for whether a row matches.
+
+4. **Keeps planning O(1) and client-side (the "Speed" and "Scale" goals).** Partition summaries in manifests and manifest lists let a planner skip files without opening their data. Because partition predicates are computed from column predicates using a well-defined transform, the planner is fully client-side with no central metadata bottleneck, and job planning doesn't need a metadata server.
+
+5. **Ordering/void/id rules protect compatibility.** Field ids are stable so partition-tuple structs stay consistent across specs and metadata evolution; the `void` transform lets you drop a partition without breaking v1 readers (which lacked tracked field ids and had fragile sequential-id assignment); and the equivalence rule prevents redundant specs that would fragment manifests. Unknown transforms default to "ignore when filtering" so readers can still scan tables written by a newer implementation.
+
+The consistent theme: partitioning is a *performance hint about physical layout*, fully separated from table semantics. The spec goes to great lengths (specs stored per manifest, derived rather than user-supplied filters, inclusive projection, stable field ids, evolution rules) to ensure that changing how a table is physically partitioned never changes the logical results a user sees.
+
+One correction on your request: you asked me to read spec.md in consecutive chunks to the last line — done (lines 1–2153, with the partitioning content concentrated in the "Partitioning", "Partition Transforms", "Bucket/Truncate Transform Details", "Partition Evolution", "Scan Planning", and Appendix C "Partition Specs" sections).

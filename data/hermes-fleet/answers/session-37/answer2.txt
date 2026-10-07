@@ -1,0 +1,47 @@
+I've traced the implementation end-to-end. Here's how the code follows the specification.
+
+## MetadataColumns.java — the reserved-ID catalog
+
+The spec (§"Reserved Field IDs", spec.md:439–459) reserves the top ~200 IDs and fixes the exact name/type/ID of each metadata column. `MetadataColumns.java` hardcodes those contract values:
+
+- `_file` = `Integer.MAX_VALUE - 1` (2147483646), required string — MetadataColumns.java:34–38
+- `_pos` = `Integer.MAX_VALUE - 2`, required long — :39–44
+- `_deleted` = `-3`, required boolean — :45–50
+- `_spec_id` = `-4`, required int — :51–55
+- `_partition` = `-5`, id only (`PARTITION_COLUMN_ID`), type built per-table — :57–59
+- Position-delete file columns: `file_path` = `MAX-101`, `pos` = `MAX-102`, `row` = `MAX-103` — :64–78, matching spec 2147483546/3545/3544
+- Changelog columns `_change_type` (`-104`), `_change_ordinal` (`-105`), `_commit_snapshot_id` (`-106`) — :79–96
+- **Row-lineage columns** `_row_id` (`MAX-107` = 2147483540) and `_last_updated_sequence_number` (`MAX-108` = 2147483539), both *optional* long — :97–108. The spec marks exactly these two as lineage fields and, unlike the always-required `_file`/`_pos`, they are optional (spec.md:458–459 and the v1-v3 table shows optional).
+
+The code groups metadata columns two ways: `META_COLUMNS` (by name, for resolution) at :110–117 and `META_IDS` at :119–127 (for ID checks). `metadataColumn(Table, name)` (:133–143) special-cases `_partition` because, per the spec's own note (:57 commentary) and spec.md:451, its type is not static — it's `Partitioning.partitionType(table)` derived from all specs. `schemaWithRowLineage` (:157–159) joins `ROW_ID` and `LAST_UPDATED_SEQUENCE_NUMBER` onto a schema — the entry point used by rewrite paths (e.g. `DataFileRewriteRunner.java:186`) to carry row IDs across rewrites, exactly per spec.md:482–486.
+
+## Inheritable assignment: the deferred-value design
+
+The spec's core mechanism (spec.md:463–480) is that `_row_id`/`_last_updated_sequence_number` are written null because commit sequence number and starting row ID aren't known until commit, then resolved by inheritance at read time. The code mirrors this at every level.
+
+**Data-file level (`first_row_id`, id 142).** `Tracking.FIRST_ROW_ID` (Tracking.java:53–55) is id 142, matching spec.md:741. `BaseFile` carries it (`firstRowId()`/`setFirstRowId`, BaseFile.java:291–297). New files are written with null and assigned at read.
+
+**Manifest level.** In `ManifestReader.open`, `idAssigner(firstRowId, isCommitted)` (ManifestReader.java:351, 440–474) does exactly the spec's "data file first_row_id = manifest's first_row_id + sum of record_count of preceding null files": when a file's `firstRowId` is null it sets `file.setFirstRowId(nextRowId)` and advances `nextRowId += recordCount` (:450–452). For uncommitted manifests it preserves values, and for pre-v3 committed manifests with null manifest-level ID it sets everything null (:459–472) — the upgraded-table path (spec.md:538). `ManifestReader` also force-projects `FIRST_ROW_ID` and `ROW_POSITION` even when unrequested (:333–336) because they're needed for assignment. The v4 reader does the same via `assignFirstRowId` (TrackingStruct.java:163–180), which assigns *only for live entries* ("ADDED will assign for new files, EXISTING will assign to handle existing files upgraded from pre-v3," :172–173) — the spec requires any null `first_row_id` be assigned even for existing files on first v3 commit (spec.md:949). `V4ManifestReader.applyInheritance` then advances `nextRowId += recordCount` (:160–162).
+
+**Manifest-list level.** `ManifestListWriter.V3Writer/V4Writer.prepare` assigns `first_row_id` to each data manifest lacking one, stepping by `existingRowsCount() + addedRowsCount()` (ManifestListWriter.java:138–149 for v4; 198–209 for v3). That's the spec's recommended estimator `first_row_id = last + added_rows_count + existing_rows_count` (spec.md:1051), and it "leaves space for existing and added rows … manifests from pre-v3 snapshots" (:144–146). The write schemas (`V3Metadata.java:48`, id `FIRST_ROW_ID`) confirm the field being written. The delete-file writer passes `null` first-row-id (ManifestWriter.java:408, `V3DeleteWriter`), matching "first_row_id for delete files is always null" (spec.md:947).
+
+**Snapshot level.** `SnapshotProducer` seeds the whole chain from `base.nextRowId()` as the manifest list's `firstRowId` (:316), and computes `assignedRows = writer.nextRowId() - base.nextRowId()` (:335–340) to pass as the snapshot's `added-rows` (spec.md:966 `added-rows` upper bound, :994–997) and the new `next-row-id` (:370–371). `V3Metadata.entrySchema` enforces at write that an assigned `first_row_id` is only valid for data entries and that live data files are never left with a null one (V3Metadata.java:145–160).
+
+## Row-level resolution into rows
+
+The final per-row values are produced by `PartitionUtil.constantsMap` plus `ValueReaders`, which together encode the spec's "if null, inherit" rules (spec.md:478–480):
+
+- `_row_id`: `PartitionUtil` puts the file's resolved `firstRowId` as the row-ID constant (PartitionUtil.java:56–61). `ValueReaders.rowIds` (ValueReaders.java:328–334) wraps it in a `RowIdReader` that returns the stored `_row_id` if non-null, otherwise `firstRowId + pos` (ValueReaders.java:1305–1314) — the spec's exact `_row_id = first_row_id + _pos` (spec.md:480). `pos` comes from the row-position supplier (SupportsRowPosition), the `_pos` backing.
+- `_last_updated_sequence_number`: `PartitionUtil` puts the file's **data sequence number** as the constant for this column (PartitionUtil.java:63–65). `ValueReaders.lastUpdated` (ValueReaders.java:336–343) → `LastUpdatedSeqReader`, which returns the row's stored value if non-null, else the file's data sequence number (ValueReaders.java:1337–1345) — exactly spec.md:478 ("if null it is assigned the sequence_number of the data file's manifest entry").
+- `_file`, `_spec_id`, `_partition`, identity-transform columns are likewise emitted as constants (PartitionUtil.java:67–100), matching the spec's column-projection rules (spec.md:403–408).
+
+The v4 content-stats mapping also recognizes the two lineage columns explicitly (`StatsUtil.METADATA_ID_TO_BASE_ID`, StatsUtil.java:73–76, 104–110), wiring their reserved stats struct base IDs (9000/9200 per spec.md:815–818) back to the metadata column IDs.
+
+## Design follow-through
+
+The implementation is faithful to the spec's two driving constraints:
+
+1. **Deferred assignment for optimistic retries.** Exactly one level above the data file — the manifest `first_row_id` — must be re-derivable, so manifests are written once with null and only the manifest list gets rewritten on a retried commit. `idAssigner`/`assignFirstRowId`/`ManifestListWriter.prepare` all reconstruct IDs deterministically from `nextRowId` + row counts, never baking commit-dependent values into the data file. This is the spec's stated reason for inheritance (spec.md:468).
+2. **Identity preserved across rewrites, modified recency tracked.** Rewrites use `schemaWithRowLineage` to carry `_row_id` and copy the existing non-null `_row_id` into new data files (spec.md:482–486; Flink `DataFileRewriteRunner` and its `TestRewriteDataFiles` exercise this), while a null `_last_updated_sequence_number` lets the new file's sequence number take over on modification.
+
+One implementation nuance worth flagging: `ValueReaders` names the inherited `_last_updated_sequence_number` constant `fileSeqNumber`, but `PartitionUtil` actually sources it from `task.file().dataSequenceNumber()` (the *data* sequence number, PartitionUtil.java:65), not the file sequence number. That matches the spec, which says to inherit the data sequence number — the variable name in `ValueReaders` is just slightly misleading versus the metdata it's fed.

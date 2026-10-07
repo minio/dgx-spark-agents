@@ -1,0 +1,68 @@
+I have what I need. Here's the failure-mode analysis, organized by what can go wrong, each traced to a specific guard.
+
+## 1. Data corruption: rewriting must not add, drop, or duplicate files
+
+The most severe class. The spec defines replace as changing files "without changing table data" (spec.md:972); losing or duplicating a file corrupts the table.
+
+Guard — `validateFilesCounts` (BaseRewriteManifests.java:300-314): it sums the active (added+existing) files in the created set and requires it to equal the active files in the replaced set (309-313), throwing `ValidationException` otherwise. It also hard-fails on missing counts (320-323), because a null count would make the equality check untrustworthy. `activeFilesCount` (316-329) counts added+existing and deliberately excludes deleted, matching spec.md:691 that deletes are informational only.
+
+Why this catches the real risks:
+- Re-clustering a file into a new manifest and forgetting one → created < replaced → caught.
+- Accidentally tracking the same file twice → created > replaced → caught.
+- `clusterByFunc` could collapse two manifests into one, but if entries are lost the counts diverge.
+
+Guard against dropped files during the copy — `liveEntries()` (ManifestReader.java:354-356, 358-365) filters to non-DELETED only, and the reader's iterator is closed via `addCloseable` (ManifestReader.java:347) inside a try-with-resources at the rewrite site (BaseRewriteManifests.java:256-270). Deleted entries are neither carried nor counted in the new manifest — correct per spec.md:1055.
+
+## 2. Silent wrong snapshot/sequence metadata on rewritten entries
+
+The spec requires EXISTING entries to carry explicit, immutable sequence and snapshot ids (spec.md:706, 935); WRITING them as NEW (ADDED) instead of preserved would change delete-scope semantics (position/equality deletes apply by data sequence number, spec.md:1075-1091).
+
+Guard 1 — correct status: the rewritten copy uses `writer.existing(entry)` (BaseRewriteManifests.java:372), and `ManifestWriter.existing(ManifestEntry)` (ManifestWriter.java:190-192) calls `wrapExisting` (GenericManifestEntry.java:54-67), which forces `status = EXISTING` and copies the entry's original snapshotId/dataSeq/fileSeq verbatim. So the re-clustered file keeps its original lineage.
+
+Guard 2 — completeness: `copyRewriteManifest` uses `InheritableMetadataFactory.empty()` (ManifestFiles.java:466). `EmptyInheritableMetadata` (InheritableMetadataFactory.java:109-120) throws if any entry still has a null snapshot id. This is the enforcement of spec.md:935 — a rewritten (existing) entry must never rely on inheritance, because after the rewrite there is no origin manifest left to inherit from. (Contrast with the append-copy path, which uses `forCopy` to legitimately rewrite with a new inherited id — ManifestFiles.java:428-453, InheritableMetadataFactory.java:95-107.)
+
+Guard 3 — v3+ row ids: `copyManifest` passes `manifest.firstRowId()` through (BaseRewriteManifests.java:154-167) into the writer (ManifestFiles.java:493, ManifestWriter.java:249). If row lineage were dropped, existing rows would silently get null `_row_id` — the pass-through (plus the `firstRowId` captured at read, ManifestFiles.java:469) preserves it, matching spec.md:941-949.
+
+## 3. Concurrent modification: rewriting manifests that another commit already changed/removed
+
+Under optimistic concurrency (spec.md:95-97), a concurrent commit could add, remove, or re-cluster the very manifests this rewrite read. Double-applying, or rewriting manifests no longer current, corrupts state.
+
+Guard 1 — rewrite-then-commit retry (SnapshotProducer.commit, SnapshotProducer.java:484-534): `apply()` is re-run on each retry (500) after `refresh()`. `performRewrite` calls `reset()` first (BaseRewriteManifests.java:240), which clears `keptManifests`, `rewrittenManifests`, `writers`, and deletes the uncommitted new manifests (231-237). So a stale rewrite is discarded and redone against the fresh base, not merged into it.
+
+Guard 2 — the "full rewrite" safety valve, `requiresRewrite` (BaseRewriteManifests.java:206-219): if `clusterByFunc` is set but any previously-processed manifest is no longer in the current manifest list (218), it forces a full rewrite instead of incrementally trusting stale results. This prevents applying a rewrite that assumed manifests that no longer exist.
+
+Guard 3 — deleted manifests must still exist: `validateDeletedManifests` (BaseRewriteManifests.java:286-298) throws `ValidationException` if a directly-deleted manifest is absent from the current snapshot (289-297). This is spec.md:1317's requirement that a replace operation verify the files it removes are still in the table — if a concurrent commit already removed it, the op fails rather than "deleting" a manifest that isn't there.
+
+Guard 4 — commit conflict handling, SnapshotProducer.java:496 `.onlyRetryOn(CommitFailedException.class)`: only genuine optimistic-lock failures retry; a missing manifest surfaces as `ValidationException` and aborts rather than silently retrying into a worse state.
+
+## 4. The same live file appearing twice (violates content-file uniqueness)
+
+The spec calls duplicate live entries undefined behavior (spec.md:680-682, 1071). A naive rewrite that re-clusters into a new manifest while leaving the old one live, or that merges manifests containing overlapping files, would create it.
+
+Guard — the rewrite *replaces* rather than *adds*: `apply` returns the new+kept manifests and omits the rewritten ones (BaseRewriteManifests.java:184-194) — the rewritten manifests go into `rewrittenManifests` and are dropped from the output list (190-192 only add `newManifestsWithMetadata` + `keptManifests`). Since each rewritten manifest's files move wholesale into a new manifest, the same live file never lives in two manifests of the new snapshot. `validateFilesCounts` (300-314) additionally guards the merge path where multiple rewritten manifests share content (if two source manifests contained the same file and both got clustered into the new set, counts would misfire). The `deleteManifest`/`addManifest` path is constrained by `requiresRewrite` (206-219), which only short-circuits (returns false) when there's nothing to rewrite or no prior work — else it rewrites.
+
+## 5. Rewriting delete manifests (would break delete scope)
+
+Delete manifests are tracked separately and scanned first (spec.md:664); rewriting them through a data-file path would corrupt delete semantics. Also, this op is data-only.
+
+Guard — `containsDeletes` (BaseRewriteManifests.java:278-280): any manifest whose content is `DELETES` is kept as-is and never re-clustered (252-253). The rewrite only ever reads data manifests (`ManifestFiles.read` on data content, BaseRewriteManifests.java:256-258; ManifestFiles.java:138-141 rejects delete content with a precondition).
+
+## 6. Resource leaks / orphaned files on failure (uncommitted manifests)
+
+If the rewrite writes new manifests but the commit fails, those files must not leak; after commit, the superseded ones must not linger.
+
+Guard 1 — cleanup on failure: `SnapshotProducer.commit` catches `RuntimeException` and calls `cleanAll` when not strict (SnapshotProducer.java:538-544), which propagates to the subclass `cleanUncommitted` (BaseRewriteManifests.java:345-351) → `deleteUncommitted` (SnapshotProducer.java:756-769), deleting the manifests this op created that weren't actually committed. `reset()` also deletes uncommitted rewritten manifests (BaseRewriteManifests.java:232).
+
+Guard 2 — writers always closed: `performRewrite` wraps the worker loop with a `finally` that closes every `WriterWrapper` (BaseRewriteManifests.java:273-275); `WriterWrapper.close` flushes and registers the manifest (375-384). Without this, a partially-written manifest would be orphaned and its incomplete files could be treated as live.
+
+Guard 3 — only-owned manifests cleaned: the comment at line 347-350 explains `addedManifests` (input manifests) are not deleted because they're shared/not owned by this op, while `rewrittenAddedManifests` (copies made by this op) are cleaned — a precise ownership distinction to avoid deleting a manifest another writer still references.
+
+## 7. Worker-thread race on shared, mutable collections
+
+The rewrite runs on a worker pool (BaseRewriteManifests.java:248-249, Tasks.foreach with `workerPool()`); several manifests are read and entries appended concurrently. Using non-thread-safe collections here is a classic data race / lost-update bug.
+
+Guard — thread-safe state, BaseRewriteManifests.java:59-64: `keptManifests` and `newManifests` are `ConcurrentLinkedQueue`, `rewrittenManifests` is `ConcurrentSkipListSet`-backed (`Sets.newConcurrentHashSet`), and per-cluster writers are held in `Maps.newConcurrentMap`. `WriterWrapper.addEntry` is `synchronized` and handles the per-writer size rollover (357-374), so only one task appends to a given writer at a time. `entryCount` is an `AtomicLong` (64). This is exactly the "container reuse causes bugs in parallel code" concern called out in AGENTS.md / high-sensitivity areas for the manifest path.
+
+## Net picture
+
+The guards are concentric: status correctness + explicit-id enforcement (fails fast on a bad entry), file-count balance (catches any data mutation), current-manifest validation + commit retry (handles concurrency), thread-safe accumulation (handles parallelism), and ownership-aware cleanup (handles failure). Each maps to a spec invariant: unchanged data (972), explicit EXISTING lineage (706/935), inherited-but-immutable metadata (105, 935), validated replace on retry (1317), content-file uniqueness (680-682), delete-manifest separation (664), and inherited v3 row ids (941-949).

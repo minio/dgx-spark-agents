@@ -1,0 +1,68 @@
+Based on the full DV code I read (`BaseDVFileWriter`, `DVFileWriter`, `PositionDeleteIndex`, `BitmapPositionDeleteIndex`, `RoaringPositionBitmap`, `Blob`, `ContentFileUtil.isFileScoped`), here are the failure modes and edge cases, grouped by where they can bite, with the guards and the honest list of what isn't guarded.
+
+## A. Position-value validity
+
+1. Negative or out-of-range positions. A bogus position (negative, or past `MAX_POSITION`) would corrupt the bitmap or index an invalid array slot.
+   Guard: `validatePosition` rejects `pos < 0 || pos > MAX_POSITION` with `IllegalArgumentException` on every entry point — `set` (RoaringPositionBitmap.java:75, 421-427), `setRange` (101-102), and `contains` (144). `MAX_POSITION` is defined at RoaringPositionBitmap.java:54.
+
+2. The key-`Integer.MAX_VALUE` overflow hazard. Splitting a 64-bit position into a key means the internal `RoaringBitmap[]` would need `key+1` slots; a key of `Integer.MAX_VALUE` would need `Integer.MAX_VALUE+1` entries and overflow a signed `int`.
+   Guard: `MAX_POSITION` deliberately caps the key at `Integer.MAX_VALUE - 1` (RoaringPositionBitmap.java:46-50, 54), so `key + 1` never overflows (`set`, 78; `setRange`, 106). `deserialize` also refuses keys `> Integer.MAX_VALUE - 1` on read (RoaringPositionBitmap.java:342). So valid positions are a proper subset of positive 64-bit values, not the full range.
+
+## B. Merging / one-DV-per-file correctness
+
+3. Doubling up positions from new + previous deletes. Repeated or concurrent deletes could double-count or leave more than one DV per file, breaking the spec's at-most-one-DV rule (spec.md:1366, 1387).
+   Guard: state is keyed by data-file path in one map, so each path yields exactly one `Deletes`/DV (BaseDVFileWriter.java:62, 90-91, 156-159). On close, previous deletes are loaded and merged into the same vector via `positions.merge(previousPositions)` (BaseDVFileWriter.java:137-139); the union is a set, so a position deleted twice is stored once. `BitmapPositionDeleteIndex.merge` does the actual OR (`bitmap.setAll`, BitmapPositionDeleteIndex.java:61-64).
+
+4. Merging an index that can't be unioned. Some `PositionDeleteIndex` implementations track richer delete-file state; the spec's default merge refuses to silently drop it.
+   Guard: `PositionDeleteIndex.merge`'s default throws `UnsupportedOperationException` if the other index carries `deleteFiles` (PositionDeleteIndex.java:49-54). `BitmapPositionDeleteIndex.merge` handles the in-memory case and propagates delete files (BitmapPositionDeleteIndex.java:77-84).
+
+5. Silent loss of the previous delete files that were folded in. When the new DV absorbs older position delete files, those older files must be marked for rewrite/removal from table state, or they'd be double-applied at read time.
+   Guard: `close()` collects the superseded files into `rewrittenDeleteFiles`, but only for DVs and file-scoped deletes (`ContentFileUtil.isFileScoped` = has `referenced_data_file`, ContentFileUtil.java:138-140; BaseDVFileWriter.java:141-144). This mirrors the spec's rule that only file-scoped position deletes/vectors can be discarded once merged (spec.md:1956).
+
+## C. Serialization / deserialization integrity (data corruption)
+
+6. Bitmap/cardinality/length mismatch after reading a vector from disk. A corrupt or truncated blob could silently produce wrong deletes (or apply them to the wrong rows).
+   Guard: `deserialize` validates four independent checks:
+   - CRC-32 over the bitmap data (BitmapPositionDeleteIndex.java:155-163, 224-228)
+   - magic number (207-211)
+   - stored bitmap-data length vs `deleteFile.contentSizeInBytes() - 8` (191-200)
+   - bitmap cardinality vs `deleteFile.recordCount()` (213-219)
+   Any mismatch throws with a descriptive message.
+
+7. Malformed header on read — bad bitmap count, out-of-range/unsorted keys.
+   Guard: `readBitmapCount` bounds the count to `[0, Integer.MAX_VALUE]` (RoaringPositionBitmap.java:330-337); `readKey` rejects negative keys, keys above `Integer.MAX_VALUE - 1`, and non-ascending sequences (339-345).
+
+8. Wrong byte order. Roaring's portable format is little-endian; writing/reading big-endian would garble the bitmap.
+   Guard: `validateByteOrder` throws unless the buffer is `LITTLE_ENDIAN` on both serialize and deserialize (RoaringPositionBitmap.java:282-283, 324-328); the writer explicitly sets little-endian before writing (BitmapPositionDeleteIndex.java:186).
+
+## D. Size and resource limits
+
+9. Serialized index exceeding 2 GB. The length prefix is a 4-byte int, so a bitmap larger than ~2 GB can't be represented.
+   Guard: `computeBitmapDataLength` asserts the buffer size is `<= Integer.MAX_VALUE` and throws `IllegalStateException` otherwise (BitmapPositionDeleteIndex.java:168-173).
+
+10. Resource/allocation blow-up from a single huge position (NOT guarded). `validatePosition` caps the key at `Integer.MAX_VALUE - 1`, but `allocateBitmapsIfNeeded` (RoaringPositionBitmap.java:237-250) will then try to allocate an array of ~2 billion `RoaringBitmap` references (~16 GB) to reach it. So a spurious delete at a position near `MAX_POSITION` can OOM before any data is written. The range cap prevents the integer overflow but not the allocation. There is no guard against this. Worth flagging honestly — it's a plausible hardening gap (and a DoS vector for untrusted delete positions).
+
+## E. Lifecycle / API misuse
+
+11. Calling `result()` on an unclosed writer.
+    Guard: `Preconditions.checkState(result != null, ...)` throws (BaseDVFileWriter.java:108-111); `result` is only set after `close`.
+
+12. Leaking the Puffin file if writing fails mid-close.
+    Guard: the `PuffinWriter` is wrapped in try-with-resources so it's closed even on an exception (BaseDVFileWriter.java:133).
+
+13. Writing DVs even when there are no deletes.
+    Guard: `close()` short-circuits and returns an empty `DeleteWriteResult` when `deletesByPath` is empty (BaseDVFileWriter.java:121-124), avoiding a throwaway empty Puffin file.
+
+## F. Not guarded / deferred (by design)
+
+14. Position validity within the referenced data file. The writer has no knowledge of the target data file's `record_count`, so it cannot (and does not) verify that a deleted position actually exists in that file. A delete beyond the file's row count is silently accepted. That check is the reader's responsibility at scan time; the spec's scope rules (spec.md:1075-1078) don't include row-count validation.
+
+15. Snapshot ID / sequence-number inheritance. `toBlob` passes `-1` for both with the explicit note "inherited" (BaseDVFileWriter.java:203-204). If a consumer erroneously persists `-1` instead of replacing it with the commit's sequence number, the vector's relative age is wrong. The writer intentionally defers this (no guard needed per spec.md:932-937), but it's a downstream correctness assumption.
+
+16. Path-canonicalization of the referenced data file. DVs are matched to data files by the `file_path` string (spec.md:1076). The writer keys on whatever path string it's given and stores it verbatim (BaseDVFileWriter.java:91, 207-209); if the same physical file is referenced under two different path spellings, they'd be treated as distinct files (two DVs) — no normalization guard here.
+
+17. Same path registered with two different partitions. `computeIfAbsent` keeps the first `Deletes` (spec, partition) seen for a path and silently ignores subsequent mismatched calls (BaseDVFileWriter.java:90-91). Under normal operation a data file lives in one partition, but there's no assertion that a repeated path carries a consistent spec/partition.
+
+## Summary
+
+The code guards hard on the mechanical risks — position range/overflow, merge dedup, one-vector-per-file, and thorough CRC/format validation on read — and defers by design the semantic risks (snapshot/sequence identity, DV-application scope, position-within-file validity) to the reader and commit layers, matching the spec's split between write-time guarantees and scan-time application (spec.md:1073-1091). The notable real gap is #10: a large but technically-valid position can trigger an OOM-class allocation, which is not defended.

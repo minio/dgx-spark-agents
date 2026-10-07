@@ -1,0 +1,70 @@
+I've read SnapshotUtil.java in full (490 lines) and traced the code it calls for time travel. Here's how the implementation follows the spec.
+
+## The core time-travel lookup
+
+The spec (spec.md:2075-2080) mandates that point-in-time reads use the **snapshot-log** — not parent lineage — to find the table state at a timestamp, picking the last snapshot **prior to** the target and preferring it over any other history. SnapshotUtil implements exactly that.
+
+**`SnapshotUtil.snapshotIdAsOfTime`** (SnapshotUtil.java:314-323) wraps a nullable variant and throws on "not found":
+
+```
+Preconditions.checkArgument(snapshotId != null,
+    "Cannot find a snapshot older than %s", ...);
+```
+
+**`nullableSnapshotIdAsOfTime`** (SnapshotUtil.java:325-337) is the heart of it:
+
+```
+Long snapshotId = null;
+long bestTimestamp = Long.MIN_VALUE;
+for (HistoryEntry logEntry : table.history()) {          // line 328
+  if (logEntry.timestampMillis() <= timestampMillis
+      && logEntry.timestampMillis() > bestTimestamp) {   // lines 329-330
+    snapshotId = logEntry.snapshotId();
+    bestTimestamp = logEntry.timestampMillis();
+  }
+}
+return snapshotId;
+```
+
+Three spec requirements are visible here:
+
+1. **Uses `table.history()`, the snapshot-log** (line 328), exactly as the spec's "use snapshot-log metadata" directive requires — not the `parent-snapshot-id` lineage.
+2. **"Most recent snapshot at or before T"**: the `<=` on timestamp (line 329) matches the spec's "as of the given timestamp, just prior to it," and the `> bestTimestamp` (line 330) picks the *last* such entry, so the most recent state at or before T wins, not the earliest.
+3. **Informative error on miss** (lines 317-320): "Cannot find a snapshot older than ...", mirroring the spec's requirement to "raise an informative error message about the missing metadata."
+
+## Where the snapshot-log comes from
+
+`table.history()` isn't the lineage — it's the log. Following the chain:
+
+- **`BaseTable.history()`** (BaseTable.java:179-181) returns `ops.current().snapshotLog()`.
+- **`TableMetadata.snapshotLog()`** (TableMetadata.java:578-580) returns the `snapshotLog` field, a `List<HistoryEntry>` (TableMetadata.java:264), serialized as the JSON `snapshot-log` field from the spec (spec.md:1163).
+- Entries are `SnapshotLogEntry` (TableMetadata.java:158-165), each a `(timestampMillis, snapshotId)` pair — precisely the spec's "(timestamp and snapshot ID) pairs that encodes changes to the current snapshot" (spec.md:1163).
+
+**The log records *current-state* transitions, not every write.** In **`TableMetadata.Builder.setRef`** (TableMetadata.java:1320-1345), an entry is appended only when the ref being set is the **main branch** (line 1335 `SnapshotRef.MAIN_BRANCH.equals(name)`), and:
+
+```
+long timeOfChange =
+    isAddedSnapshot(snapshotId) ? snapshot.timestampMillis() : this.lastUpdatedMillis;
+snapshotLog.add(new SnapshotLogEntry(timeOfChange, ref.snapshotId()));   // 1344
+```
+
+This is the spec's exact divergence warning in action (spec.md:2077-2078): a *rollback* — resetting `current-snapshot-id` to an arbitrary prior snapshot — logs the time as `lastUpdatedMillis` (the change time, `!isAddedSnapshot`), not the snapshot's original creation time. So if you rewind the table to an old snapshot, the snapshot-log correctly shows *that* as a new "current state" at *now*, while the parent lineage in `snapshots` still shows the original chain. The two histories can name different snapshot IDs for a given timestamp, and the implementation resolves it by reading the log — exactly as the spec directs.
+
+## Time travel to a snapshot, then to its schema
+
+Once a snapshot ID is found, reads use the snapshot's own metadata (its `manifest-list`), which is the same O(1) path as a normal read — matching the spec's discussion that time travel reuses the immutable snapshot/manifest design rather than reconstructing state.
+
+**`SnapshotUtil.schemaFor`** (SnapshotUtil.java:349-367) shows how the *schema at that time* is recovered:
+
+- Snapshot-specific schema is looked up via `snapshot.schemaId()` → `table.schemas().get(schemaId)` (lines 356-362), i.e. the `schema-id` stored on the snapshot (spec.md:964), falling back to `table.schema()` when `schemaId` is null (snapshots written before the field existed, line 366).
+- The `schemaFor(table, snapshotId, timestampMillis)` overload (lines 380-394) forbids passing both (line 381-383) and converts a timestamp to a snapshot via `snapshotIdAsOfTime` (line 390).
+
+## Matching the spec's error contract
+
+The spec warns no snapshot may exist at/before the requested time (either the table has no such snapshot or the snapshot-log is unpopulated because it's optional). SnapshotUtil honors this on both the log side (`snapshotIdAsOfTime` throwing at lines 317-320) and the snapshot side (`schemaFor` throwing "Cannot find snapshot with ID %s" at line 355), rather than silently guessing.
+
+## One deviation worth noting
+
+The oldest-ancestor helpers in this file operate on the **lineage** (`parentId` chains: `ancestorsOf` at SnapshotUtil.java:225-271, `parentId()` walk at lines 243-248). These are used for operations like retention and `snapshotAfter`, not for SQL `AS OF` reads — the spec's lineage is the *other* of the two histories (spec.md:2077). So SnapshotUtil contains both histories, but the actual time-travel entry point (`snapshotIdAsOfTime`) consistently uses only the snapshot-log, per the spec.
+
+In short: the implementation is a faithful, direct transcription of spec.md:2075-2080 — pick the most recent snapshot-log entry with `timestamp <= T` under the main-branch history, surface an informative error when none exists, and drive the scan from that snapshot's immutable metadata with its own schema.

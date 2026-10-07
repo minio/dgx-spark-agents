@@ -1,0 +1,18 @@
+{
+ "label": "nomemkv",
+ "wall_s": 124.3,
+ "server": {
+  "prompt_tokens_total": 1012667.0,
+  "generation_tokens_total": 3109.0,
+  "prefix_cache_hits_total": 905984.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 63.5,
+  "time_to_first_token_seconds_count": 10.0,
+  "request_prefill_time_seconds_sum": 61.8,
+  "request_decode_time_seconds_sum": 58.0
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "which is why they can't be applied with the data sequence equality rule.\n\n## What compaction does with them\n\nCompaction (`RewriteDataFiles`) rewrites the *data* files, not deletes. Concretely:\n\n1. It plans a scan and groups tasks by partition, keeping only partitions with more than one data file; nothing to rewrite otherwise (`BaseRewriteDataFilesAction.execute`, core/.../actions/BaseRewriteDataFilesAction.java:246-256). Only reads data files, so `.ignoreResiduals()` on the scan (line 233) \u2014 the delete-filtering happened before this.\n2. `rewriteDataForTasks` (line 276) reads the old files (applying whatever deletes apply to them) and writes new compacted data files containing only the live rows \u2014 the commas of deleted rows are dropped.\n3. It commits with `table.newRewrite()`: marks the old data files deleted and adds the new ones \u2014 `rewriteFiles.deleteFile(dataFile)` / `addFile(dataFile)` (BaseRewriteDataFilesAction.java:331-346).\n\nWhat compaction does *not* do by default: it does **not** carry delete files into the rewritten snapshot. It only swaps data files (BaseRewriteDataFilesAction.java:333-339). After compaction, the rewritten data files already have the deletes baked out as physical row removal, and the delete files are left tracked but applying to superseded/expired data files; they get cleaned up later \u2014 position deletes by `RewritePositionDeletesCommitManager`/`RemoveDanglingDeleteFilesAction`, and orphaned delete files by `RemoveDanglingDeleteFilesAction`. Since deletes only apply to older data files in the same partition (spec.md:1088), a delete whose target data file has been compacted away no longer matches anything.\n\nCompaction has one subtle correctness lever worth calling out: `useStartingSequenceNumber`. By default the rew shuffled files get the new snapshot's sequence number, which would make them *newer* than newer equality deletes and thus incorrectly escape them. To preserve correct delete semantics, compaction can instead stamp rewritten files with the sequence number of the snapshot at compaction start, `rewriteFiles.dataSequenceNumber(sequenceNumber)` (BaseRewriteDataFilesAction.java:341-344), so the rewritten files keep their data age and don't mask newer equality deletes. The javadoc explains this is \"to avoid commit conflicts with updates that add newer equality deletes\" (BaseRewriteDataFilesAction.java:204-208).\n\n### Summary of citations\n\n- Delete formats & types: spec.md:109-119, 1356-1373\n- Position delete file encoding: spec.md:1391-1416\n- Equality delete definition: spec.md:1418-1426; set-based application in Deletes.java:61-70, 119-128\n- Deletion vectors: spec.md:1375-1389; bitmap index in Deletes.java:130-166\n- Version gating (v2 adds deletes, v3 adds DVs, v4 bans equality): spec.md:33-67, 1358, 1946-1956, 1921-1925\n- Reader apply rules (seq-number/partition scope): spec.md:1073-1092\n- Compaction rewrites data only: BaseRewriteDataFilesAction.java:228-235, 276-284, 331-346; sequence-number preservation 341-344\n",
+ "stderr": ""
+}

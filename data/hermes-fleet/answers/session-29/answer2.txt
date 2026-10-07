@@ -1,0 +1,40 @@
+I've read StandardEncryptionManager.java in full and traced the code it calls. Here's how the implementation maps to the spec.
+
+## The spec's surface (from part 1)
+
+The spec standardized five things: `encryption-keys` in table metadata (each with `key-id`, `encrypted-key-metadata`, `encrypted-by-id`, `properties`), `key-id` on snapshots (the key encrypting the manifest list), `key_metadata` on manifest-list `manifest_file` entries, `key_metadata` on `data_file` entries in manifests, and `key-metadata` on table statistics — deliberately leaving the cipher/KMS scheme to the implementation.
+
+## How the implementation follows the spec
+
+The four spec fields map 1:1 onto model classes:
+
+- `EncryptedKeyParser.java:36-39` defines the JSON keys `key-id`, `encrypted-key-metadata`, `encrypted-by-id`, `properties` — exactly the four spec fields (spec, Encryption Keys table). `toJson`/`fromJson` are custom parsers (no Jackson annotations, kebab-case keys, optional fields only when present), matching the project's serialization conventions.
+- `BaseEncryptedKey.java:27-61` is an `EncryptedKey` holding `keyId` (key-id), `keyMetadata` (encrypted-key-metadata, base64 decoded), `encryptedById` (encrypted-by-id, nullable), and `properties` (nullable map) — `EncryptedKeyParser.java:70-83` builds it from JSON.
+
+**Envelope encryption, per the spec's delegate-to-KMS design.** All raw key material stays inside the KMS client:
+- `EncryptionUtil.java:47-99` builds a `KeyManagementClient` by type (`aws`, `azure`, `gcp`) or impl class via reflection — the pluggable KMS boundary the spec assumes. `KeyManagementClient.java:38,73` define `wrapKey`/`unwrapKey` against a `wrappingKeyId`; the Javadoc (lines 30-37) explicitly says wrapping = encrypt the secret key with a KMS-held master key, which is exactly the "envelope encryption" ledger the spec sketches.
+- `EncryptionUtil.java:101-123` decides encryption at table level purely from the table property `encryption.key-id` (`TableProperties.java:459`); if absent, returns a `PlaintextEncryptionManager`. If present, it constructs `StandardEncryptionManager` with the table's key id, data key length (`encryption.data-key-length`, default 16, `TableProperties.java:461-462`), and KMS client.
+
+**Write path — the manifest list / snapshot `key-id`.** This is the clearest mapping to the spec's "the key that encrypts the manifest list key metadata":
+- `ManifestListWriter.java:42-58`: with a `StandardEncryptionManager`, it encrypts the manifest-list output file and keeps the `NativeEncryptionKeyMetadata`.
+- `ManifestListWriter.java:100-111`: on close, calls `standardEncryptionManager.registerKeyMetadata(...)`, which returns a `FileEncryptionKeys` (a file key plus the key-encryption-key that wraps it).
+- `StandardEncryptionManager.registerKeyMetadata` (`StandardEncryptionManager.java:204-218`): generates a fresh file key id, calls `keyEncryptionKeyID()` to pick/rotate a KEK, and encrypts the manifest-list key metadata with that KEK — returning both keys.
+- `StandardEncryptionManager.java:220-224`: `generateKeyId()` makes a 16-byte random id, base64-encoded — this becomes the spec's `key-id` string.
+- `SnapshotProducer.java:359,372`: stores `manifestListEncryptionKeys.fileKey().keyId()` as the snapshot's key id — i.e. the spec's snapshot `key-id`.
+- `SnapshotParser.java:56,110,177`: serializes that as JSON `key-id`, and reads it back.
+- `SnapshotProducer.java:507-510`: registers both the file key and its KEK into the table metadata via `update.addEncryptionKey(...)`.
+- `TableMetadata.java:1507-1519` (`addEncryptionKey`) feeds table metadata's `encryption-keys` list (updating via `MetadataUpdate.AddEncryptionKey`).
+
+**The spec's `key_metadata` on `data_file` entries.** `StandardEncryptedOutputFile.keyMetadata()` (`StandardEncryptionManager.java:262-275`) generates a per-file data encryption key (DEK) and a 16-byte AAD prefix, wrapped in `StandardKeyMetadata`. That same manager encrypts the actual file through `AesGcmOutputFile` (`StandardEncryptionManager.java:277-288`). The per-file key metadata is persisted to the manifest entry (`ManifestWriter.java:227-263`, `BaseFile.java:535-536` expose `keyMetadata()`, and `V3Metadata.java:144,253,483` wire the Avro `key_metadata` field). Note `ManifestWriter.keyMetadataBuffer()` (`ManifestWriter.java:252-257`): for whole-file AES-GCM it embeds the file length (needed for GCM truncation protection), while formats with native encryption (Parquet) handle length natively — so the implementation actually supports both whole-file (iceberg AES-GCM) and in-format (Parquet column) encryption through this one manager.
+
+**Read path — decrypting per spec's key resolution.** On read, the scan gathers each file's `key_metadata` and passes them to the encryption manager in one batch to minimize KMS round-trips (`InputFilesDecryptor.java:36-58`). `StandardEncryptionManager.decrypt` (`StandardEncryptionManager.java:94-107`) wraps them in `StandardDecryptedInputFile`, which parses `StandardKeyMetadata` (`StandardEncryptionManager.java:310-317`) and decrypts via `AesGcmInputFile`. Unwrapping is `kmsClient.unwrapKey(encryptedKeyMetadata, tableKeyId)` (`StandardEncryptionManager.java:109-121` — the `tableKeyId` is `encryption.key-id`).
+
+**Key rotation is delegated to the KMS too.** `keyEncryptionKeyID()` (`StandardEncryptionManager.java:135-160`) finds an unexpired KEK (730-day max lifespan per NIST SP 800-57, line 42) among the table's `encryption-keys` (each a `BaseEncryptedKey` whose `properties` holds `KEY_TIMESTAMP`, line 43), and rotates by wrapping a fresh key with the KMS. It touches only table metadata.
+
+## Consistency with the spec's design intent
+
+Everything the spec deliberately left open is implemented outside the format spec's data model: the cipher (AES-GCM, in `AesGcm*`/`Ciphers`), key length, AAD handling, and KMS wiring (`KeyManagementClient`, catalog properties in `EncryptionUtil.java:47-99`). The spec's four fields (`key-id`, `encrypted-key-metadata`, `encrypted-by-id`, `properties`; snapshot `key-id`; per-file `key_metadata`) are exactly what Iceberg's code persists — the implementation stores key *references* and opaque *metadata*, never raw key material, and resolves keys through the KMS at read time, matching the envelope-encryption, provider-specific scheme the spec describes (v3 feature per `V3Metadata`; the `EncryptionUtil.checkCompatibility` gate at `EncryptionUtil.java:205-217` rejects encryption properties before v3, honoring the v3-only availability).
+
+One nuance worth flagging: the spec's `encryption-keys` struct lists `encrypted-by-id` and `properties` as *optional*, and this code honors that (`BaseEncryptedKey` allows null `encryptedById` and `properties`; `EncryptedKeyParser.java:57-61` writes them only when present) — but the implementation enumerates the KEK by matching `key.encryptedById().equals(tableKeyId)` (`StandardEncryptionManager.java:139`) and reads `KEY_TIMESTAMP` from properties, so in practice the keys it writes always populate these. That's consistent with the spec's "the format of encrypted key metadata is determined by the table's encryption scheme" note — the scheme here requires those fields.
+
+I could not spot anything where the code contradicts the spec; it's a faithful, KMS-delegated realization of the spec's minimal ledger.

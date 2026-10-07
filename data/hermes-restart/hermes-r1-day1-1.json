@@ -1,0 +1,18 @@
+{
+ "label": "day1-1",
+ "wall_s": 66.3,
+ "server": {
+  "prompt_tokens_total": 157397.0,
+  "generation_tokens_total": 1826.0,
+  "prefix_cache_hits_total": 92416.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 29.2,
+  "time_to_first_token_seconds_count": 5.0,
+  "request_prefill_time_seconds_sum": 28.6,
+  "request_decode_time_seconds_sum": 34.5
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "status` (ADDED/EXISTING/DELETED), `snapshot_id`, `sequence_number`/`file_sequence_number` (inherited from the manifest list when null), and the nested `data_file` struct.\n\nThe `data_file` struct is the payload: `content`, `file_path`, `file_format`, the `partition` tuple, `record_count`, `file_size_in_bytes`, and column **metrics** \u2014 `value_counts`, `null_value_counts`, `nan_value_counts`, `lower_bounds`, `upper_bounds`, `split_offsets`, `sort_order_id`.\n\nA manifest is written under a single partition spec (its schema is derived from that spec), so a spec can be reused across snapshots \u2014 only the manifest list is rewritten on each commit. When the partition spec evolves, new files go in a new manifest. The same physical manifest files are shared by many snapshots; entries marked DELETED let a file \"disappear\" from a snapshot without rewriting the manifest.\n\n### 4. Data files (Parquet/ORC/Avro)\nThe actual rows, written once and immutable. Iceberg tracks *individual files*, not directories, so it never needs directory listing or rename for writes.\n\n(Delete files, in v2+, live in their own manifolds: position deletes by file+row position, equality deletes by column value, and in v3 deletion vectors as Puffin blobs \u2014 each scoped to a data file by sequence number and partition.)\n\n## How a reader finds the data files for a query\n\n1. **Load table metadata** \u2014 the catalog hands the reader the current metadata file location. It reads `current-snapshot-id` (or a tag/branch for time travel).\n2. **Open the snapshot's manifest list** \u2014 one file. The reader now knows every manifest and, from the `field_summary` partition bounds and file counts, can drop manifests that can't satisfy the query without reading them.\n3. **Manifest-level pruning** \u2014 for each surviving manifest, convert the scan predicate (filter on data values, e.g. `ts > X`) into a **partition predicate** using that manifest's partition spec (e.g. `ts_day >= day(X)`). This is an *inclusive* projection \u2014 it may over-match a file, never under-match. Manifests whose partition summaries fall outside get skipped.\n4. **File-level pruning inside a manifest** \u2014 for each remaining file entry, use its stored column metrics (`lower_bounds`/`upper_bounds`, counts) to drop data files that can't contain matching rows, again using the spec the manifest was written with, regardless of the current spec.\n5. **Apply deletes** \u2014 delete files/vectors matching the filter that are older-and-same-partition (by data sequence number) are applied to the surviving files.\n6. **Read** \u2014 the surviving data files are opened; column projection happens by **field ID** (not name), so files written under any historical schema still map correctly to the current one.\n\nThe isolation guarantee falls out of the design: because a reader fixes a snapshot at step 1 and reads only the files reachable from that snapshot's manifest list, concurrent writers can't disturb an in-flight read \u2014 the reader simply sees the table as of that snapshot.\n",
+ "stderr": ""
+}

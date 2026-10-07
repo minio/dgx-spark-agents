@@ -1,0 +1,51 @@
+I have enough to explain the full path. Here's how query engines use table metadata files, traced through this repo's Spark and Flink integrations.
+
+## The one entry point: everything hangs off the loaded TableMetadata
+
+Every `Table` in the codebase is a `BaseTable` backed by a `TableOperations` (`ops`), whose `ops.current()` returns the parsed `TableMetadata` (the object `TableMetadataParser.fromJson` builds). Every accessor the engines call is a thin pass-through to that in-memory metadata. In BaseTable.java:124-181:
+
+- schema: :124-131 (`ops.current().schema()`, `schemasById()`)
+- partitioning/specs: :134-141
+- sort order: :144-151
+- properties: :154-156
+- location: :159-161
+- **snapshots**: `currentSnapshot()` :164-166, `snapshot(long)` :169-171, `snapshots()` :174-176 — these read the `snapshots`/`current-snapshot-id` from the metadata file (spec: snapshots embedded in the metadata JSON)
+- history (snapshot-log, used for time travel): :179-181
+- `refresh()` :97-99 → `ops.refresh()`, which re-reads the metadata file to pick up new commits (spec: readers "refresh and pick up a new metadata location")
+
+## Spark: the table object pins a snapshot from the metadata
+
+`SparkTable` (spark/v4.1/.../source/SparkTable.java) materializes the metadata state directly at construction. The class Javadoc states the contract explicitly: "the table state (e.g. schema, snapshot) is pinned upon loading and must not change" (:80).
+
+- The snapshot to read is chosen from the metadata: `determineLatestSnapshot` (:390-396) uses `table.refs()`+`SnapshotUtil.latestSnapshot` for a branch, else `table.currentSnapshot()` — i.e. it reads `refs` and `current-snapshot-id` from the metadata file.
+- `id()` returns the table UUID from metadata via `Spark3Util.baseTableUUID(table())` (:146-149).
+- `version()` (:152-154) encodes `branch` + `snapshotId` into Spark's table version string.
+- `newScanBuilder` (:180-183) hands `schema`, `snapshot`, `branch`, `timeTravel` to the scan builder — all values derived from the pinned metadata.
+- Branch validation for reads: `SparkTable.create` :316-322 requires the branch to exist (`table.snapshot(branch) != null`), i.e. the branch must be in metadata `refs`.
+
+BaseSparkTable.java turns metadata state into Spark-manifested properties: `properties()` (:129-161) exposes `location`, `current-snapshot-id` (:185-188 reads `table.currentSnapshot()`), `format-version` (pulled from `ops.current().formatVersion()` at :142-145), `sort-order`, and `identifier-fields`; `metadataColumns()` (:164-179) adds `_file`, `_pos`, `_partition`, `_spec_id`, `_deleted` (and row-lineage cols when `TableUtil.supportsRowLineage(table)`).
+
+## The actual read: planning files from the pinned snapshot
+
+`SparkScanBuilder` builds the Iceberg scan and pins it to the same snapshot (SparkScanBuilder.java):
+
+- Constructor carries the snapshot :104-127; `buildIcebergBatchScan` (:340-370) calls `scan.useSnapshot(snapshot.snapshotId())` when `shouldPinSnapshot()` (:353-355) so the scan reads exactly the metadata-selected snapshot, then enforces consistency: :357-361 checks the resolved scan snapshot equals the pinned one, else fails ("Failed to enforce scan consistency").
+- The engine ultimately calls `scan.planFiles()` (:163, :306), which walks metadata → manifest-list → manifests → files (the O(1)-planning design of the spec).
+
+## Flink: batch and streaming both start from metadata snapshots
+
+- `IcebergTableSource` (flink/v1.20/.../source/IcebergTableSource.java) is the Flink `ScanTableSource`; it builds the source from a `TableLoader` (:69, :124-148) and delegates planning to `FlinkSplitPlanner`.
+- `FlinkSplitPlanner.planTasks` (FlinkSplitPlanner.java:84-138) resolves the target snapshot *from the metadata*: `table.snapshot(context.startTag())` for tags (:91-97, :105-110), `table.currentSnapshot()` for the default, and `useSnapshot`/`useRef`/`asOfTime` for snapshot/tag/branch/time-travel (:124-134). All of these are `ops.current()` reads.
+- The streaming path actively *watches* the metadata file for new commits. In `StreamingMonitorFunction` (StreamingMonitorFunction.java:126-155) the running monitor reads `table.currentSnapshot()` each cycle (:148), resolves start-snapshot / tags from metadata, checks the start snapshot is an ancestor of the current one via `SnapshotUtil.isAncestorOf(table, ...)` (:149-152), and `monitorAndForwardSplits()` re-plans subsequent snapshots — exactly the spec's model of readers refreshing to pick up a new metadata location, while `table.snapshot(branch)` and ancestor checks read the metadata `refs`/`parent-snapshot-id` lineage.
+
+## How this maps to the spec
+
+The chain the engines rely on is precisely the spec's three-tier metadata tree:
+
+1. Load metadata file once (TableMetadataParser) → the in-memory `TableMetadata` (schema, specs, sort orders, properties, **and all snapshots + refs embedded in it**).
+2. Choose a snapshot: `current-snapshot-id` / `refs` (branches/tags) / `snapshot-log` (time travel) — all fields of the metadata file.
+3. Hand the snapshot to a scan, which pins it and plans files by following snapshot → manifest-list → manifests (spec: snapshots point at a manifest list; planning is O(1)).
+
+Whenever a query says `SELECT` against the "current" state, the engine is reading `currentSnapshot()` out of `ops.current()` — the snapshot that points into the metadata's manifest-list field. Time travel, branch/tag reads, streaming's poll-for-new-commits, row-level deletes, and metadata columns all trace back to the same loaded metadata object.
+
+One scope note: I traced the Spark + Flink call sites that consume metadata state and delegated planning. I didn't follow the deeper `SnapshotParser`/`ManifestList`/`ManifestReader` file-planning internals this turn — but the engine-facing contract (pin a snapshot from metadata, then plan through it) is the part relevant to how query engines use these files.

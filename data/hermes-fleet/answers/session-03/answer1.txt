@@ -1,0 +1,29 @@
+I read format/spec.md in full (2,153 lines, four chunks). Here's what it says about snapshot expiration and the reasoning behind it.
+
+## What the spec says
+
+**Purpose (line 1120):** "Table snapshots expire and are removed from metadata to allow removed or replaced data files to be physically deleted." Expiration is how Iceberg reconciles its immutable-files design with storage reclamation — old data files can only be deleted from the file system once the last snapshot that references them is gone.
+
+**Core invariant (lines 1162, 1190):** The `snapshots` list holds only "valid" snapshots — those for which all data files still exist. "A data file must not be deleted from the file system until the last snapshot in which it was listed is garbage collected." So expiration of a snapshot is what legally authorizes physically deleting its now-orphaned files.
+
+**Manifest-entry tracking (lines 692, 701-711):** Each manifest entry has a `status` (EXISTING/ADDED/DELETED) and a `snapshot_id`. When a file is removed from the dataset, its entry is marked DELETED and records the snapshot in which it was deleted. The file can then be physically deleted once that deleting snapshot (and all older ones) are expired — note 1 explains this design choice: it's easier to track "files deleted in snapshot S" and delete them when S expires than to diff multiple snapshots to find when a file last appeared live.
+
+**The expiry procedure — Snapshot Retention Policy (lines 1118-1133):** This is the algorithm. Start with an empty retain-set; (1) remove any ref other than `main` whose referenced snapshot is older than `max-ref-age-ms`; (2) for each branch and tag, add its referenced snapshot to the retain-set; (3) for each branch, keep adding ancestors until a snapshot is both older than `max-snapshot-age-ms` AND beyond the first `min-snapshots-to-keep` in the branch (counting the branch's head); (4) expire every snapshot not in the retain-set.
+
+**Retention configuration (Snapshot References, lines 1100-1116):** Retention is per-reference and per-table. A reference object carries `min-snapshots-to-keep`, `max-snapshot-age-ms`, and `max-ref-age-ms`, each defaulting to the corresponding table property (`history.expire.*`). `min-snapshots-to-keep` and `max-snapshot-age-ms` apply only to branches; `max-ref-age-ms` applies to non-main refs and its default keeps the `main` branch from ever expiring. The snapshot's `operation` summary (lines 969-975) lets expiration skip snapshots it shouldn't process.
+
+**Metadata cleanup (lines 1163, 1191):** Expiring snapshots also prunes the `snapshot-log` — "all entries before a snapshot that has expired should be removed" — so time-travel lookups against the snapshot log never resolve to a snapshot that no longer exists.
+
+## Why it's designed this way
+
+**It's a direct consequence of immutability + copy-on-write.** Iceberg never rewrites data in place; every commit creates new files and a new metadata snapshot that add/remove references. Files therefore outlive the snapshot that created them. Something has to decide when a file is truly unreachable across all retained snapshots — and the snapshot itself is that unit. Expire the snapshot, and everything it alone referenced becomes garbage the table is then allowed to delete. This is why the spec couples the two so tightly: snapshot validity (files exist) and physical file deletion are defined against each other.
+
+**It preserves serializable isolation and time travel.** Readers hold a snapshot and expect its files to be there. By only expiring snapshots that are old/beyond-retention and not referenced, and by designating exactly where history is retained (referenced branch/tag heads plus a window of ancestors), time-travel reads remain correct for everything that is kept. The `snapshot-log` pruning keeps point-in-time queries consistent with what's actually still valid.
+
+**It keeps the write path minimal and avoids O(n) work.** Iceberg deliberately avoids having to scan and diff snapshots to reclaim space (note 1 in the manifest section). Each snapshot independently records which files it deleted (via DELETED entries), so once that snapshot expires you have a ready-made list of files to physically delete — no cross-snapshot comparison needed. This matches the overall goals of O(1) planning and scale.
+
+**References (branches/tags) decouple logical history from retention.** Rather than one global retention knob, retention is a function of how a snapshot is referenced: `main` never expires; tags hold a specific snapshot indefinitely unless the tag itself ages out; non-main branches have their own head. This is what makes features like staged/WAP workflows (keep a snapshot alive via a reference) and independent branch retention possible without breaking the core expiry algorithm — the retain-set is simply seeded from whatever refs exist as of expiry time.
+
+**Safety defaults toward keeping data, not deleting it.** The `min-snapshots-to-keep` floor, the "branch head is always retained" rule, and `main` never expiring all ensure expiration is conservative: you reclaim storage only after honoring minimum-age and minimum-count guarantees, so a misconfigured or premature expiration can't orphan files that a query might still need.
+
+In short: snapshot expiration exists because it's the mechanism that turns Iceberg's immutable, append-only metadata model into something that doesn't grow unbounded — it's the legal precondition for physically deleting superseded data files, and its design (per-snapshot delete tracking, reference-based retention, conservative defaults) exists to preserve snapshot isolation and time travel while keeping reclamation cheap and deterministic.

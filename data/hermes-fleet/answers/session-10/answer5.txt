@@ -1,0 +1,21 @@
+Ten bullets, each pointing at the one place to read first:
+
+1. A branch and a tag are both *snapshot references* — a map entry of `{name → snapshot-id, type, retention}` recorded in table metadata; the always-present `main` branch is just one such reference. Read format/spec.md:1102-1116.
+
+2. The defining difference: a **tag is a fixed label** on one snapshot and never moves; a **branch is mutable** — it advances by committing a new snapshot to it, exactly like `main`. Read format/spec.md:1103.
+
+3. Retention is split by type: `min-snapshots-to-keep` and `max-snapshot-age-ms` apply **only to branches** (they describe a moving pointer keeping its history); `max-ref-age-ms` applies to every non-`main` ref (how long the ref itself lives). Read format/spec.md:1112-1114.
+
+4. Snapshot expiration keeps a snapshot alive only if a branch/tag references it, plus each branch's ancestry within its retention window — this is why old data isn't deleted out from under a tag. Read format/spec.md:1124-1132.
+
+5. The Java model is `SnapshotRef` (api/.../SnapshotRef.java): an immutable object holding snapshotId, type, and the three retention fields, built via a `Builder` (`tagBuilder`/`branchBuilder`). Read SnapshotRef.java:26-47.
+
+6. The builder enforces the branch-only retention rule — setting `min-snapshots-to-keep` or `max-snapshot-age-ms` on a tag throws, and all retention values must be positive. Read SnapshotRef.java:154-179.
+
+7. `main` is special-cased for permanence: `current-snapshot-id` must equal `main.snapshotId` (validated on load), setting `main` updates the current snapshot, and `main` can't be a tag. Read TableMetadata.java:879-889 and 1330-1336.
+
+8. The spec's expiration algorithm is implemented in `RemoveSnapshots`: refs older than `max-ref-age-ms` are dropped (skipping `main`), then branch ancestors are retained by age/count. Read RemoveSnapshots.java:278-333.
+
+9. JSON serialization uses custom kebab-case keys matching the spec (`snapshot-id`, `type`, `min-snapshots-to-keep`, `max-snapshot-age-ms`, `max-ref-age-ms`), writing optional retention fields only when present. Read SnapshotRefParser.java:32-60.
+
+10. Engines consume these via the core `useRef(name)` / `table.snapshot(name)` hook: Spark offers branch/tag SQL DDL plus read options, Flink offers read options only — branches read the moving head, tags read a pinned snapshot. Compare spark/v3.5/.../source/SparkScanBuilder.java:495-501 and flink/v1.20/.../source/FlinkSplitPlanner.java:124-130.

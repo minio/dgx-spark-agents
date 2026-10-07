@@ -1,0 +1,54 @@
+I've read format/spec.md in full (all 2,153 lines). Here's what the spec says about manifest files and the design rationale behind them.
+
+## The role of manifests in the Iceberg data model
+
+Manifests sit in the middle of a three-tier metadata hierarchy:
+
+- Table metadata (JSON) holds a pointer to the current snapshot and a list of all snapshots.
+- Each snapshot points to a manifest list — an Avro file listing the manifests that make up that snapshot.
+- Each manifest is an immutable Avro file that lists either data files or delete files (not both), with each file's partition tuple, metrics, and tracking info.
+
+The spec states this plainly in Overview (line 87): the data in a snapshot is the *union of all live files in its manifests*, each live file appearing at most once. Manifests can hold any subset of a table's files — they are "not associated with partitions."
+
+## What a manifest contains
+
+A manifest is itself a valid Iceberg data file (using proper formats, schemas, and column projection). Its schema is built on a `manifest_entry` struct (lines 684-696):
+
+- `status` — EXISTING (0), ADDED (1), or DELETED (2). ADDED/DELETED track when a file entered or left the snapshot; DELETED is informational only and ignored during scans.
+- `snapshot_id` — which snapshot added or deleted the file. Optional in v2+ so it can be inherited.
+- `sequence_number` and `file_sequence_number` — data age and file-added age. Optional in v2+, inherited (lines 703-706).
+- `data_file` — the nested struct holding the real substance: path, file format, partition tuple, record count, size, and a large set of optional column metrics (`column_sizes`, `value_counts`, `null_value_counts`, `nan_value_counts`, `lower_bounds`/`upper_bounds`, `split_offsets`, sort order, key metadata, and more) (lines 713-757).
+
+Manifest-level metadata is stored as Avro key-value properties: the table `schema` (and `schema-id`), the `partition-spec` (and `partition-spec-id`, v2+), `format-version`, and `content` ("data" or "deletes") (lines 668-678).
+
+## The key design decisions and why
+
+**1. Immutable manifests + reuse across snapshots → slow-changing metadata isn't rewritten.**
+Manifests are immutable Avro files. When you append, you don't rewrite existing manifests — you add a new one ("fast append", line 980). Old files stay referenced in their original manifest, so a snapshot shares manifests with its ancestors. This is the core reason Iceberg avoids O(n) metadata rewrites as the table grows (a stated goal, line 72). Only the manifest list is rewritten per commit (line 1003), because the list of manifests always changes to form a new snapshot.
+
+**2. Separate manifest list → O(1) planning and parallelizable scans.**
+The manifest list stores per-manifest summary stats — counts of added/existing/deleted files and rows, plus per-partition-field bounds and null/NaN flags (`field_summary`, lines 1005-1043). A planner reads just the small manifest list and skips manifests whose partition summaries can't match the query, without opening every manifest (line 1057). This is what makes job planning O(1) remote calls rather than O(n) (goal, line 72), and lets planning be distributed across clients instead of bottlenecking on a central metadata store (goal, line 73).
+
+**3. One partition spec per manifest → partition evolution without rewriting.**
+A manifest's schema is derived from its partition spec, so a manifest can only hold files from a single spec (line 666). When partitioning changes, old files stay in their old manifest and new files go to a new manifest. Reads are stable because scan planning converts data predicates into partition predicates using *the spec that wrote each manifest*, regardless of the current spec (lines 1059-1061). This decouples logical queries from physical layout (goal: "Reads will be planned using predicates on data values, not partition values," line 76).
+
+**4. Per-file metrics → data-skipping / predicate pushdown.**
+Storing column bounds and counts per data file in the manifest lets a scan filter files without opening them. The same metrics are used for delete files so irrelevant deletes can be skipped too (line 1067). This is the "cost-based optimization" material the goals call for (line 73). Note the metrics are stored as maps keyed by field id in v1-v3, and as a typed `content_stats` struct in v4 (lines 759-927).
+
+**5. Sequence-number inheritance → writer can write manifests before the commit succeeds.**
+New files are written with `null` sequence numbers, and the manifest's sequence number (stored in the manifest list) is substituted at read time (lines 928-939). Because the sequence number isn't known until the snapshot commits, inheritance means a manifest can be written once and reused across optimistic-commit retries — only the manifest list must be rewritten to change the sequence number (line 107). This directly supports the optimistic-concurrency model: writers commit by atomically swapping the table metadata pointer and retry on conflict (lines 91-99).
+
+**6. Tracking files, not directories → serializable isolation and atomic commits.**
+Because the table tracks individual files in manifests rather than directory listings, a writer can create files in place and only "publish" them via an explicit metadata commit that's atomic (line 83). Readers hold the snapshot they loaded and are unaffected by later commits until they refresh (line 93). This is what delivers serializable isolation without reader locks — a headline goal (line 71).
+
+**7. Content-file uniqueness → deletes and incremental processing stay sound.**
+Within a snapshot, each content file must appear in at most one live manifest entry (lines 680-682). This matters because manifests get reused across snapshots and the same file could be legitimately listed in different manifests across time; within one snapshot, duplicates would make scan results and incremental deletes undefined.
+
+**8. Evolution across spec versions.**
+Manifest requirements tightened over versions without breaking v1 reading: v1 allowed inline `manifests` lists and file-only tracking; v2 made the manifest list mandatory (to always have sequence numbers to inherit — note 2, line 711), added `content` and sequence numbers, and removed `block_size_in_bytes`, `file_ordinal`, and `sort_columns`; v3 added delete/tracking fields for deletion vectors (`referenced_data_file`, `content_offset`, `content_size_in_bytes`) and row lineage (`first_row_id`); v4 switches metrics to `content_stats` and prohibits new equality deletes. The reader-permissiveness table (lines 167-176) formalizes that older metadata remains readable in newer tables.
+
+## The design in one sentence
+
+Manifests are the deliberate move from "directory listings + central metadata" to "immutable, reusable, self-describing file indexes carrying per-file stats" — which is what buys Iceberg its O(1) planning, lock-free serializable isolation, atomic commits with optimistic retry, and lossless partition/schema evolution on slow-changing, object-store-hosted tables.
+
+One thing worth flagging: the spec actively avoids manifests being tied to partitions (they can hold any subset of a table), and this coupling to sequence numbers later became the foundation for both row-level deletes (v2) and row lineage (v3) — so the "why" of manifests is really the "why" of the whole table format.

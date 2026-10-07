@@ -1,0 +1,50 @@
+I now have a complete, production (non-test) picture across both engines. Here's how query engines use snapshot summaries.
+
+## The role of summaries in query engines
+
+The summary is a `Map<String,String>` already loaded with the snapshot in table metadata (Snapshot.java:145-147). Engines lean on it in two ways that map exactly to the two spec layers we covered: the **`operation` field** (required, spec.md:963/969) for *deciding whether/how to process a snapshot*, and the **optional metrics** (Appendix F, spec.md:2082-2104) as a *cheap surrogate for work that would otherwise require opening manifests*.
+
+## 1. Spark: streaming readers gate on `operation` (Skips the rewrite/delete noise)
+
+The clearest production reliance is Spark **Streaming** (`DataStreamReader` / `MicroBatch`), where a commit that doesn't represent new user data must not be replayed as data.
+
+`BaseSparkMicroBatchPlanner.shouldProcess` (spark/v3.5/.../source/BaseSparkMicroBatchPlanner.java:54-81) switches on `snapshot.operation()` (line 55):
+- `append` → process (line 57-58)
+- `replace` → **skip entirely** (line 59-60). A rewrite/compaction changes files, not data; replaying it would double-emit rows.
+- `delete` / `overwrite` → skip only if the corresponding streaming option is enabled, else fail fast with a Preconditions check naming `spark.read.streaming.skipDeleteSnapshots` / `...skipOverwriteSnapshots` (lines 61-74).
+- unknown op → `IllegalStateException` (lines 76-79).
+
+The planner walks the lineage with `SnapshotUtil.snapshotAfter` and *keeps skipping* until `shouldProcess` accepts (lines 108-115). This is exactly the spec's stated purpose for `operation`: "snapshot expiration does not need to clean up deleted files for appends… which have no deleted files" (DataOperations.java:24-27) — here it's streaming that uses the same classification to skip non-append commits without reading any manifest.
+
+The metrics side works as a fast path in `MicroBatchUtils.addedFilesCount` (MicroBatchUtils.java:61-68): it reads `added-data-files` straight from `snapshot.summary()` (line 63); only when the summary is missing (`-1`) does it fall back to computing added files by scanning manifests via `SnapshotChanges` (lines 64-67). That's the "avoid reading manifests" design (spec.md:89) in action — one field lookup instead of a full diff.
+
+## 2. Flink: checkpoint offsets survive restarts via summary state
+
+Flink's sink commits an Iceberg snapshot per checkpoint and must resume from the last *committed* checkpoint on restart. It persists its own keys in the summary — a clean demonstration that the string-map is a free-form extension channel (spec.md:2084).
+
+Write side — `IcebergCommitter`/`IcebergFilesCommitter`/`DynamicCommitter` set `flink.max-committed-checkpoint-id`, `flink.job-id`, `flink.operator-id` on the snapshot summary via `operation.set(...)` (flink/v1.20/.../sink/IcebergCommitter.java:307-309; IcebergFilesCommitter.java:387-389; DynamicCommitter.java:386-388). These are vendor-specific keys carried inside the standard `summary` map.
+
+Read side — `SinkUtil.getMaxCommittedCheckpointId` walks the snapshot lineage looking back for the most recent snapshot whose summary matches this job/operator, then reads `flink.max-committed-checkpoint-id` (SinkUtil.java:83-105, notably lines 89-98). `DynamicCommitter` does the same recovery scan (DynamicCommitter.java:196-201). So the summary is the durable, per-snapshot record of "how far this Flink job got" — enabling exactly-once resume without a side DB.
+
+Flink maintenance tooling also uses the classification:
+- `MonitorSource` skips `REPLACE` snapshots while walking ancestry to emit table-change events (MonitorSource.java:130-135), the same skip-rewrites logic as Spark streaming.
+- `EqualityConvertPlanner.shouldSkip` reads only summary counts to cheaply decide whether a snapshot needs conversion — `added-data-files`/`added-delete-files`/`added-equality-delete-files` (EqualityConvertPlanner.java:736-756, 758-761), with a null→0 default, and even its own `equality-convert-committed-staging-snapshot` marker as a summary key (line 738).
+
+## 3. Spark: batch operations and actions use totals for progress/metrics
+
+- `MigrateTableSparkAction` and `SnapshotTableSparkAction` read `total-data-files` to report total file count (spark/.../actions/MigrateTableSparkAction.java:190, SnapshotTableSparkAction.java:181).
+- `SparkWrite`/`SparkScan` pull `snapshot.summary()` to expose it (as `SnapshotsTable`-style metadata or for query bookkeeping) (SparkWrite.java:572, SparkScan.java:266).
+- `AddFilesProcedure` reads the resulting `summary()` to report to the user how many files/rows were added (AddFilesProcedure.java:128).
+- Row-level operations (Merge/Update/Delete) via `SnapshotSummary` constants in the extension test base validate behavior, but the production paths (BaseOverwriteFiles etc.) are core-side.
+
+## Pattern that ties it together
+
+Every engine use splits into the same two pillars, aligning with the spec's two design layers:
+
+1. **`operation` = policy knob.** Both Spark streaming (BaseSparkMicroBatchPlanner.java:55-74) and Flink maintenance (MonitorSource.java:130) branch on it to *skip* `replace` (and gated `delete`/`overwrite`) snapshots — avoiding duplicate or meaningless reads. This is the spec's stated intent (DataOperations.java:24-27).
+
+2. **metrics = cost shortcut.** `MicroBatchUtils.addedFilesCount` (MicroBatchUtils.java:61-68), `EqualityConvertPlanner` (EqualityConvertPlanner.java:742-753), and `SinkUtil.getMaxCommittedCheckpointId` (SinkUtil.java:89-98) all read counts/state out of the in-memory summary instead of scanning manifests — the "O(1), don't read what you don't need" design (spec.md:89, 1005).
+
+3. **free-form string map = engine extension.** Flink's `flink.*` checkpoint keys (SinkUtil.java:48-51) ride inside the standard summary, exercising the spec's "recommended/informational, not a correctness dependency" property (spec.md:2082-2104) — custom keys live without spec changes or reader breakage.
+
+Caveat on coverage: I traced the production source files that reference summaries directly (the patterns above). The Spark changelog table (`ChangelogRowReader`) reads the per-row `_change_type` metadata rather than the snapshot summary, so it doesn't gate on `operation` the way streaming does — worth knowing if you're investigating changelog specifically. I can dig into `ChangelogRowReader`'s snapshot-selection path if you want the full changelog story.

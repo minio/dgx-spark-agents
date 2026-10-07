@@ -1,0 +1,38 @@
+Here's the answer.
+
+## The key distinction to keep straight
+
+There are two different "manifest rewriting" mechanisms, and the two engines use them very differently:
+
+1. **Background manifest merging during every write** (the `ManifestMergeManager` from your previous questions). This runs inside the core `MergingSnapshotProducer`, which is the base for the standard table operations `AppendFiles`, `OverwriteFiles`, etc.
+2. **An explicit, user-triggered `RewriteManifests` maintenance action** (`RewriteManifestsSparkAction` in Spark). This is a distributed, deliberate consolidation operation.
+
+## Flink relies on mechanism 1, transitively
+
+Flink has **no** direct dependency on `ManifestMergeManager` or on a `RewriteManifests` action — my searches found zero references in the flink module (there is only `RewrteDataFiles`/compaction, which rewrites data, not manifests). Instead, Flink relies on it automatically and invisibly through the core commit API it uses:
+
+- Flink's streaming commit path (`IcebergFilesCommitter`) commits each checkpoint by calling `table.newAppend().scanManifestsWith(workerPool)` when there are no delete files (flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/IcebergFilesCommitter.java:337) and `table.newReplacePartitions().scanManifestsWith(workerPool)` for dynamic partition overwrite (IcebergFilesCommitter.java:313). Both `newAppend()` (AppendFiles) and `newReplacePartitions()` (ReplacePartitions) are implemented by `MergingSnapshotProducer` in core, which constructs and runs the `DataFileMergeManager` / `DeleteFileMergeManager` (MergingSnapshotProducer.java:130, 132-133; merge invoked at MergingSnapshotProducer.java:1066-1067). The `.scanManifestsWith(workerPool)` hands the producer the worker pool the merge uses (MergingSnapshotProducer.java:1272).
+- `replaceDataFiles` / `newRewrite` compaction, used by Flink's `RewriteDataFilesAction` (flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/actions/Actions.java:49-50) and the maintenance operators, is also a `MergingSnapshotProducer`-based operation, so it triggers the same background merge when it commits the rewritten files.
+
+Fueling this: one of the very cases the spec lists for why snapshots allow multiple manifests is cheap appends to streaming ingestion — "Appends can add a new manifest to minimize the amount of data written" (spec.md:980). Streaming writes (Flink especially) are the canonical case; the background merge is what keeps those accumulated manifests from growing without bound. So Flink "uses manifest merging" by relying on the core producer's default-on merge every time it commits a checkpoint, without any Flink-side code.
+
+## Spark relies on mechanism 2 explicitly (and 1 on regular writes)
+
+**Explicit manifest rewrite — `RewriteManifestsSparkAction` (spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/actions/RewriteManifestsSparkAction.java):**
+
+- Entry point `doExecute` rewrites both content types, calling `rewriteManifests(ManifestContent.DATA)` then `rewriteManifests(ManifestContent.DELETES)` (RewriteManifestsSparkAction.java:208-214). This honors the spec's requirement that data and delete files live in separate manifests (spec.md:664) — it never mixes them.
+- `rewriteManifests` (228-252) computes a target count from the total manifest bytes and `MANIFEST_TARGET_SIZE_BYTES` (RewriteManifestsSparkAction.java:123-127, 375-377) — the same consolidation target the spec's "reduce the cost of rewriting a manifest" (spec.md:982) motivates — and bails out if there's nothing to consolidate (`targetNumManifests == 1 && size == 1`, RewriteManifestsSparkAction.java:235-237).
+- It reads live entries via the ENTRIES metadata table filtered to `status < 2` — i.e. only live entries, dropping DELETED (RewriteManifestsSparkAction.java:260-262). This matches spec.md:691/1055 (deleted entries informational only, not scanned), and matches the DELETED-suppression logic in the core manager (ManifestMergeManager.java:203-208).
+- Entries are re-emitted only as `existing(...)` with their original snapshot/sequence numbers preserved (RewriteManifestsSparkAction.java:523-527 → `writer.existing`), which is exactly the spec requirement that existing files in a new manifest keep their non-null sequence numbers (spec.md:935) — same invariant `ManifestMergeManager` upholds.
+- Critically, it never mixes partition specs: entries are written with a single `spec` (the action's `spec`, writable via `specId(int)`, RewriteManifestsSparkAction.java:151-155, 589-591), and `findMatchingManifests` filters to `manifest.partitionSpecId() == spec.specId()` (RewriteManifestsSparkAction.java:360). This enforces the "one manifest per partition spec" rule (spec.md:660, 666) — the same invariant the core merge manager upholds by grouping on `partitionSpecId` (ManifestMergeManager.java:129-137).
+- The rewrite is distributed: it puts manifest entries into a Spark `Dataset`, repartitions/sorts them, and writes manifests per partition in parallel (RewriteManifestsSparkAction.java:239-246, 280-294). This is the distributed, engine-parallel analog of the core manager's worker-pool parallelism (ManifestMergeManager.java:154-158), and it materializes the spec point that splitting large tables across manifests lets planning be parallelized (spec.md:982).
+- It commits via `table.rewriteManifests()` (a replace-real-manifests operation, RewriteManifestsSparkAction.java:400), with careful cleanup of uncommitted manifests and staging handling (RewriteManifestsSparkAction.java:397-420).
+
+**Regular Spark writes** (SparkTableUtil copies/appends) use `targetTable.newAppend()` (spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkTableUtil.java:598, 712, 908), which again flows through `MergingSnapshotProducer` → mechanism 1. So Spark's routine writes also get the background merge.
+
+## Which is "relied on"
+
+- **Flink: mechanism 1 only** — no explicit manifest rewrite at all; it depends entirely on the core producer's automatic merge during checkpoint commits.
+- **Spark: both** — the explicit `RewriteManifests` action (the maintenance/procedure path, e.g. `RewriteManifestsProcedure` / the `system.rewrite_manifests` SQL procedure) for deliberate consolidation, plus mechanism 1 on all ordinary appends/overwrites through the core producer.
+
+One nuance worth flagging: the explicit Spark action is a **separate code path** from `ManifestMergeManager` — it re-implements consolidation in Spark rather than calling into the core manager. So the biggest "reliance" on `ManifestMergeManager` itself is indirect (through `MergingSnapshotProducer`), in both engines; Spark's *named* manifest-rewrite feature is its own distributed implementation.

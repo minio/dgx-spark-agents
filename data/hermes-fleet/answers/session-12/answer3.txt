@@ -1,0 +1,47 @@
+Here is a catalog of failure modes for metadata tables, grouped by the phase in which they arise, each with the concrete guard and file:line.
+
+## 1. Misuse / API-abuse failures
+
+- **Wrong base-table kind.** Only `BaseTable` (or something exposing `TableOperations`) can host a metadata table. If you pass a non-base, non-operations `Table`, the factory throws `IllegalArgumentException` and refuses to build (MetadataTableUtils.java:42-47). The table constructor independently enforces this with a `Preconditions.checkArgument(table instanceof BaseTable, ...)` (BaseMetadataTable.java:62-63).
+- **Attempt to write/mutate through the metadata table.** Metadata tables are read-only (BaseMetadataTable.java:43 extends BaseReadOnlyTable). Mutating `TableOperations` on a serialized instance throws (SerializableTable.java:460-463, `ErrorMsg` at 440-442), and `StaticTableOperations.commit`/`metadataFileLocation` throw "Cannot modify a static table" (StaticTableOperations.java:79-81, 89-91).
+- **Asking a multi-snapshot table for time travel or incremental scans.** `BaseMetadataTableScan.appendsBetween/After` throw UnsupportedOperation (BaseMetadataTableScan.java:49-58); `BaseAllMetadataTableScan.useSnapshot/useRef/asOfTime` throw (BaseAllMetadataTableScan.java:48-60). So you cannot time-travel `all_files` or run incremental scans on any metadata table — guarded by explicit exception rather than silent wrong data.
+- **Unknown table type.** `MetadataTableUtils` throws `NoSuchTableException` for an unrecognized type (MetadataTableUtils.java:92-93), and `MetadataTableType.from` returns null for a trailing name that isn't a known suffix (MetadataTableType.java:41-47).
+
+## 2. Unpartitioned tables (empty partition struct)
+
+- **Empty `partition` struct rows.** `DataFile.getType`/`ManifestEntry.getSchema` produce a mandatory `partition` field, but empty structs aren't universally supported. The files/entries tables drop the partition field when `partitionType.fields()` is empty (BaseFilesTable.java:50-53; BaseEntriesTable.java:56-59). Same for `PartitionsTable` (PartitionsTable.java:119, 129-142, 153-170) and `PositionDeletesTable` (PositionDeletesTable.java:193-199).
+
+## 3. Snapshot-frontier / "no current snapshot" cases
+
+- **No current snapshot.** Some scans call `snapshot()` internally and would fail on a brand-new or snapshot-less table. The tables that span *all* snapshots override `planFiles` to bypass the current-snapshot check (SnapshotsTable.java:90-94, HistoryTable.java:91-95, and via task builders in RefsTable.java:91, MetadataLogEntriesTable.java:100-102). Files/entries/manifests/partitions rely on a snapshot being present (they're in `TIME_TRAVEL_TABLE_TYPES`, BaseMetadataTable.java:44-52).
+- **History entries whose snapshot no longer exists** (expired, or a metadata file predating the entry). `convertHistoryEntryFunc` maps missing snapshots to a `null` parent id rather than crashing (HistoryTable.java:98-115, esp. 108-113). The same null-safe handling appears when decoding a metadata-log entry (MetadataLogEntriesTable.java:105-123, e.g. `latestSnapshot != null ? ...`).
+- **Metadata log as-of lookup blows up on table creation.** `snapshotIdAsOfTime` throws `IllegalArgumentException` when no snapshot exists at creation time; the metadata-log task catches it and yields `null` latest snapshot rather than failing the whole scan (MetadataLogEntriesTable.java:107-114).
+
+## 4. Schema-evolution hazards (partition fields across specs, field-id collisions)
+
+- **Ranges of partition field ids across different specs.** The spec warns partition field ids are reused/collide across specs (spec.md:629-637). Guarded by building per-spec partition types and per-spec `ManifestEvaluator`s keyed by `manifest.partitionSpecId()` (BaseFilesTable.java:69-80; BaseEntriesTable.java:75-82; PartitionsTable.java:254-265). Each manifest is evaluated with *its own* partition spec — the spec's rule that reads use the spec stored in the manifest (spec.md:1156-1158).
+- **Filter on the wrong/other spec's partition.** Metadata tables surface the *current* partition but files span many specs. `transformSpec` builds identity specs on the metadata schema and `checkConflicts(false)` (BaseMetadataTable.java:83-99), so predicates on `partition` don't get mis-rejected just because a spec differs.
+- **Field-id collisions in PositionDeletesTable** between its columns and user schema field ids. `calculateSchema` computes the union of all ids across all table schemas, then reassigns partition-field ids to the first unused ids so the deletes table's own ids never collide (PositionDeletesTable.java:114-200, esp. 164-191).
+
+## 5. Incomplete / malformed metadata and metrics
+
+- **Manifest-list summary counts missing (null).** `ManifestFile.addedFilesCount()` etc. document "null means non-zero"; `estimatedRowsCount` adds them as longs (BaseFilesTable.java:177-181; BaseEntriesTable.java:326-330), treating null as an unknown-but-possible count rather than zero.
+- **Missing/absent lower or upper bounds in partition summaries.** `partitionSummariesToRows` returns null when the summary list is null (ManifestsTable.java:119-121), and `Conversions.fromByteBuffer` handles null bound buffers.
+- **Manifest with no manifest-list (legacy/v1 snapshot).** `AllManifestsTableScan.doPlanFiles` falls back to `snap.allManifests(io)` + `StaticDataTask` when `snap.manifestListLocation()` is null (AllManifestsTable.java:139-158) — necessary because v1 snapshots may inline manifests instead of a manifest list (spec.md:961-962).
+
+## 6. Concurrency and stale-state failures
+
+- **Stale metadata across a commit.** `BaseMetadataTable.refresh()` delegates to the underlying base table's refresh (BaseMetadataTable.java:155-157), so a scan re-reads the new committed metadata file. Consistent with the spec's serializable-isolation guarantee: readers pick up new state "until they refresh" (spec.md:93).
+- **A table deleted/renamed between catalog lookups.** `MetadataTableUtils` re-resolves through `TableOperations` each time (MetadataTableUtils.java:32-54); a vanished table surfaces as a `NoSuchTableException` from the catalog rather than a secondary metadata-table crash.
+
+## 7. Read / I/O failures
+
+- **File-not-found / read errors while opening a manifest, manifest list, or the metadata JSON.** These propagate as `IOException`→`UncheckedIOException`/`RuntimeIOException`. `StaticTableOperations.current()` reads the metadata JSON lazily with `TableMetadataParser.read` (StaticTableOperations.java:60-65); `ManifestListReadTask.rows()` wraps manifest-list reads in try/catch and rethrows `RuntimeIOException` (AllManifestsTable.java:215-218). None of these is silently swallowed — a missing file fails the scan loudly.
+
+## 8. What is deliberately *not* guarded, and why
+
+- **Duplicate rows in the All-* tables.** `AllDataFilesTable`, `AllDeleteFilesTable`, `AllFilesTable`, `AllManifestsTable`, `AllEntriesTable` all document that they "may return duplicate rows" because a file/manifest reachable from multiple snapshots is returned once per snapshot, dedup only by manifest set (BaseAllMetadataTableScan.java:82). This is by design — the spec's content-file uniqueness is *per snapshot* (spec.md:680-682), not across snapshots — so callers must dedup.
+- **Deleted entries are exposed.** `ManifestEntriesTable`/`AllEntriesTable` deliberately surface `status=DELETED` entries (Javadoc at BaseEntriesTable/ManifestEntriesTable.java:23-29). The guard is documentation: the spec says delete entries are informational and ignored by scans (spec.md:691, 1055), so this table must not be used to conclude live files.
+- **Stats are not self-consistent at all times.** `PartitionsTable` computes aggregates fresh from live entries rather than trusting the optional partition-statistics file (PartitionsTable.java:197-247) — consistent with the spec marking those files informational/on-demand (spec.md:1238-1241, 1249). `estimatedRowsCount` treats null counts as "non-zero" per the spec (spec.md:1021-1026), so it is an estimate, not a guarantee.
+
+Net: the code's guarding strategy at each failure mode is (a) fail loudly at the API boundary (Preconditions/UnsupportedOperation, refs 1, 2), (b) tolerate and normalize missing/optional metadata rather than crash (null-coalescing and fallbacks, refs 3, 5), (c) key all partition logic by the manifest's own spec to survive evolution (ref 4), and (d) delegate concurrency/refresh to the underlying base table instead of duplicating it (ref 6). The genuinely unguarded behaviors — duplicates, deleted entries, estimate-only counts — are deliberate spec-compliant choices surfaced as documented contract, not as bugs.

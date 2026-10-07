@@ -1,0 +1,62 @@
+I read `BaseRowDelta.java`, its parent `MergingSnapshotProducer.java`, the grandparent `SnapshotProducer.java`, and `DeleteFileIndex.java` (which is how delete "application" is computed — the read-path twin of the write path). Here's how the implementation mirrors the spec, code-first with the spec section it embodies.
+
+## 1. Row deltas are a v2+ feature, and the delete *encoding* is version-gated
+
+The spec: v1 has no row-level deletes; v2 adds position and equality delete files; v3 replaces position delete files with deletion vectors (DVs) ("Position delete files must not be added to v3 tables"); v4 forbids adding equality deletes (spec.md:39-45, 1358-1364, 1921-1925).
+
+`BaseRowDelta` is handed to `MergingSnapshotProducer` (it extends it, BaseRowDelta.java:31). Every new delete file is validated against the table's current format version in `validateDeleteFileForVersion` (MergingSnapshotProducer.java:295-316):
+- v1: `throw new IllegalArgumentException("Deletes are supported in V2 and above")`.
+- v2: position deletes must NOT be DVs — `"Must not use DVs for position deletes in V2"`.
+- v3/v4: position deletes MUST be DVs — `"Must use DVs for position deletes in V*"`; equality deletes still permitted.
+
+This is enforced eagerly at `add(DeleteFile)` (MergingSnapshotProducer.java:271-288) and again in `commit()` via `validateDeleteFilesForVersion` (MergingSnapshotProducer.java:1019), guarding a buffered update against a *concurrent* format upgrade.
+
+## 2. Two update channels: rows and deletes, tracked separately
+
+The spec's mental model is a single write that can add data, add deletes, remove data, and remove deletes, with delete files tracked in their own manifests scanned first (spec.md:109-119, 662-664).
+
+`BaseRowDelta` exposes that as four operations — `addRows`/`addDeletes`/`removeRows`/`removeDeletes` (BaseRowDelta.java:62-85). The classification of the resulting snapshot operation mirrors the spec's `operation` values (spec.md:969-975): APPEND when only data is added, DELETE when only deletes are added, otherwise OVERWRITE (BaseRowDelta.java:49-60).
+
+Delete files are kept out of the data-manifest pipeline entirely: the producer maintains a parallel `deleteMergeManager`/`deleteFilterManager` (MergingSnapshotProducer.java:132-133) and writes them via `writeDeleteManifests`/`newDeleteManifestWriter` into a separate delete-manifest list, concatenated only at `apply` (MergingSnapshotProducer.java:1041-1055). Added rows go through `newDataFilesBySpec`; added deletes go through `v2Deletes` (position/equality delete files) and `dvsByReferencedFile` (DVs) (MergingSnapshotProducer.java:96-99).
+
+## 3. Sequence-number ordering is the heart, and it is deferred until commit
+
+The spec's core rule is that deletes only apply to older data, ordered by sequence number, and that data/delete files are written with `null` sequence numbers that "inherit" their value from manifest metadata at commit time (spec.md:101-107, 928-939). The code leans on this heavily.
+
+Adding a delete or a row does not assign a sequence number: `add(DeleteFile)` wraps it in `Delegates.pendingDeleteFile(file, null)` (MergingSnapshotProducer.java:263), and new data goes to manifests with a `null` data sequence unless one is explicitly supplied (SnapshotProducer.java:744-786). When manifests are written, a delete file with a `null` data sequence number is added without one so it inherits at commit (SnapshotProducer.java:800-806); `apply` computes the current `minDataSequenceNumber` and drops delete files already older than it (MergingSnapshotProducer.java:1025-1034).
+
+The spec's application rules (spec.md:1075-1091) become concrete in `DeleteFileIndex`:
+- Position deletes (and DVs) apply when `data.seq <= delete.seq` (spec.md:1077-1082). `PositionDeletes.filter` returns every delete whose sequence number is `>=` the data file's (DeleteFileIndex.java:687-743), i.e. same-or-later deletes apply — including same-commit deletes, which the spec explicitly requires.
+- Equality deletes apply when `data.seq < delete.seq` (spec.md:1085). The code encodes this by indexing an equality delete at `dataSequenceNumber - 1` (`EqualityDeleteFile.applySequenceNumber`, DeleteFileIndex.java:881), so the `>=` search yields exactly the strict-less-than semantics.
+
+## 4. Deletes are scoped by file/partition, with one global exception
+
+Spec: position deletes apply within a data file (by path) and partition; equality deletes apply within a partition, except an equality delete with an *unpartitioned* spec becomes a global delete (spec.md:1088-1091).
+
+`DeleteFileIndex` keys position deletes by data-file path when a referenced file is known (`posDeletesByPath`, DeleteFileIndex.java:200-215) and otherwise by partition (`posDeletesByPartition`). Equality deletes are placed in `globalDeletes` when the spec `isUnpartitioned()` and otherwise in `eqDeletesByPartition` (DeleteFileIndex.java:596-614). Partition mismatches are sanity-checked with an explicit "metadata is corrupted" error (DeleteFileIndex.java:234-255), matching the spec's partition-equality requirement.
+
+## 5. DVs: one per data file, referenced and merged
+
+Spec: at most one DV per data file in a snapshot; a DV must include its `referenced_data_file`; when a data file is removed its DVs must be removed; writers must merge new deletes into existing vectors (spec.md:1366-1367, 1375-1387).
+
+- One DV per file is enforced in the index (`add(dvByPath, ...)` throws `"Can't index multiple DVs for %s"`, DeleteFileIndex.java:568-575) and `findDV` keys by referenced file (DeleteFileIndex.java:217-232).
+- On the write side, DVs are accumulated by `referencedDataFile` (MergingSnapshotProducer.java:281-284) and merged with `DVUtil.mergeAndWriteDVsIfRequired` via `mergeDVs` (MergingSnapshotProducer.java:1209-1236).
+- When a data file is deleted in this commit, `removeDanglingDeletesFor` removes DVs that referenced it (MergingSnapshotProducer.java:1038-1039) — the direct realization of the spec's "writers must also remove any deletion vector that applies."
+
+## 6. Metrics are used to skip delete files
+
+Spec allows ignoring delete files whose metrics show no overlap with the scan (spec.md:1067, 1471-1473). `canContainEqDeletesForFile` (DeleteFileIndex.java:257-320) uses value/null counts and lower/upper bound range overlap to decide whether an equality delete could touch a data file, returning "no match" when ranges don't overlap or when null-only deletes can't hit non-null data.
+
+## 7. Serializable isolation and conflict validation
+
+Spec: commits are optimistic; a failed commit retries only if the conditions still hold (spec.md:91-99, 1312-1319). `BaseRowDelta.validate` (BaseRowDelta.java:132-174) is the concrete set of conditions:
+- Referenced data files must still exist (`validateDataFilesExist`, MergingSnapshotProducer.java:817-866) — the spec's "Delete operations must verify that specific files to delete are still in the table."
+- Reject a data file that is both removed and referenced by new deletes (`validateNoConflictingFileAndPositionDeletes`, BaseRowDelta.java:181-193).
+- No new conflicting deletes/rows since the starting snapshot (`validateNoNewDeleteFiles`, `validateNoNewDeletesForDataFiles`, `validateAddedDataFiles`).
+- No concurrently added DVs for the same referenced data file (`validateAddedDVs`, MergingSnapshotProducer.java:869-922) — guarding the one-DV invariant.
+
+The retry itself lives in `SnapshotProducer.commit()` (SnapshotProducer.java:484-534), which re-runs `apply()` and validates against a freshly-refreshed `base` with exponential backoff — exactly the spec's `commit.retry.*` model.
+
+## Where the file-to-spec mapping is indirect
+
+One thing worth calling out: `BaseRowDelta` itself is mostly a thin API/validation shell (194 lines); the real spec logic lives in its superclass `MergingSnapshotProducer` and in `DeleteFileIndex`. So the strongest "here is the spec, here is the code" pairings for the read path are actually in `DeleteFileIndex`, and the strongest for the sequence-number inheritance in `SnapshotProducer`/`MergingSnapshotProducer`. If you want, I can trace one of these further — e.g. how `ContentFileUtil.isDV` distinguishes a v3 DV from a v2 position delete file in the same `POSITION_DELETES` content bucket, since that decision is what lets v3 coexist with upgraded v2 tables.

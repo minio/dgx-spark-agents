@@ -1,0 +1,39 @@
+I've read format/spec.md in full (2153 lines, in three chunks). Here's what it says about incremental append scans and the design reasoning behind it.
+
+A quick framing point first: the spec never contains a literal "Incremental Append Scans" section. That feature lives in the engines (Spark/Flink `readFrom` → `fromSnapshotInclusive`/`fromSnapshotExclusive`) on top of the primitives the spec does define. What the spec actually specifies is the machinery that makes incremental append scans cheap and correct. So I'll explain the spec's relevant pieces and how they combine.
+
+## What the spec establishes
+
+1. Append is a first-class snapshot operation.
+   Snapshot summary has an `operation` field whose possible values are `append`, `replace`, `overwrite`, `delete` (format/spec.md:969-976). `append` is defined as "only data files were added and no files were removed." This exactness is what lets an incremental append scan be safe to reason about: a snapshot marked append provably contains no deletions, so the "increment" between two append snapshots is purely additive — no deletes to merge, no rewrites to account for.
+
+2. Fast append.
+   The spec explicitly endorses the "fast append" pattern (format/spec.md:978-983): an append commits by writing a brand-new manifest rather than rewriting and re-appending to an existing one, "to minimize the amount of data written." The manifest list for the new snapshot then references the new manifest plus the kept prior manifests. This is the direct enabler of cheap incremental reads — the delta is pre-materialized in the new manifest(s) rather than having to be re-derived by diffing full snapshots.
+
+3. Immutable snapshots with explicit lineage.
+   Every snapshot records `parent-snapshot-id` (format/spec.md:958), giving a chain. Combined with `sequence-number` (a monotonically increasing long tracked per snapshot, format/spec.md:959, also `last-sequence-number` in table metadata at 1150), the table has both a lineage graph and a total order on commits. Incremental scans need the lineage to walk "what changed between snapshot A and B" and the sequence numbers to order and understand the changes.
+
+4. Manifest lists carry the counts needed to know a manifest is pure-add.
+   Each `manifest_file` entry stores `content` (data vs deletes), `added_files_count`, `existing_files_count`, `deleted_files_count` and corresponding row counts (format/spec.md:1021-1026). For an incremental append scan, these let a reader find exactly the manifests where `added` > 0 and skip manifests that are purely existing/deleted — without opening the manifest files themselves.
+
+5. Scan planning on deltas.
+   The Scan Planning section (format/spec.md:1053-1098) describes how a normal scan reads the current snapshot's manifests and, critically, notes that "Deleted entries in data and delete manifests (those marked with status DELETED) are not used in a scan." An incremental append scan is the same planning logic, but it starts from the *added* entries between two snapshots instead of the full current set. Because append snapshots add no deletes, the delta scan is exactly the union of the `ADDED` entries in the new manifests — no deleted-entry reconciliation needed. The same partition-predicate projection and metrics-based file filtering apply to prune the delta files just as they prune a full scan.
+
+6. Sequence numbers make "what came after what" unambiguous.
+   Every manifest, data file, and delete file inherits its snapshot's sequence number (format/spec.md:103-107, 928-939). For incremental scans this matters for correctness against concurrent writers: it provides a consistent ordering of commits so the engine can define the scan range cleanly.
+
+## Why it's designed that way
+
+The design is a direct expression of the spec's stated goals (format/spec.md:69-77) — speed, scale, and no reader-side locking — applied to the append-only hot path:
+
+- Readers don't lock or coordinate with writers. Serializability comes from atomic metadata swaps and immutable snapshots (format/spec.md:91-99). An incremental scan is just another read of committed snapshot state, so it inherits that property for free.
+
+- The delta is already written down. Because appends add a manifest instead of rewriting one (fast append), the "what's new" is physically separated from the "what existed." An incremental scan is O(delta), not O(table): it reads only the added manifests, using the manifest-list counts to skip everything else. This is the same O(1) planning philosophy as regular scans, generalized to ranges of snapshots.
+
+- Append is kept deliberately pure so the delta is trivially a union. Restricting an append snapshot to "files added, none removed" means the increment contains no tombstone/rewrite logic. Mixed or destructive operations (overwrite, replace, delete) are not valid incremental-append sources precisely because they'd force the reader to merge deletes and recompute rewrites, destroying the cheap additive property.
+
+- Reuse of existing metadata. Manifests and manifest lists are reused across snapshots (format/spec.md:87, 981), so producing and reading incremental snapshots doesn't force metadata rewrites. The cost of an incremental read stays proportional only to what genuinely changed.
+
+- Sequence numbers + lineage replace a central coordinator. Clients derive the snapshot range themselves from lineage/sequence metadata, so job planning stays on the client and doesn't bottleneck on a metadata store — one of the "Scale" goals.
+
+In short: the spec's snapshot/append/sequence-number/manifest-list design makes incremental append scans cheap by construction. The authoritative property is that an append snapshot is additive-only, and the fast-append manifest format keeps that addition as a small, self-contained, skippable set of files — so an incremental scan is just "read the ADDED entries in the new snapshot's manifests," with lineage and sequence numbers pinning down exactly which snapshots are in range and in what order.

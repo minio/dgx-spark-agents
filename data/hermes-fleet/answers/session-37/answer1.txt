@@ -1,0 +1,107 @@
+I've read the entire spec (all 2153 lines). Here's what it says about metadata columns and row lineage, and the design rationale.
+
+## Metadata columns
+
+**Reserved field ID range.** Iceberg reserves field IDs greater than `2147483447` (`Integer.MAX_VALUE - 200`) for metadata columns. User schemas may never use IDs in this range, so the metadata columns can safely be mixed into user data schemas without colliding with user-defined fields.
+
+There are two families, distinguished by the ID block:
+
+**Reader/lineage metadata columns** (IDs 2147483646 down to 2147483539):
+- `_file` (string) — path of the file a row is stored in
+- `_pos` (long) — ordinal position of a row in its data file, starting at 0
+- `_deleted` (boolean) — whether the row is deleted
+- `_spec_id` (int) — the partition spec ID tracking the file containing a row
+- `_partition` (struct) — the partition a row belongs to
+- `_change_type` (string) — INSERT/DELETE/UPDATE_BEFORE/UPDATE_AFTER in a changelog
+- `_change_ordinal` (int), `_commit_snapshot_id` (long) — changelog ordering and provenance
+- `_row_id` (long) and `_last_updated_sequence_number` (long) — the two row-lineage fields
+
+**Position-delete-file columns** (IDs ~2147483546–2147483544): `file_path`, `pos`, and `row` (the deleted row values). These are what position delete files are physically encoded with.
+
+## Row lineage
+
+This is a v3 feature (listed under "Row Lineage tracking" in the version-3 capabilities). The goal is to give each physical row in a table a stable identity across rewrites, so a row can be traced through the table over time.
+
+Two row-level fields:
+- `_row_id` — a unique long ID per row, assigned once when the row is first added to the table and preserved forever after.
+- `_last_updated_sequence_number` — the sequence number of the commit that last modified the row.
+
+Plus a table-level counter `next-row-id`, which is always higher than any assigned row ID and seeds the next snapshot's `first-row-id`.
+
+**The core design choice is lazy, inheritance-based assignment, driven by the commit model.** The spec is explicit about why:
+
+- Row IDs and the last-updated sequence number cannot be known when data and manifest files are written, because the commit sequence number and starting row ID are only assigned when the snapshot is successfully committed — and may change if an optimistic commit is retried.
+- So writers write `null` for these values, and the reader fills them in by inheritance through the metadata hierarchy:
+  - A new data file stores `first_row_id` as `null`; at read time it's resolved to the manifest's `first_row_id` plus the sum of `record_count` of preceding null-`first_row_id` files in the manifest.
+  - A manifest's `first_row_id` comes from the snapshot's `first-row-id` (assigned from `next-row-id` at commit) plus the added/existing row counts of preceding manifests, with `added-rows` / `added_rows_count` giving the upper bound.
+  - A row's `_row_id` = data file's `first_row_id` + the row's `_pos`.
+  - `_last_updated_sequence_number` inherits the file's data `sequence_number` when null.
+- This lets data and manifest files be written once and reused across commit retries — only the manifest list and table metadata need rewriting. This matches the exact same reasoning used for sequence numbers.
+
+**When rows move between data files** (e.g. compaction/rewrite), the writer copies the existing `_row_id` verbatim — identity is preserved. If the row was modified, `_last_updated_sequence_number` is reset to null so the new commit's sequence number overwrites it; if untouched, the value is copied over. Engines may model operations as delete+insert (new row ID) or as modifications that preserve the ID.
+
+**Explicit non-goal:** lineage does *not* track rows updated via equality deletes. Engines using equality deletes don't read existing data before writing changes, so they can't produce the original row ID for modified rows; those updates are always treated as remove-old + add-new.
+
+**Upgraded tables.** On upgrade to v3, `next-row-id` initializes to 0; old snapshots are left unmodified, so their files have null `first_row_id` and every row reads null `_row_id`/`_last_updated_sequence_number`. Post-upgrade snapshots must set `first-row-id` and assign row IDs (via the manifest-`first_row_id` inheritance) to existing and added files alike — note that any null `first_row_id` must be assigned even for existing files, which is how old rows get IDs.
+
+## Why designed this way
+
+The design is fundamentally constrained by Iceberg's commit architecture:
+
+1. **Identity must survive immutable-file rewrites.** Iceberg files are immutable and rewrites are common (compaction, format migration, relocation). Without an explicit row ID, a rewritten row is indistinguishable from a new one. `_row_id` gives stable identity independent of file path or position.
+
+2. **Optimistic concurrency demands deferred assignment.** Because the sequence number and starting row ID aren't fixed until commit, and a retried commit can change them, the values must not be baked into files at write time. Inheritance through the metadata tree (data file → manifest → manifest list → snapshot → table `next-row-id`) defers the actual resolution to read time with zero file rewrites on retry. This is the same pattern sequence numbers already used, so it's consistent and reuses the proven machinery.
+
+3. **Uniqueness is cheap and bounded.** Since `next-row-id` is always higher than anything assigned and `first_row_id + _pos` never collides within a manifest, row IDs are unique across the table without a central allocator — important because job planning is client-driven and can't bottleneck on a metadata store (a stated spec "Scale" goal).
+
+4. **Lineage is separate from changelog.** The repurposed metadata columns (`_change_type`, `_change_ordinal`, `_commit_snapshot_id`) capture per-change events, while `_row_id`/`_last_updated_sequence_number` capture the current identity and recency of a row — which is what makes operations like "rows updated since snapshot X" or row-preserving revisions expressible.
+
+5. **Reserved IDs make this safe and composable.** Tucking lineage into the reserved high ID range means these virtual columns can be projected onto any schema without clashing with user columns, and read using normal ID-based column projection.
+
+One honest caveat: the spec frames row lineage as *tracking* identity and modification recency, and the inheritance machinery guarantees uniqueness and stability, but it does not build a full audit history — deleted/old versions of rows aren't retained by the lineage fields themselves; provenance relies on the changelog snapshot metadata fields and snapshot history. And as noted, equality-delete updates are intentionally outside lineage's view.I read the file start to finish (all 2,153 lines, in 8 consecutive chunks). Here's the explanation.
+
+## Metadata columns
+
+The spec (lines 439–459) reserves all field IDs above `2147483447` (`Integer.MAX_VALUE - 200`, §"Reserved Field IDs") for metadata columns, so they can be projected onto any user schema without ever colliding with data columns, and resolved via the normal ID-based column projection.
+
+Two families by ID range:
+
+Reader / lineage metadata columns:
+- `_file` (string) — path of file containing the row
+- `_pos` (long) — ordinal position in the data file, 0-based
+- `_deleted` (boolean), `_spec_id` (int), `_partition` (struct)
+- `_change_type` / `_change_ordinal` / `_commit_snapshot_id` — the issue is REST catalog identification; conflicted or deleted rows are identified by position, which is insufficient; hence `row-level lineage` (discussed below)
+- `_row_id` (long) and `_last_updated_sequence_number` (long) — the row-lineage pair
+
+Position-delete-file columns: `file_path`, `pos`, `row` (the deleted row values) — the physical layout that position delete files are encoded with.
+
+## Row lineage
+
+A v3 feature whose goal is a stable per-row identity that survives file rewrites, alongside the last commit that touched the row:
+
+- `_row_id` — unique long per row, assigned when first added, preserved through rewrites
+- `_last_updated_sequence_number` — sequence number of the commit that last modified the row
+- Table-level `next-row-id` — always higher than any assigned ID; seeds each new snapshot's `first-row-id`
+
+**The key design decision is lazy, inheritance-based assignment driven by the commit model.** The spec states the rationale directly (lines 468): the commit sequence number and starting row ID aren't known until the snapshot is *successfully* committed, and they change if an optimistic commit is retried. So writers write `null` and readers fill values in by inheritance down the metadata tree:
+
+- Snapshot `first-row-id` = table's `next-row-id` at commit; `added-rows` gives the upper bound of newly assigned IDs.
+- Manifest `first_row_id` = snapshot's, stepped by added/existing row counts of preceding manifests.
+- Data file `first_row_id` (stored null) = manifest's plus sum of `record_count` of prior null files.
+- Row `_row_id` = data file's `first_row_id` + `_pos`; `_last_updated_sequence_number` inherits the file's data `sequence_number` when null.
+
+This lets data and manifest files be written once and reused across commit retries — only the manifest list and table metadata are rewritten. It's the exact same rationale Iceberg already used for sequence numbers (§Sequence Number Inheritance), so it's consistent machinery, not a new mechanism.
+
+**When rows move between files** (compaction, format change): writers copy `_row_id` verbatim (identity preserved); if the row was modified, `_last_updated_sequence_number` is reset to null so the new commit overwrites it; if untouched, it's copied over. Engines may model updates as delete+insert (new ID) or as ID-preserving modifications.
+
+**Explicit non-goal:** equality-delete updates are *not* lineage-tracked. Equality-delete engines don't read existing data before writing, so they can't produce the original row ID; such updates are always treated as remove-old + add-new (line 470).
+
+## Why designed this way
+
+1. **Identity survives immutability.** Iceberg files are immutable and rewrites are routine. Without an explicit ID, a rewritten row is indistinguishable from a new one; `_row_id` decouples identity from file path and position.
+2. **Optimistic concurrency forces deferred assignment.** Since sequence number and starting ID aren't fixed until commit (and change on retry), values can't be baked into files at write time. Inheritance defers resolution to read time with zero file rework on retry — reusing the proven sequence-number pattern.
+3. **Uniqueness without a central allocator.** `first_row_id + _pos` never collides within a manifest and `next-row-id` stays a strict upper bound, so IDs are unique table-wide while planning stays client-side — supporting the spec's stated "Scale" goal of not bottlenecking on a metadata store.
+4. **Lineage ≠ changelog.** `_change_type`/`_change_ordinal`/`_commit_snapshot_id` capture per-change events; `_row_id`/`_last_updated_sequence_number` capture current identity and recency. That combination is what makes "rows updated since snapshot X" or row-preserving revision queries expressible.
+5. **Reserved IDs make it safe and composable** — lineage projects onto any schema without ID clashes.
+
+**Caveats worth noting:** row lineage guarantees identity stability and modification recency, but it is not a full audit history — deleted/old versions aren't retained by these fields (provenance relies on snapshot history and the changelog fields). And equality-delete updates are deliberately outside lineage's scope, as the spec spells out.

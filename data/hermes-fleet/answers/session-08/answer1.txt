@@ -1,0 +1,45 @@
+I've read format/spec.md in full (all 2,153 lines, in three consecutive chunks). Here's what the specification says about deletion vectors and why they're designed that way.
+
+## What the spec says
+
+Deletion vectors (DVs) are the v3 mechanism for encoding row-level deletes, added in Iceberg v3 alongside binary deletion vectors in that version's feature list (spec.md:55). They're one of three delete formats the spec distinguishes (spec.md:1356-1377):
+
+- Deletion vectors — identify deleted rows within a single referenced data file by position in a bitmap
+- Position delete files — identify rows by file path + row position (prohibited in v3, deprecated, spec.md:1363, 1395)
+- Equality delete files — identify rows by column values (prohibited in v4, spec.md:1364, 1422)
+
+The core DV definition (spec.md:1375-1389):
+
+- A DV identifies deleted rows of one data file by encoding deleted positions in a bitmap. A set bit at position P means row P is deleted (spec.md:1377).
+- Vectors are stored using the `deletion-vector-v1` blob type from the Puffin spec (spec.md:1379).
+- They support positive 64-bit positions but are optimized for the common 32-bit case: a collection of 32-bit Roaring bitmaps. A 64-bit position is split into a 32-bit "key" (high 4 bytes) and a 32-bit sub-position (low 4 bytes); each key gets its own Roaring bitmap (spec.md:1381-1383).
+- Key constraints:
+  - At most one DV per data file per snapshot (spec.md:1366, 1387).
+  - A DV is written for exactly one data file and must be tied to it via `referenced_data_file` in the manifest entry (spec.md:755, 1371).
+  - When a DV is written for a data file, it must absorb all previously written position delete files for that file, so readers can safely ignore matching position delete files when a DV is present (spec.md:1387). Writers must merge new deletes with existing vectors or position delete files to maintain the one-vector-per-file invariant (spec.md:1366, 1951-1952).
+  - When removing a data file, any DV for it must also be removed from delete manifests (but Puffin files need not be rewritten) (spec.md:1367).
+- Storage/addressability: delete manifests track each DV individually by containing file location (`file_path`), the blob's starting offset (`content_offset`), and length (`content_size_in_bytes`). Multiple DVs can share one Puffin file (spec.md:1371, 1385). For DVs these offset/length fields are required and must exactly match the Puffin footer values for that blob, enabling direct random access (spec.md:756).
+- Metadata fields added: `referenced_data_file` (field 143, required for DVs), `content_offset` (144), `content_size_in_bytes` (145) (spec.md:742-744).
+
+Scan-scope rules (spec.md:1075-1078): a DV applies to a data file only when all three hold — file_path equals the DV's `referenced_data_file`, the data file's data sequence number is <= the DV's data sequence number, and the partitions are equal (spec + values). They also count as position deletes, so they apply to data files from the same commit (equal data sequence numbers allow deleting rows added in the same commit, spec.md:1091), and they supersede position delete files (spec.md:1083).
+
+Format/efficiency requirements (spec.md:1086-1383):
+
+- Unlike equality/position delete files, one DV is associated with exactly one referenced data file, so a reader fetches only its own vector (offset+length in a Puffin blob) rather than materializing a whole position-delete file and probing it.
+- Position deletes and equality deletes remain valid for readers; v3 tables cannot add new position delete files, and v4 tables cannot add new equality delete files (spec.md:1358, 1422). Upgraded v2 tables keep existing position delete files, which "must be merged into the DV for a data file when one is created" (spec.md:1954-1955).
+
+## Why it's designed that way
+
+The spec frames DVs as "a binary representation of deletes for a single data file that is more efficient at execution time than position delete files" (spec.md:1366). The design follows directly from Iceberg's core constraints:
+
+1. Immutable files. Iceberg never rewrites data in place; rows are "deleted" by overlaying deleters on immutable files (spec.md:43, 83). DVs are that overlay for position-based deletes.
+
+2. Read efficiency / avoiding materialization. A position delete file is a separate data file that a reader must fetch and scan to know which rows are gone. A DV is a compact bitmap retrievable by direct offset+length from a shared Puffin file — a single random-access read for exactly the one vector that applies to the target data file (spec.md:1385, 756). The split-key Roaring bitmap design keeps the common all-32-bit case dense and fast while still supporting 64-bit positions, and bitmap set/clear tests are O(1)-ish versus a probe into a sorted delete list.
+
+3. Odds-on-one-per-file. Because a DV is scoped to a single referenced data file (spec.md:1366), each delete update touches only that file's vector, and readers never need to consider cross-file delete membership. The "at most one DV per data file" rule plus mandatory merging of prior position delete files is what makes "readers can safely ignore position delete files when a DV exists" sound — the DV is guaranteed to contain all older position deletes (spec.md:1387, 1951-1952).
+
+4. Sequence-number-based isolation. DVs inherit the same sequence-number ordering as other deletes, so snapshot isolation and time travel work identically (spec.md:1077). The data-sequence-number comparison (`<=`) and same-partition requirement keep DVs from leaking across commits or partitions.
+
+5. Cheap merge for updates. Maintaining DVs out-of-band (rather than rewriting the data file) lets repeated small deletes against a hot file accumulate cheaply; the synchronous merge rule keeps correctness without rewriting immutable data.
+
+The design tension the spec resolves: position delete files are general (one file can delete rows in many files) but expensive to apply; DVs sacrifice that generality (one DV per file) to gain random-access compactness, and move to a separate blob format (Puffin) so vectors don't need to be Iceberg "data files" at all. Equality deletes remain the value-based alternative, and v4 further demotes them, signaling the ecosystem is converging on position-based DV deletes.

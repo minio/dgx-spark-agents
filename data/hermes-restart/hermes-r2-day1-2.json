@@ -1,0 +1,18 @@
+{
+ "label": "day1-2",
+ "wall_s": 88.5,
+ "server": {
+  "prompt_tokens_total": 993162.0,
+  "generation_tokens_total": 3336.0,
+  "prefix_cache_hits_total": 953344.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 22.4,
+  "time_to_first_token_seconds_count": 11.0,
+  "request_prefill_time_seconds_sum": 20.7,
+  "request_decode_time_seconds_sum": 63.0
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "`updateTable` :146 throws `CommitFailedException` when `updatedRecords != 1`, :160-161).\n- REST catalogs send `UpdateRequirement`+`MetadataUpdate` lists that the server evaluates atomically; on conflict the server returns a status the error handler maps to `CommitFailedException`, and on indeterminate network failure to `CommitStateUnknownException` (RESTTableOperations.java:178-241).\n\nFilesystem tables (`HadoopTableOperations.commit`, HadoopTableOperations.java:131): rejects a stale base (:133-135), then the atomic step is the rename `fs.rename(src, dst)` to a versioned `v<N>.metadata.json` (:162, :379), guarded by acquiring a lock (:363) and by checking the destination doesn't already exist (:368-377).\n\nIf two writers are both based on the same version, exactly one swap wins; the other fails its conditional update / rename and gets a `CommitFailedException`.\n\n## Losing writer: retry loop\n\nThe loser's `CommitFailedException` is the thing `onlyRetryOn` accepts (SnapshotProducer.java:496, Tasks.java:440-451). So the loop repeats: `refresh()` (SnapshotProducer.java:478) now picks up the winner's metadata as the new base, `apply()` re-runs against it (this is why the sequence number and snapshot id are regenerated each attempt \u2014 SnapshotProducer.java:299, :701), and a new `commit` attempt is issued against the now-current version.\n\n- Appends are always retryable (they only add files, no conflict on the new base).\n- Replace/delete/rewrite operations revalidate in `apply()`/subclass `validate()` against the refreshed base, so if the winner removed a file a retry depends on, the retry instead fails validation (a `ValidationException`, which is not retryable \u2014 Tasks.java:440-451) \u2014 exactly the \"replace must verify the files to delete are still present\" rule from the spec.\n\nThe loop keeps going until an attempt's swap succeeds, the retry budget (attempts \u2265 4+1, or > 30 min total) is exhausted (Tasks.java:428-433), or a non-`CommitFailedException` surfaces. If the winner commits on top of the loser's successful-but-indeterminate commit, `checkCommitStatus` (BaseMetastoreOperations.java:63) searches current + previous metadata locations to mark it SUCCESS rather than UNKNOWN.\n\n## Cleanup\n\nOnly after the loop exits does the producer clean up. It refreshes and loads the committed snapshot by id, deletes any manifests from failed attempts that aren't in the committed snapshot (`cleanUncommitted`, SnapshotProducer.java:553-556), removes unused manifest lists from loser attempts (SnapshotProducer.java:560-564), then notifies listeners (:578). On a final failure it calls `cleanAll()` to remove uncommitted manifests and manifest lists (SnapshotProducer.java:539-543, :610-616).\n\nNet effect: the two writers race to swap metadata; the winner commits once, the loser fails with `CommitFailedException`, sleeps with exponential backoff, refreshes to the winner's metadata, re-applies, and retries the swap \u2014 up to `commit.retry.num-retries` times over at most 30 minutes.\n",
+ "stderr": ""
+}

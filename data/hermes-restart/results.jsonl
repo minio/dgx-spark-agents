@@ -1,0 +1,8 @@
+{"rep": 1, "arm": "memkv", "prefix": "6764312e90baefee84d80f11ebdc06", "window": [1791264426.6913168, 1791264572.807844], "memkv_read_bytes": 759697920.0, "namespace": "e2e-1005-2215-1"}
+{"rep": 1, "arm": "nomemkv", "window": [1791264839.3884332, 1791264969.0716083], "memkv_read_bytes": 0.0}
+{"rep": 2, "arm": "memkv", "prefix": "676431e6df94c94c885a7d64024be3", "window": [1791265661.7171607, 1791265716.669685], "memkv_read_bytes": 847895040.0, "namespace": "e2e-1005-2215-2"}
+{"rep": 2, "arm": "nomemkv", "window": [1791265983.0947917, 1791266092.536244], "memkv_read_bytes": 0.0}
+{"rep": 3, "arm": "memkv", "prefix": "67643130a69a9f436e8cfdc4467fd4", "window": [1791266810.348643, 1791266921.4691687], "memkv_read_bytes": 751680000.0, "namespace": "e2e-1005-2215-3"}
+{"rep": 3, "arm": "nomemkv", "window": [1791267198.4755423, 1791267292.8831398], "memkv_read_bytes": 0.0}
+{"rep": 4, "arm": "memkv", "prefix": "67643121f6a4d6a0169c91f4df3932", "window": [1791268256.4524345, 1791268333.3207574], "memkv_read_bytes": 803796480.0, "namespace": "e2e-1005-2319-4"}
+{"rep": 4, "arm": "nomemkv", "window": [1791268600.1526313, 1791268724.6536539], "memkv_read_bytes": 0.0}

@@ -1,0 +1,21 @@
+Ten bullet points to get you up to speed on cherry-picking snapshots:
+
+1. What it does: applies the file changes of a historical snapshot into a brand-new snapshot (or fast-forwards a branch to it), then makes that the current state — it's re-applying a change, not copying a snapshot wholesale. Read the intent in `core/src/main/java/org/apache/iceberg/CherryPickOperation.java:40-46`.
+
+2. Where it sits: it's a package-private `MergingSnapshotProducer`, reachable only through the transaction/manage-snapshots API, not the public Table API. Read `core/src/main/java/org/apache/iceberg/CherryPickOperation.java:46` and the wiring at `core/src/main/java/org/apache/iceberg/BaseTransaction.java:237-238`.
+
+3. Entry point: `cherrypick(long snapshotId)` looks the snapshot up, refuses unknown ids, and branches on the source snapshot's operation type (append vs. replace-partitions overwrite vs. everything else → fast-forward). Read `core/src/main/java/org/apache/iceberg/CherryPickOperation.java:69-141`.
+
+4. Read path: `SnapshotChanges` reads only the manifests that the target snapshot itself created and separates added vs. removed files. Read `core/src/main/java/org/apache/iceberg/SnapshotChanges.java:126-156`.
+
+5. Write path: the added/removed files are fed back through `MergingSnapshotProducer.add()/delete()`, and `SnapshotProducer.apply()` assigns a fresh parent-snapshot-id and sequence-number to the new snapshot. Read `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:297-316`.
+
+6. Provenance: it records the source snapshot id in the new snapshot's summary as `source-snapshot-id` (spec's field for a cherry-picked snapshot). Read `core/src/main/java/org/apache/iceberg/CherryPickOperation.java:86` and `SnapshotSummary.java:62`.
+
+7. WAP integration: publishing a Write-Audit-Publish staged snapshot is a cherry-pick; `WapUtil` ensures a wap id isn't published twice and records `published-wap-id`. Read `core/src/main/java/org/apache/iceberg/CherryPickOperation.java:80-83` and `core/src/main/java/org/apache/iceberg/util/WapUtil.java:50-68`.
+
+8. Safety / edge cases: the main guards are (a) refusing to cherry-pick an ancestor or an already-applied source (`validateNonAncestor` → `CherrypickAncestorCommitException`) and (b) re-validating at commit time that a replace-partitions overwrite's partitions haven't been modified. Read `core/src/main/java/org/apache/iceberg/CherryPickOperation.java:162-171` and `218-252`.
+
+9. Spark surface: SQL procedures `cherrypick_snapshot` (by id) and `publish_changes` (by wap id) both call `manageSnapshots().cherrypick(...).commit()`. Read `spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/procedures/CherrypickSnapshotProcedure.java:87-104` and `PublishChangesProcedure.java:89-120`.
+
+10. Flink surface: `ALTER TABLE ... SET('cherry-pick-snapshot-id'='<id>')` routes through `FlinkAlterTableUtil.commitManageSnapshots`, which also blocks combining set-current-snapshot and cherry-pick in one statement. Read `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/util/FlinkAlterTableUtil.java:97-115` (and the Spark equivalent guard at `spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java:851-863`).

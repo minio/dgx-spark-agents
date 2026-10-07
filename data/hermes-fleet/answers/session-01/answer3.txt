@@ -1,0 +1,99 @@
+Here's what can go wrong with partition evolution, mapped to the specific guards in the code.
+
+## 1. Partition field ID instability
+
+The spec's central rule is that evolving a spec must not change partition field IDs (spec.md #629), because those IDs are the field IDs of the `partition` tuple struct stored in each manifest (spec.md #723, #746). Reassigning an ID would make existing files' partition tuples unreadable and would silently break predicate projection across specs.
+
+Guards:
+- `recycleOrCreatePartitionField` (`BaseUpdatePartitionSpec.java:122-144`): for v2+, when adding a field that equals one in any historical spec (same source ID + equal transform, optionally matching name), it returns the *existing* field (`:133-140`) so the ID is reused instead of re-minted. Only a genuinely new field goes through `assignFieldId()` (`:108-111`).
+- `apply()` carries existing fields forward with their current ID (`:310-314`), so renames/non-destructive changes never reassign.
+- `TableMetadata.addPartitionSpecInternal` keeps `lastAssignedPartitionId = max(..., newSpec.lastAssignedFieldId())` (`TableMetadata.java:1692-1693`), and `BaseUpdatePartitionSpec` seeds from it (`:75`), so two different evolutions can't collide by minting the same fresh ID.
+- `PartitionSpec.Builder.add` accumulates the max ID (`PartitionSpec.java:626`).
+
+## 2. Duplicate / equivalent specs piling up
+
+The spec forbids creating a new spec when a compatible one already exists (spec.md #565). Without this, every call would add a redundant spec to `partition-specs`, bloating metadata and confusing `default-spec-id`.
+
+Guard: `reuseOrCreateNewSpecId` (`TableMetadata.java:1704-1716`) iterates existing specs; if `newSpec.compatibleWith(existing)` it reuses that ID (`:1708-1709`), else takes highest+1 (`:1711`). `compatibleWith` (`PartitionSpec.java:245-265`) enforces the spec's exact equivalence — same field count, and per-field same source ID, transform, and name (`:250-262`).
+
+## 3. Duplicate partition field *within* one spec
+
+Two fields with the same name, or the same source+transform appearing twice, would corrupt the partition tuple (two struct fields sharing an ID/name).
+
+Guards:
+- `PartitionSpec.Builder.checkAndAddPartitionName` (`PartitionSpec.java:407-433`) rejects duplicate names (`:430-431`).
+- `Builder.checkForRedundantPartitions` (`:435-445`) rejects the same source+`dedupName` twice within one builder (`:439-443`).
+- In `BaseUpdatePartitionSpec`, `addField` guards redundancies across the new adds individually: `transformToAddedField` (`:203-209`) prevents re-adding the same source+transform, and `checkForRedundantAddedPartitions` (`:375-385`) prevents adding two time transforms (`year`/`month`/`day`/`hour`, per `IsTimeTransform` at `:412-461`) on the same source, since they'd overlap.
+
+## 4. Partition-field-name collision with a schema column (or another field)
+
+A partition name that equals an existing column name is ambiguous and breaks column projection / name-based lookups.
+
+Guard: `Builder.checkAndAddPartitionName(name, sourceId)` (`PartitionSpec.java:407-433`) — with `checkConflicts` on (default `:387`), it rejects a name that exists in the schema, unless it's an identity transform on that very source column (`:421-426`). `BaseUpdatePartitionSpec.addField` also detects when the new field's name matches a *current* field and renames the old one (`:223-234`).
+
+## 5. Adding a field with an unknown transform
+
+An unknown transform can't be used for filtering or read correctly.
+
+Guard: the constructor rejects any current spec containing an `UnknownTransform` (`BaseUpdatePartitionSpec.java:77-84`) before any evolution begins.
+
+## 6. Invalid source for a partition field
+
+The spec requires primitive source columns not nested in map/list (spec.md #559).
+
+Guard: `PartitionSpec.checkCompatibility` (`PartitionSpec.java:649-686`) — source must exist (`:664-665`), be primitive (`:666-669`), the transform must `canTransform(sourceType)` (`:670-674`), and the source's ancestors must all be structs (`:677-683`). Run from `Builder.build()` (`:630-638`) and directly in `addPartitionSpecInternal` (`TableMetadata.java:1685`).
+
+## 7. v1 tables breaking sequential field-ID layout
+
+v1 has no tracked field IDs and assumes IDs are `1000, 1001, ...`. Reordering, dropping, or inserting IDs out of sequence makes manifest metadata unreadable (spec.md #633).
+
+Guards:
+- `addPartitionSpecInternal` enforces `PartitionSpec.hasSequentialIds(spec)` for v1 (`TableMetadata.java:1686-1689`), which checks each field ID equals `PARTITION_DATA_ID_START + i` where `PARTITION_DATA_ID_START = 1000` (`PartitionSpec.java:64, 688-695`).
+- `apply()` replaces removed v1 fields with `Transforms.alwaysNull()` (the `void` transform) keeping the same ID and position (`BaseUpdatePartitionSpec.java:315-327`), rather than dropping — so order/IDs stay sequential.
+- `reassignPartitionIds` preserves this for v1 (`TableMetadata.java:690-711`): keep each field or replace missing with `void`, then append new fields at the end (`:709-711`).
+
+## 8. Dropped source column / orphaned void field
+
+In v1, a field's source column can be later deleted, leaving a `void` field with no valid source type. Naively validating the source type would reject the (legal) historical spec.
+
+Guard: `checkCompatibility` skips source-type checks for `Transforms.alwaysNull()` (`PartitionSpec.java:663`), and `freshSpec`/`updateSpecSchema` handle the missing column by reusing the original field ID (`TableMetadata.java:806-812`, `:768-781`), deliberately building these "invalid" specs unchecked so old manifests stay interpretable.
+
+## 9. Non-existent or wrongly-typed source field at add time
+
+Adding a partition on a field name that doesn't exist, or an unsupported source type for the transform, fails fast.
+
+Guards: `findSourceColumn` (`PartitionSpec.java:457-459`) and `Builder.addField`/`add` resolve the source and validate; `checkCompatibility` catches nonexistent/non-primitive/unsupported-type sources (`:664-674`). `BaseUpdatePartitionSpec` similarly binds terms via `resolve` and rejects non-`UnboundTerm` terms (`BaseUpdatePartitionSpec.java:348-362`).
+
+## 10. Conflicting add/delete/rename on the same field
+
+Order-dependent or self-contradictory operations (delete-then-rename, add-then-delete, rename-then-delete, duplicate add) would silently misbehave.
+
+Guards in `BaseUpdatePartitionSpec`:
+- Can't delete a newly added field (`:245-247`, `:266-267`).
+- Can't delete and rename the same field (`:249-250`, `:271-274`, `:295-296`).
+- Can't add a duplicate of an already-added field (`:203-209`).
+- Re-adding a field that's also scheduled for delete, with a rename, resolves the conflict by cancelling the delete and renaming (`rewriteDeleteAndAddField`, `:168-175`), and a re-added field that collides by name with a deleted field renames the old one via a `_<fieldId>` suffix (`:232-234`).
+
+## 11. Name/ID ambiguity between the new field and a *deleted* void field
+
+When re-adding a name that matches an existing (especially void) field, the two would collide in the resulting spec.
+
+Guard: `addField` renames the colliding existing field to `name_fieldId` before adding the new one — for both void (`:225-227`) and deleted (`:232-233`) cases; `renameField` does the same (`:284-287`).
+
+## 12. Concurrent evolution losing/validation of the base
+
+A spec change commits against stale base metadata; or the schema changes underneath the evolution.
+
+Guards / handling:
+- `commit()` re-reads and validates via `TableMetadata.Builder` (`BaseUpdatePartitionSpec.java:338-346`), and the commit-conflict path validates the schema hasn't changed (`TableMetadata.java` — the spec requires schema-unchanged validation for spec changes, spec.md #1319).
+- `updateSpecSchema` (`TableMetadata.java:768-781`) re-binds historical specs to the current schema *without* validation (`buildUnchecked`), so old specs survive schema evolution even when the old schema's types no longer validate — preventing spurious read failures.
+
+## 13. Non-default (add-only) evolutions silently changing the wrong thing
+
+`addNonDefaultSpec()` (`BaseUpdatePartitionSpec.java:153-156`) exists so a caller can add a spec without making it the writer's default; `commit()` dispatches to `base.addPartitionSpec` vs `base.updatePartitionSpec` accordingly (`:340-344`). The guard against misuse is the flag itself — protocol, not validation — but it prevents accidentally repartitioning new writes when the intent was to register an alternate spec.
+
+## Failure response mode
+
+Nearly all guards fail loudly via `Preconditions.checkArgument` / `ValidationException` with actionable messages (e.g. "Cannot add duplicate partition field name: %s", `BaseUpdatePartitionSpec.java:230`), rather than silently producing a corrupt spec — consistent with the spec's "validate at boundaries" convention. The few silent paths are deliberate and isolated to *preserving* old metadata (`updateSpecSchema`/`freshSpec` with `buildUnchecked`), never to generating new invalid state.
+
+The one thing the code deliberately does *not* fully guard is data correctness of the source type at the very instant of a type promotion — it validates the *current* source type (`PartitionSpec.java:663-674`) but relies on per-manifest spec preservation (`TableMetadata.java:1059` behavior) to keep already-written files readable, since each manifest records the spec it was written under. That's by design, not a gap being papered over.

@@ -1,0 +1,33 @@
+Row deltas — the ten things to read first.
+
+1. What the feature is and why — row deletes let you logically delete rows in immutable files without rewriting them; the whole design is built on that constraint.
+   Read: format/spec.md:109-119
+
+2. The three encodings and their version gating — position delete files (v2), deletion vectors/DVs (v3), equality deletes (v2/v3, forbidden in v4). Each version forbids certain forms.
+   Read: format/spec.md:1356-1364
+
+3. The ordering rule that makes deletes correct — deletes apply only to older data, ordered by sequence number; the spec states the exact ≤ / < rules for position vs equality deletes.
+   Read: format/spec.md:1075-1091
+
+4. The write entry point — a row delta commits rows, deletes, removed deletes, and DVs in one snapshot; `BaseRowDelta` is the thin API shell.
+   Read: core/src/main/java/org/apache/iceberg/BaseRowDelta.java:31 (and the four ops at :62-85)
+
+5. All the real logic lives here — `MergingSnapshotProducer` buffers deletes/DVs separately, writes delete manifests on their own, and merges DVs.
+   Read: core/src/main/java/org/apache/iceberg/MergingSnapshotProducer.java:271-316 (version gating) and :1209-1236 (DV merge)
+
+6. The read side / delete application — `DeleteFileIndex` turns the spec's sequence-number + partition scope rules into "which delete files apply to this data file."
+   Read: core/src/main/java/org/apache/iceberg/DeleteFileIndex.java:158-175 (the application entry) and :881 (equality strict-less-than trick)
+
+7. Engines actually consume deletes through this — `DeleteFilter` applies equality then position deletes per file and augments the schema with `_pos`/`_deleted`.
+   Read: data/src/main/java/org/apache/iceberg/data/DeleteFilter.java:188-190 and :282-333
+
+8. Concurrency/conflict guards — every row delta re-validates that referenced files still exist, no conflicting deletes landed, no duplicate DVs, and only matches an isolation level.
+   Read: core/src/main/java/org/apache/iceberg/BaseRowDelta.java:132-174
+
+9. Retry + cleanup after a failed optimistic commit — commits retry with backoff and only delete rewritten manifests once the committed snapshot is confirmed.
+   Read: core/src/main/java/org/apache/iceberg/SnapshotProducer.java:484-582
+
+10. How a query engine drives it — Spark's MERGE/UPDATE/DELETE is reduced to "delete by position + insert" and committed through `RowDelta` with validations selected by isolation level; Flink mirrors it. This is where you'll see DVs emitted on v3+.
+   Read: spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkPositionDeltaWrite.java:211-285
+
+Start at #1 and #3 (the spec, why), then #4/#5 (write), #6/#7 (read), and treat #8-#10 as behavior you confirm once the model is in your head. The mental model in one line: immutable data + ordered delete metadata = a correct snapshot without rewriting files.

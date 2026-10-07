@@ -1,0 +1,35 @@
+Now I have the full picture. Here's how `BaseIncrementalChangelogScan` implements the spec, with file:line references.
+
+The scan pipeline
+
+doPlanFiles() (BaseIncrementalChangelogScan.java:56) is the entry point. It has three stages, each mapped to a spec mechanism:
+
+1. Bounded snapshot lineage — fromSnapshotIdExclusive()/toSnapshotIdInclusive() (BaseIncrementalScan.java:133, 159)
+   These resolve the requested range `(from, to]` into concrete snapshot IDs, validating against the table's snapshot graph. The crucial part for the spec: for inclusive "from" snapshots, it sets the exclusive bound to the from-snapshot's parent (BaseIncrementalScan.java:175). This makes ADDED files in the from-snapshot itself appear as changes, matching the parent-child lineage spec (spec.md:958 parent-snapshot-id; the lineage below is walked via those parent links). It also rejects `from`/`to` that aren't on the same branch via `isAncestorOf`/`isParentAncestorOf` (BaseIncrementalScan.java:169, 180).
+
+2. orderedChangelogSnapshots() (BaseIncrementalChangelogScan.java:103)
+   Calls SnapshotUtil.ancestorsBetween(table, toIdIncl, fromIdExcl) (SnapshotUtil.java:205), which walks the parent-snapshot chain from `to` down to (but not including) `from` (SnapshotUtil.java:217-219). This is exactly the "diff of snapshots via parent lineage" the spec enables with snapshot-id + parent-snapshot-id (spec.md:957-958). The snapshots are pushed onto a deque oldest-first (addFirst, line 113), and the comment at :102 states the order drives change ordinals.
+
+3. Manifest diff via entry status
+   The scan only pulls manifests whose snapshot is in the range (filter at :71, :80), then hands each manifest entry to CreateDataFileChangeTasks (line 92), which switches purely on entry.status() (line 156): ADDED → a change with rows, DELETED → a change representing removed rows. This is a direct reading of the "status: 0 EXISTING, 1 ADDED, 2 DELETED" manifest entry field — including the spec's stipulation that DELETED is "informational only and not used in scans" (spec.md:691): normal scans ignore DELETED, but the changelog scan reads it as a change. The `.ignoreExisting()` at line 81 is the concrete flip: a changelog scan deliberately drops EXISTING entries (which a normal scan would keep) and keeps ADDED/DELETED.
+
+The `_change_*` columns
+
+The three reserved spec columns map to methods carried on every task:
+- `_change_ordinal` (spec.md:456) → changeOrdinal() (BaseChangelogContentScanTask.java:45). Computed by computeSnapshotOrdinals() (BaseIncrementalChangelogScan.java:124), which numbers the ordered snapshots oldest-first starting at 0. This is why ordering is preserved: the ordinal is the position of the committing snapshot in the walked lineage.
+- `_commit_snapshot_id` (spec.md:457) → commitSnapshotId() (BaseChangelogContentScanTask.java:50). Set to entry.snapshotId() at BaseIncrementalChangelogScan.java:152 — the snapshot that added or deleted the file.
+- `_change_type` (spec.md:455) is not set in core here; it's implied by the task subtype (AddedRowsScanTask vs DeletedDataFileScanTask, constructed at :158/:168). The engine reading these tasks assigns INSERT vs DELETE (and UPDATE pairs) — consistent with the spec reserving the column ID but leaving classification semantics to engines, as I noted before.
+
+Where the implementation deliberately diverges / can't fully, and why
+
+- Row lineage fields (`_row_id`, spec.md:461-546) are NOT reconciled here. This scan correllates changes by file-level manifest status, not by `_row_id`. That's why it can't emit a true UPDATE_BEFORE/UPDATE_AFTER pair by itself — it has no way to match which deleted rows correspond to which added rows. The spec's lineage machinery exists to enable that, but this core scan only surfaces file-level ADD/DELETE.
+
+- Deletes are explicitly unsupported: orderedChangelogSnapshots() throws if a snapshot has any delete manifests (BaseIncrementalChangelogScan.java:108-111). Note the spec's ADD/DELETE diff (spec.md:691) is about whole data files being added/removed, which is exactly what this scan consumes — but row-level deletes (spec.md:115-119) don't show up as a file ADDED/DELETED, so the scan rejects them rather than silently producing an incomplete change stream. It passes NO_DELETES to every task (:162, :171) for the same reason.
+
+- REPLACE operations are skipped entirely (BaseIncrementalChangelogScan.java:107) — only append/overwrite/delete snapshots contribute changes. This aligns with the spec's snapshot `operation` field (spec.md:969-975): REPLACE is defined as "without changing table data" (compaction/format change), so a replace-only snapshot emits no data changes and is filtered out.
+
+- The expired-snapshot edge case: fromSnapshotExclusive() explicitly can't validate the from-ID against table.snapshot() because it may point to an already-expired parent (BaseIncrementalScan.java:64-68). This maps to the spec's note that re-adding/changing around garbage-collected snapshots can break incremental reads (spec.md:711).
+
+Summary of the match
+
+The implementation is a faithful reading of the spec's "changes are derived, not stored" model: it never inspects row data for change detection — it walks snapshot parent lineage to bound the range, diffs manifest entries by ADDED/DELETED status, and carries the committing snapshot's id + an ordinal as the `_change_commit_snapshot_id`/`_change_ordinal` metadata. It applies the spec's caveats literally: REPLACE skipped (operation semantics), delete manifests rejected (row-level deletes aren't file diffs), EXISTING entries dropped (spec: DELETED/ADDED are the change signal for scans that want it). The only capability the spec models but this core scan doesn't implement is row-lineage-based UPDATE correlation, which is left to the engine layer.

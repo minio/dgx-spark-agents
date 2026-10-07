@@ -1,0 +1,64 @@
+I now have the complete call chain. Here is how `BaseOverwriteFiles` and the code it calls implement the spec.
+
+## Structure of the call chain
+
+`BaseOverwriteFiles` extends `MergingSnapshotProducer<OverwriteFiles>` (BaseOverwriteFiles.java:31), which extends `SnapshotProducer` (MergingSnapshotProducer.java:69). The actual snapshot creation/commit lives in `SnapshotProducer`; `MergingSnapshotProducer` handles manifest rewriting and delete-file merging; `BaseOverwriteFiles` adds the overwrite-specific semantics and conflict validation.
+
+## 1. The `overwrite` operation label (spec line 973)
+
+The spec says `overwrite` is "data and delete files were added and removed in a logical overwrite operation". The implementation derives this label dynamically in `operation()` (BaseOverwriteFiles.java:49-60):
+
+- deletes data files, adds none  -> `DataOperations.DELETE` (line 52)
+- adds data files, deletes none -> `DataOperations.APPEND` (line 56)
+- both added and removed        -> `DataOperations.OVERWRITE` (line 59)
+
+This matches the spec's set {append, replace, overwrite, delete} (spec lines 971-974). The constants are literally `"append"`/`"overwrite"` (DataOperations.java:36,50), the same strings the snapshot summary stores (SnapshotProducer.java:343, 366 uses `operation()` when building the `BaseSnapshot`).
+
+## 2. Add and remove in one atomic commit (spec: serializable isolation, lines 71, 91-99)
+
+An overwrite never mutates files in place; it stages new files as ADDED and marks replaced files as DELETED, all committed by one metadata swap. The single-commit path is in `SnapshotProducer.commit()` (SnapshotProducer.java:484-582): each attempt calls `apply()` (line 500), builds the next `TableMetadata` from the base (line 502), then atomically swaps the metadata pointer via `taskOps.commit(base, updated)` (line 533). The swap (backed by the catalog check-and-put) is exactly the "atomic swap... serializable isolation" goal. Any `CommitFailedException` is retried with backoff (lines 489-496) — the spec's optimistic-concurrency retry (spec lines 95-99).
+
+How a single commit carries both removals and additions:
+- Additions: `addFile` -> `MergingSnapshotProducer.add()` (BaseOverwriteFiles.java:70 -> MergingSnapshotProducer.java:240) buffers new data files; `apply()` writes them into new manifests carrying this snapshot's id (MergingSnapshotProducer.java:1134-1146, SnapshotProducer.java:744-753), entries written via `ManifestWriter.add` (ManifestWriter.java:147) which wraps them `ADDED`.
+- Removals: `deleteFile`/`deleteFiles` (BaseOverwriteFiles.java:75-93) send files to a `ManifestFilterManager` (MergingSnapshotProducer.java:206-208), which rewrites existing manifests and marks the removed files `DELETED` (ManifestFilterManager.java:503-578, and `writer.delete(entry)` at line 538 with `ManifestWriter.delete` at ManifestWriter.java:204-208).
+
+These two effects land in the same `apply()` (MergingSnapshotProducer.java:1018-1084) and therefore the same snapshot/metadata commit.
+
+## 3. Rewriting manifest entries with status DELETED instead of physical deletion (spec, manifest entry fields, lines 691, 701-711)
+
+`deleteByRowFilter` (spec's "logical overwrite") and `deleteFile` both route through `ManifestFilterManager`. For deleting by row filter (default overwrite filter), the manager uses an inclusive/strict projection + metrics-evaluator combo to find files where ALL rows match the filter — and rejects files where only some rows match (ManifestFilterManager.java:472-489, 527-535: "Cannot delete file where some, but not all, rows match filter"). This directly implements the spec's rule that a delete-by-filter applies when every row in the file is being replaced.
+
+Removed files are written back as DELETED entries (status 2) in a rewritten manifest — `ManifestWriter.delete` (ManifestWriter.java:204-208) — with the original data/file sequence numbers preserved, matching spec lines 701-706 ("store the snapshot ID in which the file was deleted and status 2... sequence numbers must be non-null and set to the original values"). The old data files are not physically removed here; physical GC happens later via snapshot expiration (spec lines 1118-1132) — consistent with the file-system-ops requirement of write-in-place + deferred deletes (spec lines 121-131).
+
+## 4. Replace-by-row-filter must only delete whole files (spec scan-planning inclusive projection, lines 1059-1069)
+
+`overwriteByRowFilter(expr)` (BaseOverwriteFiles.java:63-66) calls `deleteByRowFilter` (MergingSnapshotProducer.java:190-196). The spec says delete-by-expression requires all rows in a file to match (whole-file replacement), which is enforced by `PartitionAndMetricsEvaluator.rowsMustMatch` using `ResidualEvaluator` (ManifestFilterManager.java:583-630) — inclusive metrics projection for "might match," strict for "must match." This is the same inclusive/strict projection machinery the spec describes for partition predicates (spec lines 1061-1063).
+
+## 5. Retry requires validating replaced files are still present (spec commit conflict resolution, lines 1312-1319)
+
+`BaseOverwriteFiles.validate()` (BaseOverwriteFiles.java:136-179) implements the spec's retry conditions. The overwrite-specific validations, all gated on the snapshot the conflict is detected against (`validateFromSnapshot`, line 102):
+- `validateAddedFilesMatchOverwriteFilter` (lines 96-99) — with the filter enabled, `validate()` re-checks that every added file's rows match the overwrite filter (lines 137-161), using inclusive + strict projections and `StrictMetricsEvaluator`. This is post-merge-definition but is part of "the added file matches the filter".
+- `validateNoConflictingData` (lines 116-120) -> `validateAddedDataFiles` (MergingSnapshotProducer.java:391-412) scans the validation window of snapshots (only `append`/`overwrite` ops, line 439) and throws if fresh data files appeared that could contain matching rows. Spec: an overwrite reruns only if conditions hold.
+- `validateNoConflictingDeletes` (lines 123-127) -> `validateNoNewDeleteFiles` (MergingSnapshotProducer.java:574-584) and `validateNoNewDeletesForDataFiles` (475-553), verifying no row-level deletes were added in the window.
+
+Most importantly, `failMissingDeletePaths()` (BaseOverwriteFiles.java:118,125 -> MergingSnapshotProducer.java:179-182) triggers `validateRequiredDeletes` (ManifestFilterManager.java:281-303): if a file the overwrite intends to delete is no longer actually present in the table, the commit fails with "Missing required files to delete" — precisely the spec's "Replace/overwrite operations must verify that the files that will be deleted are still in the table" (spec line 1317-1318). Notice the contrast the spec draws (line 1316: appends "can always be applied") is why `operation()` returns APPEND for pure adds, which skip this delete validation.
+
+## 6. Delete files may be added in an overwrite (spec line 973)
+
+`overwriteByRowFilter` also filters delete manifests (MergingSnapshotProducer.java:192-195), and `deleteFiles(..., deleteFilesToDelete)` (BaseOverwriteFiles.java:75-86) lets an overwrite remove delete files. New delete files (e.g. row-level deletes expressed as an overwrite) are written into delete manifests by `apply()` (MergingSnapshotProducer.java:1041-1055, 1167-1207). Version gating is enforced in `validateDeleteFileForVersion` (MergingSnapshotProducer.java:295-316): deletes rejected in v1 (spec: "row-level deletes... not supported in v1", spec line 1358), DVs required for position deletes in v3/v4 (spec lines 1363, 1953), equality deletes correctly allowed in v2/v3.
+
+## Summary mapping table
+
+| Spec requirement | Implementation |
+|---|---|
+| `overwrite` = add+remove (spec:973) | `operation()` BaseOverwriteFiles.java:49-60 |
+| Single atomic metadata swap (spec:71,91-99) | `SnapshotProducer.apply()`+`commit()` SnapshotProducer.java:295-373, 484-533 |
+| Add as ADDED entries | `ManifestFilterManager.add`/`ManifestWriter.add` MergingSnapshotProducer.java:240, ManifestWriter.java:147 |
+| Remove as DELETED entries, keep seq numbers | `ManifestWriter.delete` ManifestWriter.java:204-208 (sets status 2) |
+| Delete-by-filter only whole files | ManifestFilterManager.java:472-489,527-535 |
+| Physical deletion deferred to GC (spec:1118-1132) | entries marked DELETED only; deletion via `deleteFile` used for uncommitted manifests, not data |
+| Retry requires replaced files present (spec:1312-1319) | `failMissingDeletePaths` + `validateRequiredDeletes` MergingSnapshotProducer.java:179, ManifestFilterManager.java:281-303 |
+| No conflicting concurrent writes | `validate()` BaseOverwriteFiles.java:136-179 -> MergingSnapshotProducer.java:363-779 |
+| Delete-file version rules (v1/v2/v3/v4) | `validateDeleteFileForVersion` MergingSnapshotProducer.java:295-316 |
+
+The overall design matches the spec's intent precisely: overwrite is a logical, atomic, single-commit operation on immutable files, expressing replacement as manifest-entry status changes in a new snapshot, with the spec's required validation (replaced files still present, no concurrent conflicting writes) handled before the atomic metadata swap.

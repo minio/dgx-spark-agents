@@ -1,0 +1,6 @@
+__pycache__/
+out/
+harness/task-hermes-iceberg/
+harness/hermes-tmp/
+harness/hermes-fleet/
+setup/openshell/image/iceberg/

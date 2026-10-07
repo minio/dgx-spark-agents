@@ -1,0 +1,25 @@
+Partition evolution is how an Iceberg table changes its partition layout (add/remove/rename/reorder fields, or change a transform) without rewriting existing data or old metadata. It works because every manifest remembers the spec it was written under, so reads always use each file's own spec.
+
+Ten bullets, each pointing to the file/line to read starting with:
+
+1. Evolution = append a new spec to `partition-specs` and optionally flip `default-spec-id`; old files keep their old spec. Table metadata is where specs live: `partition-specs`, `default-spec-id`, `last-partition-id`. — TableMetadata.java:1157-1159 (and addPartitionSpecInternal at :1671).
+
+2. The entry point. All changes funnel through one guarded class: add/remove/rename record *intent* in `adds`/`deletes`/`renames`, then `apply()` rebuilds the spec and `commit()` persists it. — BaseUpdatePartitionSpec.java:178-241 (addField), :303-335 (apply), :338-346 (commit).
+
+3. The spec's sacred rule: field IDs must never change across evolution, because they're the field IDs of the `partition` tuple struct in every manifest. Preserved in `apply()` and reused across specs. — BaseUpdatePartitionSpec.java:307-314, recycleOrCreatePartitionField :122-144.
+
+4. New field IDs in v2+ come from a running counter kept on table metadata, so two evolutions never collide. — BaseUpdatePartitionSpec.java:108-111 and TableMetadata.java:1692-1693.
+
+5. Don't mint a duplicate spec: if a compatible spec already exists, reuse its spec ID instead. Compatibility = same fields, same source IDs, same transforms, same names. — TableMetadata.java:1704-1716 and PartitionSpec.java:245-265 (compatibleWith).
+
+6. v1 tables have no tracked field IDs and must stay sequential from 1000 — so you can't reorder/drop; removed fields become `void` (`alwaysNull`). — BaseUpdatePartitionSpec.java:315-327 and PartitionSpec.java:688-695 (hasSequentialIds).
+
+7. Validation at commit: source must exist, be primitive, nest only in structs, and the transform must accept its type. All enforced before the spec is added. — PartitionSpec.java:649-686 (checkCompatibility) and TableMetadata.java:1685.
+
+8. Name collisions are rejected: a partition field can't duplicate a name in the schema or another partition field, and redundant transforms on one source are blocked. — PartitionSpec.java:407-433 (checkAndAddPartitionName), :435-445; BaseUpdatePartitionSpec.java:375-385.
+
+9. Reads depend on per-manifest specs, not the default. Core projects the scan filter with each manifest's own spec, so a query works across a mix of old and new partitions with no change. — ManifestGroup.java:211-212 and :284-290 (Projections.inclusive per spec).
+
+10. Engines (Spark) drive and consume it: `ALTER TABLE ... PARTITION` DDL calls `updateSpec()`, and Spark builds a unified grouping key from the union of all live specs so scheduling/deletes/placement stay correct mid-evolution. — AddPartitionFieldExec.scala:42-45, SparkPartitioningAwareScan.java:169-177, Partitioning.java:225-227.
+
+Field IDs are everything: stable IDs (bullets 3-4) are what let old and new specs coexist, and per-manifest specs (bullet 9) are what let queries ignore the whole thing. Everything else is validation around those two ideas.

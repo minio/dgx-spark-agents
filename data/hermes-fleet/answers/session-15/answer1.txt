@@ -1,0 +1,37 @@
+I read the full spec (all 2,153 lines). Here's what it says about Puffin statistics files.
+
+## What the spec says
+
+The main treatment is in the **Table Statistics** section (spec.md:1207-1234), referenced from table metadata (spec.md:1168, 1196).
+
+**Registration in table metadata.** Table metadata carries an optional `statistics` field — a list of statistics-file descriptors, each tied to a specific table snapshot. Each descriptor has:
+- `snapshot-id` — the Iceberg snapshot the statistics file describes
+- `statistics-path` — path to the Puffin file
+- `file-size-in-bytes` — full file size
+- `file-footer-size-in-bytes` — total footer size (not just the payload)
+- `key-metadata` — optional, base64, implementation-specific encryption key metadata
+- `blob-metadata` — a list of blob descriptors
+
+**Blob descriptors** (one per statistic blob in the file) carry: `type` (matches the blob type in the Puffin file), the `snapshot-id` and `sequence-number` of the snapshot the blob was computed from, an ordered `fields` list (field IDs the statistic was calculated on), and optional `properties`.
+
+**Status of the data.** The spec is explicit that statistics files are *informational*: a reader may choose to ignore them, support for them is not required to read a table correctly, and a table can hold many statistics files associated with different snapshots.
+
+**Puffin used elsewhere in the spec.** Puffin isn't only for table statistics. It's also the container for **deletion vectors** in v3: a DV uses the `deletion-vector-v1` blob type from the Puffin spec (spec.md:1379), and delete manifests reference each DV blob by its containing file, `content_offset`, and `content_size_in_bytes` in the Puffin footer (spec.md:756, 1385, 1949-1950). Puffin is also one of the legal `file_format` values for data-file entries (spec.md:722).
+
+## Why it's designed this way
+
+Several design choices fall out of the spec's broader goals (spec.md:69-77), especially serializable isolation, O(1) planning, and keeping statistics off the read path:
+
+- **Decoupled from the core read/plan path.** Statistics support "is not required to read the table correctly." Puffin files are an optimization/analytics aid, not a correctness dependency. This keeps the scan-planning critical path lean and means engines that don't need the stats can safely ignore them. It also means a bug in a statistics file can never corrupt query results — worst case, stats are missing.
+
+- **Self-describing and evolving.** Because statistics are meant to be computed and added *after* data is written (potentially on demand, by different systems over time), the registration is snapshot-scoped and content is organized as a list of typed blobs. The `blob-metadata` at the table-metadata level is a lightweight index so a reader can see what's available without opening every file. This is consistent with Iceberg's design of keeping fast-changing analytics (stats) separate from slow-changing correctness-critical structures (manifests).
+
+- **Composability / interop.** Using a single general-purpose container (Puffin) for both human-readable statistics and deletion vectors means one format and one reader/writer stack. The `deletion-vector-v1` blob and table statistics can coexist in the same Puffin file model.
+
+- **Immutable, snapshot-associated.** Aligning each statistics file with a snapshot-id (and sequence-number per blob) preserves Iceberg's time-travel/isolation model: stats are attribute of a specific table state, so a reader can pick the stats matching the snapshot it's reading, and writers can attach a new stats file to a new snapshot without invalidating older ones.
+
+- **Forward compatibility / envelope pattern.** The descriptor fields (sizes, footer size, key-metadata, blob metadata) are exactly what a consumer needs to locate, decrypt, and fetch blob payloads from a Puffin file by offset. Optional fields (key-metadata, properties) use the spec's standard "optional only written when present" rule so older readers aren't forced to understand encryption or extra props.
+
+The reason it's all *optional* rather than required boils down to a core Iceberg value: **correctness and scan speed must never depend on auxiliary metadata.** Statistics are an enhancement layered on top — safe to ignore, safe to add later, and strictly separated from the metadata that defines table content.
+
+(Note: the detailed binary layout of the Puffin file itself — magic, blobs, footer properties, compression — lives in the separate `format/puffin-spec.md`, which spec.md references rather than inlining.)

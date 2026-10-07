@@ -1,0 +1,70 @@
+I've now read the implementation end-to-end (PartitionSpec, PartitionField, Transform, Transforms, Bucket, Truncate, Identity, VoidTransform, TimeTransform/Days/Dates, BucketUtil, TruncateUtil, UnicodeUtil). Here are the edge cases and failure modes in partitioning and how each is guarded, with citations.
+
+## A. Null handling
+- **Spec:** "All transforms must return null for a null input value" (spec.md:582).
+- **Failure if not guarded:** A null input would either crash or (worse) be silently bucketed/truncated into a bucket that the same null can't reproduce, making scan pruning incorrect.
+- **Guard:** every `apply` returns null on null input: `Bucket.apply` (Bucket.java:112-115), `TruncateInteger/Long/...` (Truncate.java:181-186), `Identity` (Identity.java:88-90), `TimeTransform`/`Dates.Apply` (Dates.java:48-51), `VoidTransform` always null (VoidTransform.java:61-63). Null partition values also survive into `toHumanString` as "null" (Transform.java:168-172).
+
+## B. Bucket hash correctness (the highest-leverage spec item)
+- **Spec:** `bucket_N(x) = (murmur3_x86_32_hash(x) & Integer.MAX_VALUE) % N` (spec.md:598); Appendix B mandates 32-bit Murmur3 x86 seeded 0 and per-type hashing (spec.md:1620-1637).
+
+**B1. Negative hash / sign bit.** `(hash & Integer.MAX_VALUE)` guarantees a non-negative value before `% N` (Bucket.java:116). If the sign bit weren't discarded, negative hashes would produce negative buckets.
+- **Guard:** Bucket.java:116.
+
+**B2. Implementation drift on the hash itself.** The bucket *value written into manifests* must be byte-identical across engines, or files written by one engine get mis-pruned by another.
+- **Guard:** `BucketUtil` fixes exactly the spec's algorithm: `Hashing.murmur3_32_fixed()` (BucketUtil.java:34). Per-type rules match Appendix B: int via `hashLong` so int==long (BucketUtil.java:38-44, spec.md:1651); string UTF-8 (67); uuid big-endian via `reverseBytes` (92-99, spec.md:1655); `-0.0` canonicalized to `+0.0` for float/double (46-56, spec.md:1657); timestamp_ns converted to micros before hashing (Bucket.java:236-247, spec.md:1654).
+
+**B3. Schema evolution changing bucket values.** Spec: promotion must not change bucket values (spec.md:381, 1651).
+- **Guard:** the int==long hash identity (B2) is what makes int→long promotion safe. Note the comment "cannot bucket by type" switch only accepts the valid source types (Bucket.java:120-136) matching spec.md:574.
+
+## C. Width/parameter validation
+- **Spec:** N and W must be sensible; truncate decimal width applies at the column's scale (spec.md:602-620).
+- **Guard:** `bucket` requires `numBuckets > 0` (Bucket.java:41-42, 55-56); `truncate` requires `width > 0` (Truncate.java:41-42); `UnicodeUtil.truncateString` checks length > 0 (UnicodeUtil.java:42). A non-positive value throws immediately rather than producing a broken spec.
+
+## D. Truncate on negatives — a genuine correctness-critical edge
+- **Spec:** "The remainder, v % W, must be positive... `v - (((v % W) + W) % W)`" (spec.md:618). Example: W=10: `1→0`, `-1→-10` (610).
+- **Failure if naive:** Java's `%` returns a *negative* remainder for negative operands, so plain `v - (v % W)` would mis-truncate negatives (e.g. `-1 % 10 = -1`, giving `-1` instead of `-10`), breaking the truncate() projection contract.
+- **Guard:** `TruncateUtil` implements the spec daguerreotype: `value - (((value % width) + width) % width)` (TruncateUtil.java:55-61), and decimals do the same on the unscaled value (TruncateUtil.java:63+). The per-type `apply` null-guards then call it (Truncate.java:181-186, 239-245, 475-481).
+
+## E. String truncation vs. UTF-8 codepoint boundaries
+- **Spec:** "Strings are truncated to a valid UTF-8 string with no more than L code points" (spec.md:620).
+- **Failure:** truncating by raw char/byte position can split a surrogate pair, producing an *invalid* string that violates the partition-value invariants.
+- **Guard:** `UnicodeUtil.truncateString` counts **code points** and only cuts at a codepoint boundary (UnicodeUtil.java:41-55), and it no-ops when already within length (48-50).
+
+## F. Identity on disallowed types
+- **Spec:** identity = "any primitive except for geometry and geography" (spec.md:573).
+- **Guard:** `Identity.canTransform` rejects `VARIANT`, `GEOMETRY`, `GEOGRAPHY` (Identity.java:34-35, 100-106).
+
+## G. Invalid/unsupported source types at build time
+- **Failure:** partitioning on a non-primitive (struct/list/map) or a type a transform can't handle would corrupt the write path.
+- **Guard:** `Builder.checkCompatibility` validates each field: `sourceType.isPrimitiveType()`, `transform.canTransform(sourceType)`, and every parent type is a struct (PartitionSpec.java:649-686). Bucket/Truncate **throw** `IllegalArgumentException`/`UnsupportedOperationException` on unsupported types (Bucket.java:77-78, Truncate.java:65-66) — a hard failure rather than a silent mis-bucket. This is what makes unknown transforms readable-but-not-writable (spec.md:563, 1741).
+
+## H. Redundant / duplicate partition fields
+- **Spec:** two fields partitioning the same column by the same transform are redundant (equivalent spec must not be duplicated, spec.md:565-567).
+- **Failure:** duplicate identical partitions waste metadata and fragment manifests.
+- **Guard:** `checkForRedundantPartitions` keys on `sourceId + transform.dedupName()` and rejects matches (PartitionSpec.java:435-445); time transforms share `dedupName()=="time"` (TimeTransform.java:103-105) so `month(ts)` + `day(ts)` collide as intended while `bucket[8]` vs `bucket[16]` differ.
+
+## I. Partition name collisions and identity naming
+- **Failure:** duplicate names break `name=value` path segments and confused projection; identity partition names must trace to their source column.
+- **Guard:** `checkAndAddPartitionName` enforces uniqueness and rejects empty names (PartitionSpec.java:429-432), and requires an identity partition's name to map to its own source field (PartitionSpec.java:416-426).
+
+## J. Predicate projection correctness (scan-pruning edge cases)
+- **Spec:** inclusive projection "if a scan predicate matches a row, then the partition predicate must match that row's partition" (spec.md:1061-1062); strict projection for residuals (spec.md:1095); unknown transforms project to *true* (spec.md:1065).
+
+**J1. Projections that could exclude matching rows (incorrect pruning).** This is the cardinal correctness rule.
+- **Guard:** `Transform.project` (inclusive) and `projectStrict` are separated (Transform.java:105-128). Critically, transforms return `null` where they *can't* safely project — never a wrong filter: `Bucket.project` only projects EQ/IN and returns null for comparisons it can't bound (Bucket.java:177-180), and `projectStrict` similarly only NOT_EQ/NOT_IN (192-201). `VoidTransform` returns null from both (VoidTransform.java:81-88). For bucketed columns, no inclusive range pruning is attempted at all because it would be unsound.
+
+**J2. Time projection bounds (day/ts → coarse).** Truncating an upper bound up or a lower bound down must not exclude a matching row.
+- **Guard:** `Dates`/truncate projections call `fixInclusiveTimeProjection`/`fixStrictTimeProjection` for coarser granularities (Dates.java:143-147, 174-179) — this adjusts inclusive bounds outward so the inclusive projection remains a superset.
+
+**J3. Unknown transforms must not prune.** Spec: unknown transform's inclusive projection is *true* (spec.md:1065, 1098).
+- **Guard:** `UnknownTransform` returns null/true (skips filtering) and the manifest reader maps it to `Object.class` so the value can still round-trip (PartitionSpec.java:185-186).
+
+## K. Evolution: field-id / spec uniqueness
+- **Spec:** ids reused for equivalent fields; ids must not change when evolving (spec.md:567-567, 629); v1 sequential-from-1000 scheme (spec.md:633).
+- **Guard:** `PARTITION_DATA_ID_START = 1000` with `nextFieldId()` (PartitionSpec.java:64, 394-396). `hasSequentialIds` detects the fragile v1 sequential layout (688-695), which the spec warns breaks when manifests from multiple specs share ids with different types. Redundant-partition rejection (H) is what forces id *reuse* rather than new ids for equivalent fields.
+
+## Summary of the pattern
+The code guards partitioning with two complementary strategies: **hard validation at build time** (types, parents, widths, name/duplicate collisions — `checkCompatibility`) so a bad spec can't be created, and **soundness-preserving runtime projections** (null input → null, positive buckets, spec-exact hash, codepoint-safe truncation, no-projection-when-unsafe, inclusive-bounds fixing) so scan pruning never drops a matching row. The `(hash & Integer.MAX_VALUE)` mask, the positive-remainder truncate formula, and the separated inclusive/strict `null`-on-unsafe projections are the three where a subtle bug would silently corrupt pruning — all verified implemented exactly as the spec prescribes.
+
+One limit on my coverage: `core/` owns the code that *consumes* these projections during actual scan planning (manifest/partition evaluators, per-manifest spec selection), and I only traced `api/` here. The failure modes around evolve-while-planning (a file written under spec #0 scanned with the table's current spec) are managed there. Want me to trace that consumer path for the pruning edge cases?

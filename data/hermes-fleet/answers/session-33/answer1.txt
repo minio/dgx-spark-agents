@@ -1,0 +1,45 @@
+I read the whole file (2,153 lines). Here's the honest framing up front: **spec.md never uses the phrase "changelog scan."** That's an engine-level feature name (Spark/Flink call it `scan` with `fromSnapshotId`, "incremental read", "change data"). What the spec defines is the machinery that makes changelog-style reads possible plus a set of reserved metadata columns specifically for change data. So the answer is: what the spec provides, and why it's shaped that way.
+
+What the spec actually specifies
+
+1. Manifest entries carry add/delete status (line 691)
+   Each entry has `status`: 0 EXISTING, 1 ADDED, 2 DELETED. Critically, DELETED entries are "informational only and not used in scans" — a normal table scan only reads live (EXISTING/ADDED) files. This add/remove record-per-file is exactly what allows an engine to diff snapshots and reconstruct what changed.
+
+2. Reserved changelog metadata columns (lines 455-457)
+   The metadata-column table reserves three IDs specifically for change data:
+   - `_change_type` (string): INSERT, DELETE, UPDATE_BEFORE, or UPDATE_AFTER
+   - `_change_ordinal` (int): the order of the change
+   - `_commit_snapshot_id` (long): the snapshot in which the change occurred
+   These let an engine attach a per-row change classification to scan output. Note they're listed as reserved columns available for use in user data schemas — the spec reserves the IDs but does not mandate how row-level changelogs are materialized.
+
+3. Row lineage fields (v3+, lines 461-546)
+   `_row_id` (unique per row) and `_last_updated_sequence_number` are tracked for all newly created rows. Assignment is via inheritance (see below). This is how a changelog read can correlate UPDATE_BEFORE/UPDATE_AFTER pairs and tell a row was modified rather than deleted+reinserted.
+
+4. Snapshot lineage and summary (lines 69-119, 951-997, 969-975)
+   Snapshots form a parent-child graph, each has a `sequence-number`, and each carries a `summary.operation` — append, replace, overwrite, delete. The parent-snapshot-id chain is what lets an engine walk "all snapshots between snapshot N and the current one" to produce an incremental/change view.
+
+5. Sequence-number inheritance (lines 101-107, 928-939)
+   Manifests, files, and entries inherit a snapshot's sequence number from the manifest list at read time, precisely so a manifest can be written once and reused across commit retries (only the manifest list is rewritten on a retry). This gives every file a stable, monotonically increasing age — the ordering primitive changelog reads need.
+
+6. Position/equality delete files can carry the deleted row (lines 1373, 1405-1411, 1418-1420)
+   "Both position and equality delete files allow encoding deleted row values with a delete. This can be used to reconstruct a stream of changes to a table." That's the only place the spec explicitly says "changes." For a changelog you need the old values of a deleted row; the deleted-row column makes that possible.
+
+Why it's designed this way
+
+The design is a direct consequence of Iceberg's two core commits: immutable files + immutable, append-only metadata with optimistic concurrency (lines 84-99, 1136). Everything else follows from those.
+
+- Changes are derived, not stored. Because data files are never rewritten in place and each commit produces a new snapshot, the "what changed" is already implicit in the diff between two manifest sets. The spec doesn't need a change log — the manifest ADDED/DELETED entries and the snapshot lineage are the log. This is why DELETED entries exist at all despite being excluded from normal scans (line 691): they exist to make that diff reconstructable.
+
+- Total order comes from sequence numbers, not time. Changelog consumers want a deterministic, ordered, exactly-once-ish stream. Sequence numbers give a global monotonic order across concurrent commits that timestamps can't (two commits can share a timestamp). Inheritance exists to keep writes fast: since the sequence number isn't known until commit succeeds, files are written with null and the number is injected at read time (lines 101-107, 928-939). So ordering is free at commit time, folded in only when read.
+
+- Row lineage exists to make UPDATEs meaningful. Without `_row_id`, an update looks like delete+insert and you can't pair them. `_row_id` + `_last_updated_sequence_number` lets a changelog present a true UPDATE_BEFORE/UPDATE_AFTER pair (lines 482-488 explicitly say engines may model operations as delete+insert or as row-preserving updates). Like sequence numbers, these are assigned via inheritance for the same retry-safety reason (lines 463-468).
+
+- Iceberg commits to O(1) planning and immutable metadata (lines 72, 85), so changelog scans degrade gracefully: instead of re-reading everything, an engine can restrict to files with sequence numbers after some threshold.
+
+What the spec deliberately leaves to engines
+
+The `_change_type` / `_change_ordinal` / `_commit_snapshot_id` columns are reserved but the spec does not define how an engine decides UPDATE_BEFORE vs UPDATE_AFTER, how it orders changes, or the exact SQL API for a changelog scan. That's intentional per the module-boundary philosophy in Iceberg: the core spec gives stable primitives (status, sequence numbers, lineage, snapshot graph) and reserves column IDs so engines expose change data consistently, without pinning engine-specific semantics into core.
+
+One thing to flag: the spec notes that ADDING a previously-deleted file back "can lead to edge cases where incremental deletes can break table snapshots" and that reusing deleted files is not recommended (note 1, line 711). So changelog/incremental reads are only reliable under the well-behaved append/overwrite/delete patterns the spec assumes — a direct warning that the change stream is best-effort, not a journal-guarantee.
+
+Want me to also look at how the reference implementation (Spark's `IncrementalChangelogScan` / Flink's equivalent) consumes these primitives, since the text you asked about lives mostly in the engine layer rather than spec.md?

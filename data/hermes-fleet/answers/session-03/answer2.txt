@@ -1,0 +1,50 @@
+I've now read RemoveSnapshots.java in full plus the code it calls for snapshot expiration: `computeRetainedRefs`, `computeAllBranchSnapshotsToRetain`, `computeBranchSnapshotsToRetain`, `unreferencedSnapshotsToRetain` (all in RemoveSnapshots), the file cleanup via `ReachableFileCleanup`/`IncrementalFileCleanup`/`FileCleanupStrategy`, and `SnapshotUtil.ancestorsOf`. Here's how the implementation maps onto the spec's Snapshot Retention Policy.
+
+## 1. The retention policy algorithm (spec lines 1124-1132) is implemented in `internalApply()`
+
+The spec's numbered steps map directly to RemoveSnapshots.java:196-276.
+
+Spec step 2 — "Remove any refs (other than main) where the referenced snapshot is older than max-ref-age-ms."
+`computeRetainedRefs` (lines 278-301). It always keeps `main` (SnapshotRef.MAIN_BRANCH, lines 283-286), matching spec line 1114 ("The `main` branch never expires"). For every other ref it looks up the referenced snapshot and drops the ref when `refAgeMs = now - snapshot.timestampMillis()` exceeds `maxRefAgeMs` (lines 288-294). This also implements the spec's per-ref override of the global property (spec lines 1113-1114): `ref.maxRefAgeMs() != null ? ref.maxRefAgeMs() : defaultMaxRefAgeMs` at line 289, where `defaultMaxRefAgeMs` came from the `history.expire.max-ref-age-ms` property at lines 101-102.
+
+Spec step 3 — "For each branch and tag, add the referenced snapshot to the retained set."
+lines 206-213 build `idsToRetain` from every ref that survived `computeRetainedRefs`, adding the ref's snapshot ID to both `idsToRetain` and `retainedIdToRefs`. The `retainedIdToRefs` map exists so that the later check (lines 215-222) can reject explicitly-requested expirations (`idsToRemove`) when a retained ref still points at that snapshot — "Cannot expire X. Still referenced by refs" — which is the implementation guard for spec 1128's rule that a referenced snapshot can't be dropped.
+
+Spec step 4 — "For each branch, add its ancestors ... until older than max-snapshot-age-ms AND beyond the first min-snapshots-to-keep."
+`computeAllBranchSnapshotsToRetain` (lines 303-318) iterates over branches, computing a branch-local `expireSnapshotsOlderThan = now - ref.maxSnapshotAgeMs()` (or the global default) and `minSnapshotsToKeep` (ref override or global default) — again matching the spec's per-ref override of `max-snapshot-age-ms`/`min-snapshots-to-keep` (spec 1112-1113). It then calls `computeBranchSnapshotsToRetain` (lines 320-333): walk `SnapshotUtil.ancestorsOf(branch head, ...)` and keep an ancestor while either fewer than `minSnapshotsToKeep` snapshots have been retained OR the ancestor's timestamp is >= `expireSnapshotsOlderThan`; the first ancestor that's both old and beyond the minimum-count floor stops the walk (lines 324-329). This is precisely the spec's "until the snapshot is older than max-snapshot-age-ms AND not one of the first min-snapshots-to-keep" — the AND semantics come from the early `return` at line 328, which stops adding once both conditions hold.
+
+`SnapshotUtil.ancestorsOf` (util/SnapshotUtil.java:225-271) is the parent-lineage traversal that step 4 depends on: an iterator that walks `next.parentId()` via the lookup function (lines 243-252), yielding the head snapshot first and stopping at the root (no parent). This is the snapshot's parent-snapshot-id lineage (spec 958), which the retention algorithm uses to walk each branch's history.
+
+Spec step 5 consequences — expire everything not in the retain set. lines 233-237 compute each snapshot not in `idsToRetain` and add it to `idsToRemove`, then call `updatedMetaBuilder.removeSnapshots(idsToRemove)`, producing new table metadata whose `snapshots` list excludes the expired snapshots. `apply()` (lines 188-194) returns exactly the removed set.
+
+## 2. "Remove any refs older than max-ref-age" is only the starting set — the graceful fallback
+
+Beyond the numbered steps, there's `unreferencedSnapshotsToRetain` (lines 335-357): before expiring, it collects every unreferenced snapshot (one not reachable from any retained branch/tag) but keeps it if `snapshot.timestampMillis() >= defaultExpireOlderThan` (line 351). This means a snapshot older than `max-snapshot-age-ms` but NOT part of any ref is still expired; but an unreferenced snapshot that is still within the retention window is retained. This is a strict-superset safety behavior: expense is based on `defaultExpireOlderThan` so that no snapshot within the age window is lost, consistent with the spec's conservative "keep recent history" intent (spec 1120, 1126-1132).
+
+## 3. Their connection to the spec's purpose: physical file deletion after the last referencing snapshot is gone
+
+The spec's central justification (spec 1120, 1162/1190: delete files only when the last snapshot that listed them is garbage collected) is implemented in the cleanup strategies invoked by `commit()` at lines 360-381.
+
+`commit()` calls `internalApply()` in a retry loop (lines 361-373) with optimistic concurrency (`ops.commit(base, updated)`, matching spec's atomic metadata swap, spec 95-99 and 1136). After the metadata change is committed, it cleans expired files at lines 378-380 unless `CleanupLevel.NONE` was requested (the `cleanExpiredFiles(false)` / `cleanupLevel` switches at lines 106-114, 176-185).
+
+Two cleanup strategies:
+- `ReachableFileCleanup` (the default, used when the table has non-main branches/snapshots): computes `expiredSnapshots` = before − after (lines 64-74), collects those manifest lists for deletion, then `pruneReferencedManifests` (lines 109-142) removes from the candidate set any manifest still reachable from the surviving snapshots, and `findFilesToDelete` (lines 170-229) only deletes data files that appear in deleted manifests but not in any current manifest. This is exactly the spec's reachability invariant: a data file is deleted only when no retained snapshot reaches it (spec 1162).
+- `IncrementalFileCleanup` (chosen when only `main` is involved, lines 391-408): instead of reachability over all snapshots, it uses the spec's DELETED-entry tracking (spec 692, 701-711) — it deletes a data file precisely when a manifest entry is `Status.DELETED` and that file's deleting snapshot (`entry.snapshotId()`) is no longer valid (lines 298-307). This is the "track what files were deleted in a snapshot and delete them when that snapshot expires" approach the spec describes in note 1 (spec 710).
+
+Both delete through `FileCleanupStrategy.deleteFiles` (FileCleanupStrategy.java:107-134), which either uses bulk `FileIO.deleteFiles` or a `Tasks.foreach` with per-file retry — the actual physical deletion the spec authorizes once the last referencing snapshot is gone.
+
+## 4. Retry / concurrency consistency
+
+`commit()` wraps everything in `Tasks.foreach(ops).retry(...).onlyRetryOn(CommitFailedException)` (lines 361-368), and each attempt re-runs `internalApply()` on a fresh `ops.refresh()` (line 197). This is the spec's optimistic-concurrency retry contract (spec 95-99, 1314-1319): if the base version changed under us, the commit retries against the new current metadata rather than producing a lost update. Cleanup then runs against a freshly refreshed `current` metadata (line 389) so file deletion is based on the actually-committed post-expiration state.
+
+## Summary of the mapping
+
+- Spec 1126 (start empty) → `idsToRetain = new` (line 204).
+- Spec 1127 (remove old non-main refs) → `computeRetainedRefs` (lines 206, 278-301).
+- Spec 1128 (keep ref heads) → lines 206-213; violation guarded at 215-222.
+- Spec 1129-1131 (branch ancestors until old AND past count floor) → `computeAllBranchSnapshotsToRetain` + `computeBranchSnapshotsToRetain` (lines 224, 303-333), using `SnapshotUtil.ancestorsOf`.
+- Spec 1132 (expire the rest) → lines 233-237 `removeSnapshots`.
+- Spec 1162/1190 (delete files only when last referencing snapshot is gone) → ReachableFileCleanup (reachability) and IncrementalFileCleanup (DELETED-entry-based), both invoked from `commit()`.
+- Spec per-ref retention overrides (1112-1114) and `main` never expires (1114) → lines 283-286, 289, 307-310.
+
+One nuance worth flagging: the spec's `min-snapshots-to-keep`/`max-snapshot-age-ms` protection applies to branches; `RemoveSnapshots` adds `unreferencedSnapshotsToRetain` (lines 335-357) so snapshots within the age window that happen to be referenced by no ref at all are still protected from expiry. That's a deliberate superset of the spec text — costlier to reason about, but it honors the spec's "don't lose recent history" intent and is the reason the non-main path uses reachability rather than simple DELETED-entry scanning.

@@ -1,0 +1,45 @@
+Here are the edge cases and failure modes for table properties, and how the code guards (or fails to guard) each.
+
+## Guards that exist
+
+1. Reserved (control-only) properties supplied at table creation
+   The spec says properties are "not intended for arbitrary metadata"; reserved keywords like `format-version`, `uuid`, `current-snapshot-id` must not be persisted. `newTableMetadata` rejects any property in `RESERVED_PROPERTIES` with `Preconditions.checkArgument` (TableMetadata.java:115-118). Even if they slip through elsewhere, `persistedProperties`/`unreservedProperties` strip them before storage (TableMetadata.java:87-106), so they cannot pollute the metadata map.
+
+2. null property map on an update
+   `replaceProperties` throws `ValidationException.check(rawProperties != null, "Cannot set properties to null")` (TableMetadata.java:628). `Builder.setProperties`/`removeProperties` also short-circuit on empty maps (TableMetadata.java:1475-1477, 1486-1488).
+
+3. Non-integer or negative commit/retry values
+   `PropertyUtil.validateCommitProperties` (PropertyUtil.java:134-151) validates `commit.retry.*` (the list is at PropertyUtil.java:38-43) — but only at table creation (called from `TableMetadata.newTableMetadata`, TableMetadata.java:144). A non-integer throws `ValidationException` "must have integer value"; a negative throws "must have non negative integer value". The guard is deliberately creation-only so existing tables are never broken by retroactive validation.
+
+4. Encryption properties on a format version that doesn't support them
+   Encryption is a v3 feature (per spec). `EncryptionUtil.checkCompatibility` (encryption/EncryptionUtil.java:205-217) rejects encryption table properties when `formatVersion < 3`, called at TableMetadata.java:146. This prevents writing properties that the spec version cannot honor.
+
+5. Metrics properties referencing columns that don't exist
+   `MetricsConfig.validate` (MetricsConfig.java:110-112) → `validateReferencedColumns` checks each `write.metadata.metrics.column.*` key resolves to a real schema field, else `ValidationException` (MetricsConfig.java:143-147). This is also creation-only (see the comment at TableMetadata.java:140-141).
+
+6. Missing/unguarded numeric parsing (partial guard)
+   `PropertyUtil.propertyAsInt/Long` use `Integer.parseInt`/`Long.parseLong` (PropertyUtil.java:87-119), which throw uncaught `NumberFormatException` if a property holds garbage. There is no try/catch here — the guard exists only where callers wrap values in try (`propertyTryAsInt` for `format-version`, TableMetadata.java:77,520-522) or where creation-time validation covers commit properties. So a malformed read/write property can fail at read time with a raw NumberFormatException. This is a genuine gap: numeric properties are only validated for the commit subset.
+
+7. Deprecated location properties
+   Setting `write.object-storage.path` or `write.folder-storage.path` (the deprecated forms of `write.data.path`) throws `IllegalArgumentException` telling you to switch (LocationProviders.java:84-95). This forcibly moves users off legacy keys that could alias the new one.
+
+8. format-version used to upgrade on a property change
+   `replaceProperties` reads `FORMAT_VERSION` and calls `upgradeFormatVersion` (TableMetadata.java:641-648) — so changing `format-version` as a property is a real upgrade path, and reserved filtering means it never persists as a stored property while still taking effect.
+
+## Failure modes with little or no guard
+
+9. Silent boolean coercion
+   `propertyAsBoolean` uses `Boolean.parseBoolean` (PropertyUtil.java:47-60), which never throws and returns `false` for any unrecognized string. A typo like `"ture"` silently disables a feature instead of failing — a footgun that is not guarded.
+
+10. Unbounded/non-UTF-8 or oversized property values
+    There is no size or encoding validation on property keys/values anywhere (the map is just parsed back as a string map, TableMetadataParser.java:468-474). A bloated `properties` map grows every metadata commit, and since metadata is rewritten atomically on each commit (per spec), runaway properties directly inflate commit cost and can approach object-store size limits. Nothing prevents this.
+
+11. Reserved properties introduced through the upgrade/refresh path
+    The `RESERVED_PROPERTIES` guard is enforced at `newTableMetadata`/`replaceProperties` (create/update entry points). Refresh paths and REST/catalog round-trips parse the map with `JsonUtil.getStringMap` (TableMetadataParser.java:471) without re-checking reserved membership. If a catalog returns reserved-looking keys in persisted metadata, they are loaded as ordinary properties — the guard only protects writes, not reads.
+
+12. Concurrent property updates (dead-lost update)
+    Because every property change is a new immutable metadata file committed by atomic swap (the spec's concurrency model), two simultaneous `replaceProperties` calls based on the same base version can lose one update. This is the standard optimistic-concurrency retry risk (RemoveSnapshots.java:360-368 retries on `CommitFailedException`), not property-specific — but a property-only change is subject to it like any other commit.
+
+## Summary of the gaps
+
+The code guards robustly at the boundaries it cares about: creation-time validation (commit ints, metrics columns, encryption/version, reserved keys) and write-time filtering (reserved keys never persist). Its weakest areas are read-time parsing — malformed numeric values surface as uncaught `NumberFormatException`, and malformed booleans are silently coerced to `false` — plus unbounded property size and reserved-key leakage on the read/refresh path. The design intent from the spec (config, not metadata; engine-agnostic string map) is honored, but the cost of that flexibility is that most property values are trusted as-is by the time they're consumed.

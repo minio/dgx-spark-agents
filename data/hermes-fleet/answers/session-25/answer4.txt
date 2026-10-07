@@ -1,0 +1,27 @@
+## How query engines use fast appends (with citations)
+
+The engine integrations don't know the details of FastAppend (a core class). They just call `table.newFastAppend()` / `table.newAppend()`, which core resolves; the two are siblings in core: `newFastAppend()` returns `new FastAppend(name, ops)` and `newAppend()` returns the alternative `new MergeAppend(...)` (core BaseTable.java:209-216). So "fast append" in the engines means the `FastAppend` class you read, and "merge append" means `MergeAppend`.
+
+Spark (spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java; same pattern in v3.5 at line 603)
+
+- Batch append: BatchAppend.commit takes the DataFiles from Spark's write tasks and does `table.newAppend()` then `append.appendFile(file)` per file (SparkWrite.java:348, 351-354), committing the single append operation (SparkWrite.java:356-357). This is the merging variant by default.
+
+- Streaming append is where fast append is chosen directly: StreamingAppend.doCommit
+  `AppendFiles append = useMergeAppendForStreaming ? table.newAppend() : table.newFastAppend();`
+  and `append.appendFile(file)` for each file (SparkWrite.java:653, 655-658).
+
+- The toggle: `useMergeAppendForStreaming` is read from the `use-merge-append-for-streaming` option with default true (SparkWriteConf.java:237-241; SparkWriteOptions.java:97-98). So Spark Structured Streaming defaults to the merging append; setting that option to `false` makes streaming use `newFastAppend()`.
+
+- Batch never uses fast append in this tree — it's always `table.newAppend()` (SparkWrite.java:348).
+
+Flink (flink/v2.2/flink/src/main/java/org/apache/iceberg/flink/sink/IcebergCommitter.java and IcebergFilesCommitter.java)
+
+- Flink's checkpoint committer appends data files for each checkpoint when there are no deletes: commitDeltaTxn does `table.newAppend().scanManifestsWith(workerPool)` then `appendFiles::appendFile` per data file and commits (IcebergCommitter.java:256-264, 258, 263; the same in IcebergFilesCommitter.java:332-347, 340, 345).
+
+- This always resolves to the merge append (`table.newAppend()` -> BaseTable.newAppend() -> MergeAppend, BaseTable.java:209-211). I searched all of `flink/` for `newFastAppend`/`FastAppend` and found none — Flink's committer does not expose a fast-append path in this tree. It relies on the merging append to keep its streaming manifest count bounded. Flink does use `scanManifestsWith(workerPool)` to parallelize manifest scanning across the checkpoint's files (IcebergCommitter.java:258), which is the parallel manifest write machinery shared with FastAppend (SnapshotProducer.writeDataManifests -> ManifestFiles.writeParallel), but the operation itself is merge append.
+
+So, concretely:
+- Spark is the engine that directly leverages the `FastAppend` implementation — the streaming sink selects `table.newFastAppend()` (base of the FastAppend class you read) when `use-merge-append-for-streaming=false`, committing each micro-batch as a new manifest for O(new data) latency.
+- Flink relies on the same architecture (append per checkpoint) but uses the merging append, not FastAppend — it trades the fast-append latency benefit for bounded manifest count by default and has no toggle to fast append here.
+
+The engine-side intent matches the earlier analysis: fast append is the low-latency commit path for streaming; the fragmentation it causes is why both default toward (and Flink exclusively uses) the merging append, and why `rewriteManifests`/compaction exists to clean up.

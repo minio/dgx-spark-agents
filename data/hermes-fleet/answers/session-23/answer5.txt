@@ -1,0 +1,23 @@
+Overwrite in Apache Iceberg — ten things to read first:
+
+1. What "overwrite" is: a snapshot whose `operation` is add + remove in one logical commit. BaseOverwriteFiles.java:49-60 (it picks APPEND/DELETE/OVERWRITE based on what changed), constant at api/.../DataOperations.java:50.
+
+2. The public builder API is tiny: `overwriteByRowFilter`, `addFile`, `deleteFiles`, and optional validation toggles. BaseOverwriteFiles.java:63-127.
+
+3. The core of the operation is a single atomic metadata swap. SnapshotProducer.java:484-533 is `commit()` — retry-on-conflict loop, apply then swap. Start here for the commit model.
+
+4. Adds are staged as ADDED manifest entries with the new snapshot id; `apply()` writes them. MergingSnapshotProducer.java:240-255 and SnapshotProducer.java:744-753.
+
+5. Removes are NOT physical deletes — files are marked DELETED in rewritten manifests. ManifestWriter.java:204-208, driven by the filter manager's rewrite at ManifestFilterManager.java:503-578.
+
+6. Delete-by-row-filter only ever drops whole files: a file must match ALL rows or the commit fails ("some, but not all, rows match filter"). ManifestFilterManager.java:472-489 and 527-535.
+
+7. Retry safety — the replaced files must still exist when the overwrite commits. BaseOverwriteFiles.java:118/125 calls `failMissingDeletePaths`, which triggers the check in ManifestFilterManager.java:281-303.
+
+8. Opt-in concurrent-write guards: `validateNoConflictingData` / `validateNoConflictingDeletes` / `validateAddedFilesMatchOverwriteFilter`. BaseOverwriteFiles.java:96-127, executed in `validate()` at BaseOverwriteFiles.java:136-179. Note these are NOT on by default.
+
+9. How engines drive it: Spark's `OverwriteByFilter` (SparkWrite.java:394-415), dynamic `ReplacePartitions` (SparkWrite.java:357-370), and copy-on-write delete/update (SparkWrite.java:463-539).
+
+10. How Flink drives it: `INSERT OVERWRITE` = dynamic `newReplacePartitions()`, gated to bounded streams. IcebergTableSink.java:199-200, committed in IcebergFilesCommitter.java:304-327.
+
+Two framing notes before you dive in: (a) "overwrite" as an operation label is distinct from dynamic partition overwrite, which uses the separate `ReplacePartitions` producer — both share the `MergingSnapshotProducer` base (MergingSnapshotProducer.java:69), and (b) the correctness model is whole-file replacement + validate-before-swap, which is why most of the interesting code is in validation, not in data movement.

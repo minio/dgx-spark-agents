@@ -1,0 +1,101 @@
+I've now covered the full write path (including `SortingPositionOnlyDeleteWriter`). Here are the edge cases and failure modes, each with the guard.
+
+## 1. Unordered position deletes (file/position not sorted)
+
+Spec requires position deletes sorted by `file_path` then `pos` so readers can filter by file and stream-merge deletes while scanning (spec.md:1413-1416). If a writer emitted them in arbitrary order, a naive reader materializing deletes per range would be wrong.
+
+Guard: `SortingPositionOnlyDeleteWriter` buffers positions in a `CharSequenceMap<PositionDeleteIndex>` keyed by data file (lines 57, 82-88) — that in itself makes the index per-file unordered-tolerant (set semantics). At close it sorts the paths (`sort`, lines 174-182) and iterates positions in ascending order (`positions.forEach`, line 156, which is ascending by construction). Its own javadoc states it "is capable of handling unordered deletes" specifically because the spec requires ordering (lines 37-43). `RoaringPositionBitmap.forEach` emits positions in ascending order (RoaringPositionBitmap.java:190-194).
+
+## 2. Delete applied to the wrong data file
+
+The index is per-file, so a delete keyed to file A could accidentally be applied to rows of file B.
+
+Guard: grouping is by data-file path. `Deletes.toPositionIndexes` keys each `BitmapPositionDeleteIndex` by the delete row's `DELETE_FILE_PATH` (Deletes.java:153-157), and the read side only hands the loader deletes for the target file via `DataFileFilter`, which compares `file_path` equality (Deletes.java:230-243). For DVs, `BaseDeleteLoader.validateDV` requires `filePath.toString().equals(dv.referencedDataFile())` (BaseDeleteLoader.java:279-283). Spec: "file paths are equal" (spec.md:1080).
+
+## 3. Overflowing/corrupt positions — out-of-range or invalid bit set
+
+A 64-bit position outside the bitmap's representable range, or a negative position, would index the bitmap array badly (negative array index / overflow).
+
+Guard: `RoaringPositionBitmap.validatePosition` requires `0 <= pos <= MAX_POSITION` and rejects anything else (lines 421-427). `set`/`setRange`/`contains`/`forEachInRange` all validate (lines 75, 101-102, 144, 218-219). `MAX_POSITION` is defined so the key never hits `Integer.MAX_VALUE`, avoiding the signed-length array overflow (lines 46-54). The range cannot be written out of order either: `setRange`/`forEachInRange` guard `posStart <= posEnd` (lines 91-95, 208-212).
+
+## 4. Duplicate / out-of-range keys in a deserialized blob
+
+A DV blob could be malicious or truncated with duplicate keys, negative keys, or unsorted keys, which would corrupt the bitmap array.
+
+Guard: `RoaringPositionBitmap.readKey` rejects negative keys, keys ≥ `Integer.MAX_VALUE`, and keys that are not strictly ascending (`key > lastKey`) (lines 339-345). `readBitmapCount` bounds the count (lines 330-337). This is on the read path, so a bad blob fails fast rather than silently corrupting the scan.
+
+## 5. Integrity corruption — blob length, magic, CRC, or cardinality mismatch
+
+The persisted DV is a Puffin blob; if it's truncated, swapped, or the manifest metadata disagrees, deletes would be silently wrong (applying garbage positions or dropping valid ones).
+
+Guard (all on `BitmapPositionDeleteIndex.deserialize`, invoked from `DVUtil.readDV` / `BaseDeleteLoader.readDV`):
+- length vs. manifest: `readBitmapDataLength` checks the encoded length equals `contentSizeInBytes - 4 - 4` (lines 191-200),
+- magic number check (lines 206-211),
+- CRC-32 of magic+bitmap, matching a big-endian 4-byte field (lines 155-163),
+- cardinality vs. manidfested `record_count` (lines 213-219).
+
+Spec: `record_count` is "the cardinality of a deletion vector" (spec.md:724) and `content_offset`/`content_size` must match the Puffin footer (spec.md:744-756).
+
+## 6. More than one DV (or DV + position files) for the same data file
+
+Spec forbids this: "at most one deletion vector for a given data file" and a DV must subsume position files (spec.md:1366, 1387).
+
+Guard: `BaseDVFileWriter` keys by referenced file in `deletesByPath` (BaseDVFileWriter.java:62), so a single path accumulates one index. `BaseDeleteLoader.loadPositionDeletes` declares "if the delete files contain a single DV... else read position files," and its javadoc states a DV replaces position deletes (BaseDeleteLoader.java:160-169). When the spec requires writers to collapse multiple DVs for one file, `DVUtil.mergeAndWriteDVsIfRequired` merges them (DVUtil.java:80-112).
+
+## 7. Merging DVs across conflicting metadata (sequence/partition mismatch)
+
+Two vectors that can't actually both apply to the same row — e.g. different data sequence numbers or different partitions — must not be merged, or rows get over/under deleted.
+
+Guard: `DVUtil.validateCanMerge` rejects merges unless all duplicates share the same data `sequenceNumber`, the same `specId`, and an equal partition tuple (DVUtil.java:130-151). This enforces the spec's scoping: deletes apply only to same-partition data files with data sequence number ≤ the delete's (spec.md:1081-1082). Position deletes themselves also get the explicit note at spec.md:1091 allowing same-commit deletes (equal sequence numbers), which the code allows by requiring *equal* sequence numbers, not strictly-less.
+
+## 8. Merging in previous deletes that are not file-scoped
+
+A previous delete could be partition-scoped (applies to *many* data files), so treating it as removable/replaceable when writing a per-file DV could drop deletes that still apply elsewhere.
+
+Guard: `SortingPositionOnlyDeleteWriter.validatePreviousDeletes` requires that all previously-loaded deletes are file-scoped before merging (`allMatch(ContentFileUtil::isFileScoped)`, lines 168-172). The class javadoc is explicit: "Callers must ensure only previous file-scoped deletes are loaded because partition-scoped deletes... can't be safely discarded" (lines 45-48). `BaseDVFileWriter.close` similarly only marks previous files as rewritten when `ContentFileUtil.isFileScoped` (BaseDVFileWriter.java:140-145).
+
+## 9. Applying the index to rows from the wrong file due to position reuse
+
+Since position is per-file and 0-based, the same ordinal in two files refers to different rows — conflating them would corrupt reads.
+
+Guard: the index is scoped to one data file by construction (per-path keying in Deletes.java:153-157 and per-file loader), so `_pos` (`MetadataColumns.ROW_POSITION`, spec.md:448) is always resolved within that file. `DeleteFilter.pos` reads `_pos` and tests `positionIndex.isDeleted(pos(record))` (DeleteFilter.java:168-170, 265-273), so the ordinal is only ever interpreted against its own file's index.
+
+## 10. Missing `_pos` / `_deleted` columns — position deletes applied without the row position
+
+If the reader's schema doesn't project row position, it can't apply the index; and `_deleted` handling chooses between drop vs. mark-deleted.
+
+Guard: `DeleteFilter.fileProjection` adds `_pos` and `_deleted` metadata columns to the required schema when position deletes exist (DeleteFilter.java:293-330). `applyPosDeletes` does nothing if there are no position deletes (lines 265-267). The `hasIsDeletedColumn` flag routes to either `Deletes.markDeleted` (keep rows, flag `_deleted`) or `Deletes.filterDeleted` (drop rows + count via `DeleteCounter`) (lines 275-280) — the spec's optional "may contain the deleted row"/changelog-support distinction (spec.md:1405, 1449).
+
+## 11. Deletes arriving out of order / racing with the data they delete
+
+A delete committed before the row it targets exists (or after the file is gone) must not corrupt state.
+
+Guard: this is handled structurally, not by the index: a data file is referenced before a delete can target it (scans only apply deletes with data-sequence-number ≤ the delete's from the same partition; spec.md:1073-1091). `BaseDVFileWriter` merges *previous* loaded deletes into the new DV at close, so re-writing a DV doesn't lose earlier deletes (lines 137-140). The spec's content-file-uniqueness caveat (spec.md:680) means duplicate live entries are undefined behavior — but the merge-before-write and one-DV-per-path keying prevent the writes this code produces from creating that state.
+
+## 12. Time-travel / stale snapshot reading a delete that shouldn't apply
+
+A delete file added in a later snapshot must not be applied to a scan of an earlier snapshot that didn't contain it.
+
+Guard: the spec's sequence-number rule (apply only same/older partition data, spec.md:1081-1082) and snapshot-scoped planning mean only delete files present in the chosen snapshot's manifests are loaded. `BaseDeleteLoader` only reads the delete files it's handed for that file (`loadPositionDeletes`, BaseDeleteLoader.java:160-169); nothing reaches outside the snapshot's plan. `DeleteFilter` is constructed per-scan with the plan's `deletes` list tied to `filePath` (DeleteFilter.java:69-116), so no out-of-snapshot delete can be applied.
+
+## 13. Bug in the "single DV vs. position files" assumption
+
+If code wrongly assumed "exactly one DV" and there were multiple, or assumed position-file layout when the content is a DV, reads would misinterpret bytes.
+
+Guard: `loadPositionDeletes` uses `ContentFileUtil.containsSingleDV` to branch, and in the DV branch calls `validateDV` (offset/length non-null, ≤2GB, referenced-file matches) before reading (BaseDeleteLoader.java:162-165, 266-284). The deserialize path then also validates length/magic/CRC/cardinality (see #5), so a misclassified file fails validation rather than silently decoding garbage.
+
+## 14. Positions beyond the file's actual row count / cardinality semantic misuse
+
+Recording a "deleted" position that never existed is harmless (no row matches it), but a *mismatch* between manifest `record_count` and the blob can indicate a real bug.
+
+Guard: deserialization enforces `cardinality == deleteFile.recordCount()` (BitmapPositionDeleteIndex.java:213-219). `BaseDVFileWriter.createDV` sets `recordCount` from `positions.cardinality()` at write time (BaseDVFileWriter.java:179), so what's written and what's checked agree. Positions are allowed to be sparse (only set bits are stored in Roaring), so this agreement is about cardinality, not range — a file with deletes at positions 0 and 5 correctly reports cardinality 2, matching the spec's count semantics (spec.md:724, 1381-1383).
+
+## 15. Resource / concurrency safety on the read path
+
+Parallel delete loading must not corrupt shared state, and open resources must be closed.
+
+Guard: `BaseDeleteLoader` runs per-file loads in a worker pool via `Tasks.foreach` writing into a `ConcurrentLinkedQueue` (lines 232-242), and merges results with `PositionDeleteIndexUtil.merge` (lines 185-190). `CloseableIterable` is closed in try-with-resources on both read (`Deletes.java:149-163, 188-195`) and in-load paths; reused containers are handled by the reader. `DeleteFilter` lazily initializes the loader under a double-checked `synchronized` block (DeleteFilter.java:176-186) so the shared loader isn't built twice under parallelism.
+
+---
+
+The strongest guards are concentrated in the DV blob deserialization (#5: length/magic/CRC/cardinality) and the file-scoping checks (#2/#7/#8: path equality, sequence/partition equality, file-scoped-only merges) — because those are the two ways a position delete can silently corrupt a scan: by misapplying it to the wrong rows, or by accepting a corrupt blob that deletes the wrong positions. Isolating the "query/merge" index from the "persist/verify" blob format is what lets each failure mode be caught at its own boundary. Want me to trace where `mergeAndWriteDVsIfRequired` is invoked from compaction, or walk the deletion-vector write through `PuffinWriter`?

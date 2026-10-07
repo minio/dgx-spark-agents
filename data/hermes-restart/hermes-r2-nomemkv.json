@@ -1,0 +1,18 @@
+{
+ "label": "nomemkv",
+ "wall_s": 109.2,
+ "server": {
+  "prompt_tokens_total": 983652.0,
+  "generation_tokens_total": 2823.0,
+  "prefix_cache_hits_total": 869632.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 55.1,
+  "time_to_first_token_seconds_count": 9.0,
+  "request_prefill_time_seconds_sum": 53.3,
+  "request_decode_time_seconds_sum": 51.4
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "sition \u2192 per-path position. `findDV` (DeleteFileIndex.java:217-232) finds the data file's vector and validates `dv.dataSequenceNumber() >= seq` (same-commit allowed, :224-228). `findPathDeletes`/`findPosPartitionDeletes` (:181-188, :200-215) plus `validatePartitionMatch` (:234-255) check path/partition.\n- Position and DV filtering uses `>=` \u2014 `findStartIndex` on a sorted sequence array returns the first delete whose sequence number is `>=` the data file's (DeleteFileIndex.java:687-703, used at :729 and :811). That's the spec's `<=` from the delete's side.\n- Equality filtering is backed by the same `findStartIndex`, so it can return equal-seq deletes too, but those are then gated by the per-file overlap test `canContainEqDeletesForFile` (DeleteFileIndex.java:257-320) using null counts and lower/upper bounds (`rangesOverlap`, :322-342), implementing spec.md:1067's metric-based pruning. (`EqualityDeletes` uses `applySequenceNumber` for sorting, DeleteFileIndex.java:786-787.)\n\nAt read time the delete manifests are scanned first (spec.md:664), and the computed `DeleteFile[]` are applied to the data file's rows \u2014 position rows dropped by path+pos, equality rows by matching the delete columns, DV positions tested against the bitmap.\n\n### What compaction does with them\n\nCompaction is a `REPLACE`-operation rewrite (`BaseRewriteFiles.operation()` returns `DataOperations.REPLACE`, BaseRewriteFiles.java:43-45). It's an explicit \"delete old data files, add new data files containing the same rows\" (spec operation `replace`, spec.md:972; spec.md:1317). A writer can `deleteFile(DeleteFile)` (BaseRewriteFiles.java:55) and `addFile(DeleteFile, dataSequenceNumber)` (BaseRewriteFiles.java:73), deleting/moving the deletes.\n\n- **Position/delivered deletes are the payoff of compaction:** by physically rewriting a data file without its already-deleted rows, the writer can drop the delete file entirely \u2014 the deletion becomes permanent in the new file, so no delete is applied at read time. Rewriting data files this way (`deleteFile(DataFile)` + `addFile(DataFile)`, BaseRewriteFiles.java:48-61) is the mechanism. The same-commit rule above ensures a DV/position delete added while compaction runs still gets applied to the newly written file (seq \u2264), so no deleted row resurfaces.\n- **Equality deletes** likewise can be removed by rewriting the data files with the matching rows physically gone (and the delete `deleteFile(DeleteFile)` is the way the writer marks them removed from the new snapshot).\n- The spec constrains this: `REPLACE` requires `added-records <= replaced-records` (SnapshotProducer.java:345-357), and commit-retry validation re-checks that the files being replaced are still present (spec.md:1317).\n\nSo the lifecycle is: writes add deletes (cheap, in-place); reads apply them on the fly; compaction rewrites the affected data files with the deleted rows physically removed and drops the now-redundant delete files/DVs, so subsequent reads no longer pay the delete cost.\n",
+ "stderr": ""
+}

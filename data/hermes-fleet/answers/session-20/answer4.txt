@@ -1,0 +1,41 @@
+Here's how query engines in this repo use the bucket transform, with citations.
+
+## Spark
+
+Spark integrates the bucket transform in three distinct places.
+
+### 1. Exposing it as a SQL system function (`system.bucket(N, col)`)
+The transform is surfaced to Spark SQL as a registered system function so users can call it directly (e.g. `system.bucket(128, 'abc')`).
+
+- Registered in `SparkFunctions.java:39` (`"bucket", new BucketFunction()`) and the reverse map at `:48`.
+- `BucketFunction.bind(...)` (`BucketFunction.java:65-102`) validates the two-arg signature, restricts the bucket count to an integral type (byte/short/int, `:60-61`, `:74`), and dispatches the value type to the matching implementation class — date/tiny/small/int → `BucketInt` (`:80-85`), long/timestamp/ntz → `BucketLong` (`:86-91`), decimal → `BucketDecimal` (`:92-93`), string → `BucketString` (`:94-95`), binary → `BucketBinary` (`:96-97`).
+- Every variant computes the hash through the same canonical `BucketUtil` used by the transform itself — e.g. `BucketInt.hash` → `BucketUtil.hash(value)` (`BucketFunction.java:143-145`), `BucketLong.hash` → `BucketUtil.hash(value)` (`:182-184`), string/bytes → `BucketUtil.hash` (`:221-228`), decimal → `BucketUtil.hash(BigDecimal)` (`:299-301`). This is the crucial guarantee: the SQL function and the actual partition transform hash the same bytes, so `system.bucket(N, col)` returns exactly the partition a writer would place the row in.
+- The final formula replicates the spec and `Bucket`: `(hashedValue & Integer.MAX_VALUE) % numBuckets` (`BucketFunction.java:118-120`), including the sign-bit discard.
+- Nulls propagate to null (`:164-165`, `:202-203`, `:242-243`, `:271-272`, `:316-318`), matching the spec's null rule.
+- The class Javadoc notes the bucket count isn't validated in the codegen path for performance (`BucketFunction.java:51-54`) — a deliberate divergence from `Bucket`'s `> 0` precondition.
+
+### 2. Converting Spark plans to Iceberg partition transforms (write/DDL path)
+`Spark3Util` bridges Spark's `Transform` expressions to Iceberg ones when building partition specs and terms.
+
+- Building a spec: `Partitioning` visitor `bucket(...)` → `Expressions.bucket(numBuckets, ...)` (`Spark3Util.java:318-320`), and `toPartitionSpec` maps a Spark `bucket` transform into the Iceberg spec builder (`:379-380` for a term, `:439-441` for the spec builder).
+- So `PARTITIONED BY (bucket(N, col))` in Spark DDL becomes an Iceberg `bucket[N]` partition field, which is exactly the `bucket[N]` transform from the spec / `Bucket.java`.
+
+### 3. Filter pushdown (partition pruning)
+Spark predicates on the table's raw columns are pushed down as Iceberg expressions; `bucket` is one of the recognized transform UDFs (`SparkV2Filters.SUPPORTED_FUNCTIONS:72-73`). The translation `udfToTerm` recognizes the two-arg `bucket(literal, ref)` and produces an Iceberg bucket term `bucket(column, numBuckets)` (`SparkV2Filters.java:472-474`). Once it's an Iceberg term, it flows into Iceberg's scan-planning inclusive/strict projection — the same `Bucket.project`/`projectStrict` logic we discussed, which only prunes on exact bucket matches (so `WHERE col = X` prunes to the single bucket of `X`, but range predicates don't prune).
+
+### 4. (Legacy) registering a bucket UDF
+`IcebergSpark.registerBucketUDF` (`IcebergSpark.java:31-42`) binds `Transforms.bucket(numBuckets)` to the source type and registers a Spark UDF over the converted values — an older path for computing buckets in Spark than the codegen'd `BucketFunction`.
+
+## Flink
+
+Flink uses the bucket transform to drive a specialized sink partitioner, primarily on the write side.
+
+- `BucketPartitionerUtil` inspects the partition spec and requires it to contain exactly one bucket field. Its `BucketPartitionSpecVisitor.bucket(...)` (`BucketPartitionerUtil.java:83-86`) returns the `(fieldId, numBuckets)` pair for the bucket field (and null for every other transform, `:78-124`). `getBucketFieldId`/`getMaxNumBuckets` (`:61-67`) extract the bucket field id and `numBuckets` for the table.
+- `BucketPartitioner` then assigns rows to Flink subtasks: it takes the computed `bucketId`, validates it (`BucketPartitioner.java:62-66`), and routes it — `bucketId % numPartitions` when writers ≤ buckets (`:69`), or a round-robin stateful split when writers > buckets (`:71`, `:90-92`) so each writer sticks to one bucket.
+- The bucket value itself is produced by `BucketPartitionKeySelector`, which is where the actual transform evaluation happens: `partitionKey.partition(...)` fills the Iceberg `PartitionKey` for the row, and `partitionKey.get(bucketFieldPosition, Integer.class)` (`BucketPartitionKeySelector.java:66-69`) retrieves the bucket partition value. That `PartitionKey` internally binds the partition spec — including the `Bucket` transform — over the row, so Flink reuses the same canonical hashing rather than reimplementing it.
+
+## The unifying principle
+
+Every engine path ultimately funnels through the single canonical `BucketUtil` hash (Spark's `BucketFunction` explicitly; Flink's via `PartitionKey`/the partition-spec bind) and the one `(hash & MAX_VALUE) % N` formula. That shared hashing is what makes results engine-consistent: the value a Spark `system.bucket(N, x)` returns, the value a Spark `PARTITIONED BY bucket(N, col)` writer computes, and the value a Flink `BucketPartitionKeySelector` extracts from the `PartitionKey` are all the same bucket for the same row — which is precisely the cross-engine determinism the spec's hash rules exist to provide.
+
+One thing I couldn't fully confirm from what I read: the exact call sites where Flink wires `BucketPartitionKeySelector`/`BucketPartitioner` into the sink graph (the `IcebergStreamWriter`/partitioning setup beyond these classes), and the `SortKeySerializer` bucketing for range-distributed shuffles. The matches there were in `shuffle/` sort-key code and tests; if you want, I can trace those call sites specifically.

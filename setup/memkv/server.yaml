@@ -1,0 +1,18 @@
+# /etc/memkv/config.yaml on each DGX Spark.
+network:
+  address: 0.0.0.0:9900
+  auth_key: <the shared key from: openssl rand -hex 32>
+memory:
+  block_size: 2 MiB
+  max_size: 2 GiB
+rdma:
+  devices: [rocep1s0f0, roceP2p1s0f0]
+  num_worker_threads: 8
+storage:
+  mode: file
+  block_size: 1 MiB
+  drives:
+    - media: /var/lib/memkv/drive0.dat
+      max_size: 1 TiB
+  eviction:
+    enabled: true

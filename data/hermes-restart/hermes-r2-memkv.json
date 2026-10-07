@@ -1,0 +1,18 @@
+{
+ "label": "memkv",
+ "wall_s": 54.7,
+ "server": {
+  "prompt_tokens_total": 338006.0,
+  "generation_tokens_total": 1994.0,
+  "prefix_cache_hits_total": 220160.0,
+  "external_prefix_cache_hits_total": 102656.0,
+  "time_to_first_token_seconds_sum": 9.8,
+  "time_to_first_token_seconds_count": 3.0,
+  "request_prefill_time_seconds_sum": 8.7,
+  "request_decode_time_seconds_sum": 42.8
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "ion (:568-594).\n\nFor a given data file, `forDataFile(seq, file)` returns the deletes to apply (:158-175): the global + per-partition equality deletes, plus either the single DV or the pos files. Before that it cheaply **skips** delete files whose metrics prove no overlap \u2014 `canContainEqDeletesForFile` compares the data file's lower/upper bounds against the delete file's bounds, and uses null counts (e.g. data has no nulls while deletes only target null) (:257-320). This is the spec's \"If metrics show that a delete file has no rows that match ... it may be ignored\" rule (spec: Scan Planning note 2). It also validates partition/spec match on the path-based lookups (:234-255), mirroring the spec's partition-equality requirement. Reading deletes that match the scan filter is what the spec describes as \"Delete files ... that match the filters must be applied ... at read time\" (spec: Scan Planning). The actual filtering of data rows by position/equality is then done by the engine's delete filter while decoding each matching data file.\n\n## What compaction does with them\n\nCompaction = `RewriteFiles`, implemented by `BaseRewriteFiles` (BaseRewriteFiles.java:26, extends `MergingSnapshotProducer`), so it commits through the same optimistic `SnapshotProducer` retry path. It is a REPLACE operation (BaseRewriteFiles.java:42-45).\n\n- It can rewrite **both** data files and delete files: `deleteFile(DataFile)` / `deleteFile(DeleteFile)` record files to remove; `addFile(...)` record files to add (BaseRewriteFiles.java:48-75); `rewriteFiles(dataToReplace, deleteFilesToReplace, dataToAdd, deleteFilesToAdd)` (BaseRewriteFiles.java:92-120).\n- A compacted new data file contains the surviving rows, so its position deletes/equality deletes that were merged in can be dropped by deleting the corresponding delete files via `deleteFilesToReplace` \u2014 and `addFile(deleteFile, seq)` lets a replacement delete file be carried with an explicit data sequence number (BaseRewriteFiles.java:73-81).\n- Validation requires disjoint sets and that replaced files exist: `validateReplacedAndAddedFiles` (BaseRewriteFiles.java:144-155) forbids adding data files without removing any, and `validate` guards against new row-level deletes for a replaced data file (:135-142). Because an equality/position delete only applies to files with a strictly-lower/\u2264 data sequence number, a plain data-file rewrite is safe: it creates a higher-sequence-number data file, so existing deletes don't apply to it \u2014 which is why compaction rewrites data files to retire deletes, in line with the spec's REPLACE semantics (spec: snapshot summary \"replace ... compaction\").\n\nSo: readers assemble the applicable deletes per data file from the index (respecting sequence-number and partition rules, skipping non-overlapping delete files via metrics), and compaction rewrites data files (and optionally rewrite/relocate delete files) so that the rewritten files escape their old deletes and the deletes can be dropped from the table.\n",
+ "stderr": ""
+}

@@ -1,0 +1,58 @@
+I now have the full picture. Here's how query engines use manifest files, traced through this repo's Spark and Flink integrations.
+
+## The core: scan planning is "read the manifest list, then the matching manifests, then build tasks"
+
+Query engines don't scan a central index. They (1) read the snapshot's manifest list, (2) prune it using per-manifest partition summaries, (3) read the surviving data/delete manifests, (4) filter their entries by the query predicate, and (5) build scan tasks. Everything funnels through `ManifestGroup` in core. Both Spark and Flink sit on top of it.
+
+## Where the planning happens (core, shared by both engines)
+
+`DataScan` builds the working set: `newManifestGroup(...)` (DataScan.java:46-71) constructs a `ManifestGroup` with the data and delete manifests, the row filter, and the stat columns, and calls `ignoreDeleted()` (DataScan.java:59) so DELETED entries won't enter results. `ManifestGroup.planFiles()` (ManifestGroup.java:177-179) is the entry point that turns manifests into `FileScanTask`s.
+
+Inside `ManifestGroup.plan` (ManifestGroup.java:181-221):
+- It builds a `DeleteFileIndex` from the delete manifests (ManifestGroup.java:191).
+- It caches per-spec `ResidualEvaluator`s (ManifestGroup.java:182-189) to compute residual predicates per file.
+- `entries(...)` (ManifestGroup.java:276-391) filters manifests with a `ManifestEvaluator` built from the projected partition filter (ManifestGroup.java:284-292) — this is the spec's *inclusive projection → partition predicate → skip manifests that can't match* (spec.md:1057-1061).
+- Per-manifest `ManifestReader` applies `filterRows(dataFilter)`, `filterPartitions(partitionFilter)`, and `select(...)` (ManifestGroup.java:344-350), then drops DELETED entries via `liveEntries()` (ManifestGroup.java:353-357) — matching spec.md:1055 (deleted entries not used in scans).
+- `createFileScanTasks` (ManifestGroup.java:393-405) copies each surviving data file, attaches the delete files that apply (`ctx.deletes().forEntry(entry)`), and emits a `BaseFileScanTask` with its residual.
+
+This `planFiles`/`planTasks` path is exactly what both engines invoke.
+
+## Spark integration
+
+**`SparkTable` → `SparkScanBuilder` builds the scan**, and the scan is the distributed variant `SparkDistributedDataScan` (spark/v3.5/.../SparkDistributedDataScan.java:72). It extends core `BaseDistributedDataScan` (line 57-58), which overrides `doPlanFiles()` (BaseDistributedDataScan.java:146-188) to decide between local and cluster planning.
+
+The Spark-specific value is *distributed* manifest reading — pushing manifest filtering onto executors:
+
+- `findMatchingDataManifests` / `findMatchingDeleteManifests` (BaseDistributedDataScan.java:196-216) read the snapshot's data and delete manifests and prune them with `ManifestEvaluator`s (BaseDistributedDataScan.java:218-225) — using the partition summaries from the manifest list to skip irrelevant manifests. This is the O(1)-planning goal (spec.md:1005, 1057).
+- Planning mode is chosen by comparing remote parallelism vs. local thread pool and manifest size thresholds (BaseDistributedDataScan.java:238-258).
+- `planDataRemotely` (SparkDistributedDataScan.java:122-143) parallelizes the data manifests into an RDD and each executor runs `ReadDataManifest.call` (SparkDistributedDataScan.java:241-250), which literally does `ManifestFiles.read(manifest, io, specs).select(...).filterRows(filter).iterator()` — reading a manifest and filtering its rows *on the executor*. `scanMetrics().skippedDataFiles()` counts what was pruned (SparkDistributedDataScan.java:138-140).
+- `planDeletesRemotely` (SparkDistributedDataScan.java:151-173) does the same for delete manifests and builds a `DeleteFileIndex` on the driver from the fetched delete files (lines 168-172).
+- Back on the driver, `toFileTasks` joins the data future and delete index and constructs `BaseFileScanTask`s (BaseDistributedDataScan.java:335-383), attaching `deletesFuture.join().forDataFile(dataFile)` (line 369) and computing residuals per spec (lines 371-372).
+
+The class javadoc spells out the design trade-off (SparkDistributedDataScan.java:47-71): manifests are filtered remotely and only matching data/delete files are returned to the driver — which is why per-manifest stats and the manifest list summaries matter.
+
+**Deletes during the scan**: `SparkCopyOnWriteScan` (in the same package) is the other key consumer — it uses this planning to fetch rows being deleted. And the tests `TestSparkReaderDeletes`, `TestPositionDeletesTable`, `TestRuntimeFiltering` (all in `spark/v3.5/spark/src/test/.../source/`) exercise these manifest-driven paths.
+
+## Flink integration
+
+Flink's source plans splits through `FlinkSplitPlanner.planTasks` (flink/v1.20/.../FlinkSplitPlanner.java:84-138):
+
+- For a batch read it builds `table.newScan()` (line 121), and for incremental reads `table.newIncrementalAppendScan()` (line 88), applying snapshot/tag/branch/as-of-time selectors (lines 124-134) and filters (lines 181-185).
+- It then calls `scan.planTasks()` (lines 119, 136). That resolves down to the same core `ManifestGroup` planning described above (via `BaseTableScan.planFiles` → `DataScan.doPlanFiles` → `newManifestGroup().planFiles`).
+- The planned `CombinedScanTask`s are wrapped into Flink splits: `planInputSplits` (FlinkSplitPlanner.java:46-70) and, for the FLIP-27 source, `planIcebergSourceSplits` (lines 73-82) map each `CombinedScanTask` to an `IcebergSourceSplit`.
+- `planInputSplits` even computes block locality from file paths (`Util.blockLocations(table.io(), task)`) when locality is exposed (lines 60-64) — showing manifests ultimately determine on which machines Flink schedules readers.
+
+**Streaming**: `StreamingMonitorFunction` replans splits as new snapshots arrive (StreamingMonitorFunction.java:214-219), each call going through `FlinkSplitPlanner.planInputSplits` — so each committed snapshot triggers a fresh manifest-list → manifest read. `ContinuousSplitPlannerImpl` drives this loop.
+
+**Maintenance actions that also depend on manifests**: Flink's `TestRewriteDataFilesAction`, `TestConvertEqualityDeletes` (reading delete manifests), and the Spark `TestRewriteManifestsProcedure` all exercise the manifest plumbing, but those are maintenance, not query path.
+
+## Summary of how the spec maps onto engine usage
+
+| Spec concept | Engine usage |
+|---|---|
+| Manifest list partition summaries let planning skip manifests O(1) (spec.md:1005, 1057) | `ManifestEvaluator` pruning in BaseDistributedDataScan.java:218-225 and ManifestGroup.java:284-292 |
+| Data vs. delete manifests, deletes applied per scope (spec.md:1053-1091) | Delete manifest index in BaseDistributedDataScan.java:151-173 / ManifestGroup.java:191, 400 |
+| Only live entries used (spec.md:1055) | `.ignoreDeleted()` (DataScan.java:59), `liveEntries()` (ManifestGroup.java:353-357) |
+| Files → tasks for engines to distribute | `FileScanTask`/`CombinedScanTask` from ManifestGroup.java:393-405, wrapped as Spark RDDs or Flink splits |
+
+In short: the engine integration's whole job is "read the manifests the snapshot points to, prune them with their stats, filter entries with the query, and hand out per-file tasks." Spark's contribution is doing that pruning on executors in parallel for large tables (SparkDistributedDataScan), while Flink's is wrapping the same core planning into splits — both ultimately resting on the `ManifestGroup` → `ManifestReader` core that implements the spec's scan-planning rules.

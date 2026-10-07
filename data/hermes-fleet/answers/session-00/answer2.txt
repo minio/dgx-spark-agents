@@ -1,0 +1,60 @@
+I read PartitionSpec.java in full plus the partitioning code it calls: the `Transform` interface, `Transforms` factory, `PartitionField`, and the transform implementations (`Bucket`, `Truncate`, `Identity`, `VoidTransform`, `TimeTransform`/`Days`/`Dates`) plus `BucketUtil`. Here's how the implementation maps to the spec.
+
+## The spec's claims vs. the code
+
+**Spec: "A partition spec has a list of fields that consist of: a source column id..., a partition field id..., a transform..., and a partition name" (spec.md:552-557).**
+In code, this is the `PartitionField` model — four fields matching exactly: `sourceId`, `fieldId`, `name`, `transform` (PartitionField.java:27-30), each with a getter (PartitionField.java:40-56). A spec is an ordered list of these plus a `specId` (PartitionSpec.java:69-70).
+
+**Spec: "The source columns... must be a primitive type and cannot be contained in a map or list, but may be nested in a struct" (spec.md:559).**
+This is enforced at build time in `Builder.checkCompatibility` (PartitionSpec.java:649-686): it validates `sourceType.isPrimitiveType()` (667-669), that `transform.canTransform(sourceType)` (670-674), and walks the parent chain recursively asserting every parent is a struct (677-683) — which is exactly "primitive, not in map/list, may be nested in struct." It deliberately skips these checks for the `void` transform (663), because a dropped v1 partition field replaced by `void` has no meaningful source type (matching spec.md:584).
+
+**Spec: partition type uses "partition field ids for the struct field ids" (spec.md:723, 746).**
+`partitionType()` builds a `StructType` where each field's id is the partition field id and its type is the transform's result type (PartitionSpec.java:141-146), calling `resultType(field)` (200-209) which delegates to `transform.getResultType(sourceType)`. The comment at line 68 ("this is ordered so that DataFile has a consistent schema") reflects the spec's invariant that the partition tuple schema is derived from the spec's fields in order.
+
+**Spec: "Two partition specs are considered equivalent... same number of fields... same source column IDs, transform definition and partition name" (spec.md:565-567).**
+`compatibleWith` implements exactly this, comparing count, `sourceId`, `transform.toString()`, and `name` per field (PartitionSpec.java:250-262) while ignoring field ids.
+
+**Spec: the transforms table (spec.md:571-580).** Each is a concrete `Transform`:
+
+- `identity` — `Identity.java`: `apply` returns the value unchanged (88-90), `isIdentity()` true, result type == source type (127-129). Spec says identity is "any primitive except geometry and geography" (573); the code rejects exactly `VARIANT`, `GEOMETRY`, `GEOGRAPHY` (Identity.java:34-35, 100-106).
+- `bucket[N]` — `Bucket.java` and `BucketUtil.java`.
+- `truncate[W]` — `Truncate.java` (int/long/size/string/binary/decimal variants; preservesOrder true at 124-126).
+- `year`/`month`/`day`/`hour` — `TimeTransform`/`Days`/`Dates`/`Timestamps`.
+- `void` — `VoidTransform.java`: always returns null (61-63), `canTransform` always true (71-73), `isVoid()` true — used to "replace the transform in an existing partition field so that the field is effectively dropped" (spec.md:584).
+
+**Spec: bucket formula `(murmur3_x86_32_hash(x) & Integer.MAX_VALUE) % N` (spec.md:598) and "all transforms must return null for a null input value" (spec.md:582).**
+`Bucket.apply` is literally `(hash(value) & Integer.MAX_VALUE) % numBuckets` with a `null` guard (Bucket.java:112-117); `numBuckets > 0` is validated (41-42). Every transform's `apply` checks for null first (e.g. Bucket.java:113, Truncate.java:182, Identity returns null via returning the null value).
+
+**Spec: bucket result type is `int` (spec.md:574).** `Bucket.getResultType` returns `IntegerType.get()` (Bucket.java:205-207), regardless of source type.
+
+**Spec, Appendix B: "32-bit Murmur3 hash, x86 variant, seeded with 0" (spec.md:1620) and per-type hashing with specific rules.**
+`BucketUtil` uses `Hashing.murmur3_32_fixed()` (BucketUtil.java:34). The per-type rules match Appendix B:
+- `int` → `hashLong(long(v))` via `hash(int)` calling `hashLong(value)` (BucketUtil.java:38-40), so int and long hash identically — matching note 1 (spec.md:1651) that promotion must not change bucket values.
+- `string` → UTF-8 bytes (BucketUtil.java:67).
+- `uuid` → big-endian via `reverseBytes` on both halves (BucketUtil.java:92-99) — matching "UUIDs are encoded using big endian" (spec.md:1655-56).
+- `float`/`double` canonicalize `-0.0` to `+0.0` before hashing (BucketUtil.java:46-56) — matching Appendix B note 5 (spec.md:1657).
+- nanos→micros conversion before hashing timestamp_ns is in `BucketTimestampNano` (Bucket.java:236-247) — matching Appendix B note 3 (spec.md:1654).
+
+**Spec: "All v3 readers are required to read tables with unknown transforms, ignoring them. Writers should not write using partition specs that use unknown transforms" (spec.md:1741, 563).**
+`Transforms.fromString` parses the known set (identity/year/month/day/hour/void/`bucket[N]`/`truncate[N]`) and returns `new UnknownTransform<>(transform)` for anything else (Transforms.java:54-81). `PartitionSpec.java:186` maps unknown transforms to `Object.class` in `javaClasses()` so reads can still handle the value, and Writers cannot build a spec with an unknown transform because `checkCompatibility` requires `canTransform` to pass (PartitionSpec.java:670-674) — unknown transforms can be read but not written.
+
+**Spec: "Partition field IDs must be reused if an existing partition spec contains an equivalent field" and the v1 assignment "starting at 1000" (spec.md:567, 633).**
+`PARTITION_DATA_ID_START = 1000` and sequential allocation via `nextFieldId()` (PartitionSpec.java:64, 394-396), with `hasSequentialIds` detecting the v1 pattern (688-695). Specs aren't silently duplicated: the builder rejects redundant partitions by `sourceId` + `transform.dedupName()` (PartitionSpec.java:435-445) — e.g. you can't add `day(ts)` twice, though different granularities (`dedupName() == "time"`, TimeTransform.java:103) still conflict.
+
+**Spec: "For identity transforms, require the partition name to match the source column" (implied by identity transform producing source values).**
+Enforced in `checkAndAddPartitionName` (PartitionSpec.java:416-426), and `partitionToPath` (220-235) turns partition values into the `name=value` path segments used in file layout.
+
+**Spec: inclusive projection — "if a scan predicate matches a row, then the partition predicate must match that row's partition" (spec.md:1061-1062), and strict projection for residual predicates (spec.md:1095).**
+This is the `Transform` interface's two projection methods. The Javadoc on `project` states the guarantee verbatim: "if pred(v) is true, then projected(apply(v)) is true" (Transform.java:105-115); `projectStrict` gives the dual "if strict(apply(v)) is true, then pred(v) is also true" (Transform.java:118-127). Each transform implements both:
+- `Identity` projects inclusive == strict, mapping the predicate unchanged onto the same value (Identity.java:143-157).
+- `Bucket` projects only equality/IN inclusive (Bucket.java:169-175) and NOT_EQ/NOT_IN strict (192-198) — comparisons can't be projected inclusively, so `project` returns null (177-180). That's why order information is lost for bucket transforms and only exact-match predicates prune.
+- `Truncate` and `Dates` project range predicates by truncating the bound (e.g. Truncate.java:190-222, Dates.java:135-163), with `fixInclusiveTimeProjection`/`fixStrictTimeProjection` adjusting coarser-than-day projections.
+
+**Spec: scan predicates converted "using the partition spec that was used to write the manifest" (spec.md:1059) and partition filtering is always derived from data predicates (spec.md:561).**
+The `Transform.project`/`projectStrict` methods are the mechanism that derives partition predicates from bound data predicates — the planner (in core, e.g. `InclusiveMetricsEvaluator`/`PartitionEvaluator`) calls these per-spec, never using user-supplied partition predicates. The transform carries `preservesOrder()` and `satisfiesOrderOf()` (Transform.java:87-102), which the sort/partition-order logic uses so, e.g., `day(ts)` ordering satisfies `month(ts)`.
+
+## Summary
+
+The implementation isn't just "like" the spec — it's a direct, near-one-to-one encoding: the four `PartitionField` attributes mirror the spec's field definition; every transform in the table has a class implementing the same `Transform` contract whose `apply`/`bind`/`getResultType`/`canTransform` reproduce the type rules and formulas (notably the exact `(hash & Integer.MAX_VALUE) % N` bucket formula and Murmur3 seeding from Appendix B); and the two projection methods embody the spec's inclusive/strict predicate projection that powers scan planning. The one deliberate asymmetry — unknown transforms readable but not writable — is the spec's own rule (spec.md:563), enforced by `checkCompatibility`.
+
+One caveat: the physical file-pruning planner that *consumes* these projections (manifest/partition evaluation, spec stored per manifest, `ManifestGroup`) lives in `core/`, not `api/`, so I didn't trace that here — say the word and I'll follow the scan-planning path (e.g. `core/.../ManifestGroup.java`, `PartitionEvaluator.java`) the same way.

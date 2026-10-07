@@ -1,0 +1,75 @@
+Here are the failure modes and edge cases in catalog commits, and how the code defends against each.
+
+## 1. Stale-base / concurrent commit (lost update)
+The classic optimistic-concurrency hazard: two writers build from the same version V; the first wins, the second must not silently overwrite the winner.
+
+Guarded by require that base == current before touching the store: `BaseMetastoreTableOperations.java:111-119` (throws `CommitFailedException` at :113, `AlreadyExistsException` at :117). The real protection is the atomic conditional swap in the backend — JDBC `validateMetadataLocation` + one SQL UPDATE whose WHERE clause pins `metadata_location = <old>` (`JdbcTableOperations.java:200-209`, `JdbcUtil.java:65-88`, params :554-560) so the base check and the move happen in a single atomic statement; if 0 rows change it throws `CommitFailedException` (`JdbcTableOperations.java:157-162`). In-memory uses the same conditional under `synchronized` + `tables.compute` (`InMemoryCatalog.java:466-484`, throws at :478-482).
+
+## 2. Ambiguous commit — did it actually land?
+A network/DB failure can leave the referent uncertain: the write may have succeeded or not. Silently throwing would either double-apply or lose a committed version.
+
+Guarded by `checkCommitStatus`/`checkCommitStatusStrict`, which refresh and test whether the new location is current or in the `previous_files` (metadata-log) history (`BaseMetastoreTableOperations.java:298-345`, esp. :334-345), with retry/backoff governed by `COMMIT_NUM_STATUS_CHECKS` etc. (`BaseMetastoreOperations.java:99-151`). It distinguishes `SUCCESS` / `FAILURE` / `UNKNOWN` and specifically returns `UNKNOWN` when it can't tell whether a pending retry might still commit (`BaseMetastoreOperations.java:63-80`). Notably the search covers the whole history because "a second committer was able to successfully commit on top of our commit" (`BaseMetastoreOperations.java:49-54`).
+
+## 3. Table dropped while a writer holds a stale refresh
+A writer refreshes, meanwhile another process drops the table; the writer then commits against a pointer that no longer exists.
+
+Guarded in `doRefresh`: on a missing row, if the table had previously been loaded it raises `NoSuchTableException` and resets state (`JdbcTableOperations.java:83-91`; `BaseMetastoreTableOperations.java:90-99`). In-memory: commit against a missing location throws `NoSuchTableException` (`InMemoryCatalog.java:474-476`).
+
+## 4. Create-vs-existing race (duplicate / phantom at create time)
+Two creators race: one creates, the other must not overwrite; or create collides with an existing table.
+
+Guarded by (a) the base-class split of `AlreadyExistsException` for a null base when the table exists (`BaseMetastoreTableOperations.java:114-118`); (b) backend uniqueness — JDBC inserts under a unique key and maps a constraint violation to `AlreadyExistsException` (`JdbcTableOperations.java:130-136`, `JdbcUtil.isConstraintViolation` :531-535); in-memory `tables.compute` throws `AlreadyExistsException` if the location differs when base is null (`InMemoryCatalog.java:470-472`). Name collisions with a view are also checked (`JdbcTableOperations.java:174-177`, `InMemoryCatalog.java:461-464`). JDBC also honors strict mode — creating in a missing namespace fails with `NoSuchNamespaceException` (`JdbcTableOperations.java:166-172`).
+
+## 5. Commit is a no-op
+Callers can pass a metadata that's unchanged; committing would write a redundant version file and bump history pointlessly.
+
+Guarded by early return when `base == metadata` (`BaseMetastoreTableOperations.java:120-124`).
+
+## 6. Metadata file visibility / caching after write
+On object stores, a freshly overwritten file might be served stale due to negative caching, and a partially-read metadata file must not become visible before the pointer swap. Because writes happen *before* the swap, a reader can never see a partially written metadata file as current.
+
+The write uses `TableMetadataParser.overwrite` with the justification "use overwrite to avoid negative caching in S3... safe because the metadata location is always unique because it includes a UUID" (`BaseMetastoreTableOperations.java:159-162`, file naming at :347-355). The pointer swap after the file is fully written is what makes it visible — matching spec.md:131 immutability.
+
+## 7. Metadata file exists but is corrupt / refresh fails transiently
+Reading the pointer succeeds but the metadata JSON read fails (network blip, truncation).
+
+Guarded by `refreshFromMetadataLocation` retrying the load with exponential backoff (`BaseMetastoreTableOperations.java:175-216`, retry/backoff at :194-200), stopping on `NotFoundException`, and `shouldRetryTest`.
+
+## 8. Table "moved" to a different catalog / UUID mismatch
+A refresh could surface a metadata file that doesn't belong to this table — e.g., the pointer was reassigned to a different table's metadata by a mistake or a different catalog lineage.
+
+Guarded by verifying the table UUID on refresh: if the refreshed UUID differs from the current one, `IllegalStateException` via `Preconditions.checkState` (`BaseMetastoreTableOperations.java:202-209`). This mirrors spec.md:1148's "throw if UUID does not match after refreshing metadata." Note the guard only fires when *both* UUIDs are non-null (new tables have null), which is the deliberate null-safe case.
+
+## 9. Pointer present but the metadata file itself is missing
+Pointer points at a metadata location that no longer exists (file deleted out from under it).
+
+Guarded by `stopRetryOn(NotFoundException.class)` in the metadata loader (`BaseMetastoreTableOperations.java:198`); a missing metadata file is not retried into perpetuity.
+
+## 10. Connection / DB transient failures during commit or check
+A DB connection drops mid-`UPDATE`, mid-check, or during the status check — treating these as definitive "failures" would be wrong.
+
+Guarded by mapping connection/timeout/truncation SQL errors to `UncheckedSQLException` rather than `CommitFailedException` (`JdbcTableOperations.java:122-139`), and by retrying the status check itself with backoff within `checkCommitStatusStrict` (`BaseMetastoreOperations.java:121-141`). Transient DB errors during `doRefresh`/`doCommit` are wrapped as `UncheckedSQLException`/`UncheckedInterruptedException` (`JdbcTableOperations.java:72-81, 140-143`).
+
+## 11. Interruption while a thread holds a pooled connection
+A pool checkout blocks; interrupting must not corrupt the shared pool.
+
+Guarded by re-setting the interrupt flag and rethrowing `UncheckedInterruptedException` (JDBC: `JdbcTableOperations.java:74-76, 140-143`), rather than swallowing the interrupt.
+
+## 12. Version-number parsing / backward compat with filesystem-style metadata
+The catalog may encounter a metadata location that isn't one of its own `V-<uuid>` files (e.g., a filesystem table's `v1.metadata.json` picked up through a migrated pointer).
+
+Guarded by `parseVersion` returning -1 (treated as not part of this catalog) when the name has no `-` or fails to parse, rather than crashing (`BaseMetastoreTableOperations.java:364-378`), and `writeNewMetadataIfRequired` reusing an existing metadata location when the table is new and already has one (`:149-153`).
+
+## 13. Version skew between what was validated and what's current
+The caller passes a base that is *logically* fine but no longer matches `current()` because a refresh already happened between planning and commit.
+
+Guarded by the identity check `if (base != current())` at `BaseMetastoreTableOperations.java:111` before any store write, plus the backend's atomic WHERE-guard (see #1) as the second line of defense.
+
+---
+
+Two things worth flagging as gaps/weaknesses rather than guarded cases:
+
+- The retry loop is *not* inside `doCommit`; a `CommitFailedException` is thrown up to the caller, so whether a conflict is retried depends on the higher-level snapshot producer (per spec.md:97). Nothing guarantees bounded retry here.
+- The UUID check (#8) is skipped when either UUID is null, so corruption into a *fresh/null* state won't be flagged — an accepted tradeoff for new tables.
+
+If you want, I can walk through where the caller (`SnapshotProducer`/`BaseTransaction`) actually catches `CommitFailedException` and re-bases for retry, since that's the component that closes the loop on conflict handling.

@@ -1,0 +1,120 @@
+Here are the edge cases and failure modes for the variant type, and how each is guarded. I've grouped them by where the risk lives.
+
+## 1. Malformed / truncated input (buffer out of bounds)
+
+A variant is parsed from arbitrary bytes; the big failure mode is a buffer shorter than what a header or offset claims. The code defends every read with `Preconditions.checkArgument` before touching memory, so an attacker/corrupt file gets an `IllegalArgumentException` instead of a read past the buffer end.
+
+- Metadata: `SerializedMetadata.java:63-65` (dict-size field must fit), `76-79` (offset table must fit), `85-91` (last/end offset must fit).
+- Primitive: `SerializedPrimitive.java:55-60` (`requiredBytes <= value.remaining()`), `94-101` (string/binary length field must fit, and size >= 0).
+- Short string: `SerializedShortString.java:52-55` (`HEADER_SIZE + length <= remaining`).
+- Object: `SerializedObject.java:78-81` (element-count field must fit), `94-97` (field-id + offset tables must fit), `126-137` (declared data length and each offset within the data region), `211-215` (field id in dictionary range).
+- Array: `SerializedArray.java:66-69` (count field fits), `79-82` (offset table fits), `102-107` (each offset in data region).
+
+## 2. Unsupported encoding version
+
+The format is versioned (VariantEncoding V1). A future V2 would silently mis-parse if not rejected. Guard:
+
+- `SerializedMetadata.java:30` `SUPPORTED_VERSION = 1`; `48-49` throws "Unsupported version: %s" for anything else.
+
+## 3. Byte-order confusion
+
+The VariantEncoding is little-endian. A big-endian buffer passed in would produce garbage values (or Integer.reverse issues on the read). All parsers and writers require little-endian explicitly:
+
+- `SerializedMetadata.java:45-46`, `SerializedObject.java:50-51`, `SerializedArray.java:44-45`, `SerializedPrimitive.java:39-40`, and the core writers `PrimitiveWrapper.java:147-148`, `ShreddedObject.java:134-135`, `ValueArray.java:62`. The empty-metadata constant is built `.order(LITTLE_ENDIAN)` at `SerializedMetadata.java:37`.
+
+## 4. Unbounded nesting depth (stack overflow / DoS)
+
+A deeply nested variant (objects/arrays inside objects) parsed recursively would overflow the JVM stack and crash the reader. Guard — a depth ceiling enforced at every descent:
+
+- `VariantUtil.MAX_VARIANT_DEPTH = 1000` (`VariantUtil.java:39`), checked at parse entry in `fromBuffer` (`VariantUtil.java:50-57`); depth is incremented on each recursion in `SerializedObject.get` (`SerializedObject.java:233-237`) and `SerializedArray.get` (`SerializedArray.java:108-110`). A comment at `VariantUtil.java:36-38` notes this is a safety limit, not a spec bound, matching parquet-java (`apache/parquet-java#3562`).
+
+## 5. Element-count / allocation amplification (memory DoS)
+
+A forged header can claim a huge element count or dictionary size, forcing a large heap allocation for offsets/arrays before data is validated. Guard — caps on all container and dictionary sizes:
+
+- `VariantUtil.MAX_ELEMENTS = 16_777_216` (`VariantUtil.java:45`), enforced in `SerializedMetadata.java:69-73`, `SerializedObject.java:84-88`, `SerializedArray.java:70-76`.
+
+## 6. Unsupported primitive type id / unrecognized basic type
+
+A header byte can claim a primitive id that isn't in the encoding, or a reserved basic-type value. Guard:
+
+- Unknown primitive → `PhysicalType.from` throws `UnsupportedOperationException` (`PhysicalType.java:113`).
+- Unknown basic type → `VariantUtil.basicType` throws (`VariantUtil.java:180-181`).
+- Type/kind mismatches on the object model → `VariantValue.asPrimitive/asObject/asArray` throw `IllegalArgumentException` (`VariantValue.java:41-61`), and parsers verify the claimed basic type matches (`SerializedPrimitive.java:41-44`, `SerializedShortString.java:39-41`, `SerializedObject.java:52-54`, `SerializedArray.java:46-48`).
+
+## 7. Unsorted vs sorted dictionary lookup failures (\(O(n)\) or false negatives)
+
+Metadata may be marked `isSorted` or not. If the flag lies, the binary search can miss a field that an unsorted linear scan would have found, or the linear scan is slow. Guard:
+
+- `SerializedMetadata.id` (`SerializedMetadata.java:111-127`) does binary search when `isSorted`, else linear scan.
+- UTF-16 fallback: `VariantUtil.find` (`VariantUtil.java:102-133`) retries supplementary-plane (non-BMP) keys in UTF-16 order, and `SerializedMetadata.java:114-116` documents this is "so dictionaries written before the UTF-8 fix still resolve."
+- Writer-side sortedness detection at `Variants.java:53` / `60-66` decides whether to emit the sorted flag.
+
+## 8. Field-name ordering / dictionary off-by-one
+
+`SerializedObject` uses a name→id dictionary resolved by binary search; a non-sorted dictionary or a name missing from the dict must not crash. Guard:
+
+- `SerializedObject.get` (`SerializedObject.java:222-240`) binary-searches and returns `null` when the name isn't found (`index < 0` at `221-228`).
+- Field-id range is validated lazily on first access in `id(index)` (`SerializedObject.java:204-220`) rather than construction — the code comment (`204`) notes it "is validated lazily ... not at construction."
+- `ShreddedObject.put` rejects names absent from metadata (`ShreddedObject.java:93-94`), and `SerializedMetadata.get` throws `NoSuchElementException` for missing ids (`VariantMetadata.java:35-38`).
+
+## 9. Mutable wrappers and stale serialization state
+
+The core `ShreddedObject` / `ValueArray` mutate after construction (`put`/`remove`/`add`). Cached `sizeInBytes()`/`writeTo` results could go stale. Guard:
+
+- Every mutation nulls the cached `serializationState`: `ShreddedObject.java:89`, `100`; `ValueArray.java:47`. `sizeInBytes`/`writeTo` recompute lazily when the state is null (`ShreddedObject.java:123-143`, `ValueArray.java:50-69`).
+- Serialized sizes are validated during writes: `ShreddedObject.java:240-245` checks `writtenSize == expected` and throws if `writeTo` and `sizeInBytes` disagree.
+
+## 10. Inconsistent size/bytes on serialized values
+
+For wrapped serialized values, `sizeInBytes` must equal what `writeTo` emits so container offsets stay consistent. Guard:
+
+- `ShreddedObject.java:240-245` cross-checks written vs declared size for shredded entries.
+
+## 11. Buffer aliasing / reference retention
+
+Deserialized values hold live `ByteBuffer` slices of the input (`Serialized*`, `SerializedValue.java:25-33` copies whole buffer, `SerializedObject.sliceValue` `248-270` slices). For efficiency the code holds views rather than copies. This is safe (no reallocation of the backing array happens) but is a retention consideration — a single huge source buffer can be kept alive by a small slice.
+
+## 12. Serialization (Java) of non-serializable wrappers / ByteBuffer
+
+`Variants` values must survive Spark/Flink-style shipping. `ByteBuffer` is not Java-serializable, and `PrimitiveWrapper` holds it. Guard:
+
+- `PrimitiveWrapper.java:62-63` stores binary as a `byte[]` (`binary` field) with a transient `ByteBuffer`, converting via `ByteBuffers.toByteArray` at `76` and re-wrapping at `92-94`; all wrappers implement `Serializable` (`PrimitiveWrapper.java:31`).
+- `SerializedMetadata`, `SerializedObject`, `SerializedArray`, `SerializedPrimitive`, `SerializedShortString` all use `writeReplace` serialization proxies that convert the buffer to `byte[]` (`SerializedMetadata.java:172-186`, `SerializedObject.java:292-308`, `SerializedArray.java:125-141`, `SerializedPrimitive.java:205-219`, `SerializedShortString.java:91-105`) so serialization never ships a raw `ByteBuffer`.
+
+## 13. Decimal precision / overflow
+
+Variant decimals use 4/8/16-byte unscaled values. Building one outside the supported precision must fail rather than silently truncate. Guard:
+
+- `Variants.java:191-203` maps precision ranges to DECIMAL4/8/16 and throws `UnsupportedOperationException` for precision > 38.
+- Writes use `intValueExact`/`longValueExact` (`PrimitiveWrapper.java:199`, `205`) so an unscaled value that doesn't fit throws instead of wrapping; DECIMAL16 padding is sign-aware (`PrimitiveWrapper.java:209-221`).
+
+## 14. Cross-engine canonical-representation ambiguity (the spec's own caveat)
+
+The spec (spec.md:1647) notes variant has "multiple representations for equivalent values," so no bucketing hash is defined. The code avoids imposing a byte-level hash/equality: logical equality/hashing is done on decoded values via `VariantPrimitive.equals/hash` (`VariantPrimitive.java:61-76`), `VariantObject` (`VariantObject.java:63-94`), and `VariantArray`. There's no physical-bytes hashing, so two equivalent variants can compare equal regardless of representation — consistent with the spec decision. (This is a design limit, not a "bug": you cannot bucket/sort/equality-join a variant column by encoded bytes.)
+
+## 15. Boolean representation
+
+Booleans have two distinct ids (TRUE=1, FALSE=2) in `Primitives.java:23-24`, but callers can request either `BOOLEAN_TRUE`/`BOOLEAN_FALSE`. Guard:
+
+- `PrimitiveWrapper.java:66-73` normalizes the physical type from the actual value so both spellings behave identically; `VariantPrimitive.equals` (`VariantPrimitive.java:74-75`) also compares logically by value.
+
+## 16. Empty buffers / null inputs
+
+Guards:
+
+- `VariantValue.from`/`VariantUtil.fromBuffer` require at least 1 byte (`VariantUtil.java:57` "empty value buffer").
+- `VariantData` rejects null metadata and null value (`VariantData.java:28-33`); `ShreddedObject` rejects null metadata (`ShreddedObject.java:53`); `Variants.java` and `VariantMetadata.from`/`empty` route through these.
+
+## 17. Length fields that are negative (unsigned misread)
+
+Offsets/lengths are read as unsigned little-endian; a high byte in the MSB slot could be interpreted as negative. Guard: `SerializedPrimitive.java:99-100` (negative size), `SerializedMetadata.java:67-68` and `85-86` (negative dict size / end offset), `SerializedObject.java:82-83` and `131-136` (negative counts/offsets), `SerializedArray.java:70-71` (negative count).
+
+---
+
+### What's deliberately *not* guarded (by design)
+
+- **Deep equality/joining by value**: no canonical byte hash, because the spec deliberately withholds one (spec.md:1647). `VariantObject.hash` is not a stable cross-representation hash — it's computed over decoded field names/values (`VariantObject.java:63-71`).
+- **Fully validating the whole tree eagerly**: `SerializedObject`/`SerializedArray` validate structure on construction but materialize child `VariantValue`s lazily (`SerializedObject.java:230-237`, `SerializedArray.java:93-113`). A corrupted deep child is only caught when that field is accessed — by design, to avoid penalizing reads. Malicious data could defer the error until a specific field is touched, but not bypass the depth/size caps above.
+
+If you'd like, I can also check the `InclusiveStatsEvaluator` consumer to see how variant field-path bounds are turned into scan filters — that's the one place a schema-less type meets Iceberg's pruning layer, and it has its own set of edge cases (mixed-type fields must not carry bounds, per spec.md:785).

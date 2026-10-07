@@ -1,0 +1,32 @@
+I've read `BaseIncrementalAppendScan.java` in full plus its call chain. Here's how the implementation maps onto the spec.
+
+## The scan's structure
+
+`BaseIncrementalAppendScan` (core/src/main/java/org/apache/iceberg/BaseIncrementalAppendScan.java) is a thin specialization of `BaseIncrementalScan` (core/.../BaseIncrementalScan.java), which holds all the snapshot-range logic. The append specific work is in three places: range selection in `appendsBetween` (BaseIncrementalAppendScan.java:105-117), gathering manifests/snapshot-id set in `appendFilesFromSnapshots` (BaseIncrementalAppendScan.java:68-99), and the planning itself delegated to `ManifestGroup`.
+
+## Following the spec
+
+1. Append is only handled, matching the spec's additive-only `operation` definition (format/spec.md:969-976).
+   `appendsBetween` walks ancestors between the bounds and keeps only snapshots where `snapshot.operation().equals(DataOperations.APPEND)` (BaseIncrementalAppendScan.java:111). `DataOperations.APPEND = "append"` with the Javadoc "no data is removed or deleted" (api/.../DataOperations.java:31-36) — exactly the spec's "only data files were added and no files were removed." Non-append commits (REPLACE/OVERWRITE/DELETE) are skipped, so the incremental result is pure union, as the spec intends.
+
+2. The range is expressed through the spec's `parent-snapshot-id` lineage + sequence numbers.
+   `fromSnapshotInclusive`/`fromSnapshotExclusive`/`toSnapshot` produce a `TableScanContext` (BaseIncrementalScan.java:46-77). At plan time `fromSnapshotIdExclusive()` (BaseIncrementalScan.java:159-187) validates ancestry (`SnapshotUtil.isAncestorOf`, `isParentAncestorOf`) and converts inclusive to exclusive by taking the start snapshot's `parentId()` (BaseIncrementalScan.java:175) — the parent relationship the spec defines (format/spec.md:958). `toSnapshotIdInclusive()` picks the current/branch snapshot when none is set (BaseIncrementalScan.java:133-157). `SnapshotUtil.ancestorsBetween` then walks the parent chain, stopping when it hits the exclusive bound (core/.../util/SnapshotUtil.java:210-223) — walking the same lineage graph the spec describes, bounded by the snapshot IDs the engine supplied.
+
+3. Only ADDED entries from the in-range snapshots are read — the spec's "added entries are the delta" idea in code.
+   `appendFilesFromSnapshots` first collects the set of in-range snapshot ids, then from each snapshot's `dataManifests(table().io())` keeps only manifests whose `snapshotId()` is in that set (BaseIncrementalAppendScan.java:69-74). Note it deliberately uses the manifest's own `snapshotId` (the already-assigned snapshot id, format/spec.md:692) rather than inheritance, so a manifest reused across snapshots isn't double-counted. It then filters entries to `snapshotIds.contains(entry.snapshotId()) && entry.status() == ADDED` (BaseIncrementalAppendScan.java:81-84). The spec says deleted entries are never used in scans (format/spec.md:1055) and fast append pre-materializes the delta as ADDED entries in a new manifest (format/spec.md:978-983); filtering to ADDED is precisely "read the increment, not the whole table."
+
+4. Whole-manifest skipping from the manifest-list counts.
+   In `ManifestGroup`, `ignoreDeleted()` (called at BaseIncrementalAppendScan.java:87) causes manifests with no `hasAddedFiles() || hasExistingFiles()` to be skipped (core/.../ManifestGroup.java:311-320), and `hasAddedFiles()` is backed by `addedFilesCount()` from the manifest list (api/.../ManifestFile.java:149-151) — the `added_files_count` the spec stores (format/spec.md:1021). This is the O(1)-style pruning from the manifest-list summary metadata that makes the delta cheap, matching the "Skip planning" goal.
+
+5. Standard scan planning applied to the delta, reusing existing machinery.
+   `ManifestGroup.planFiles()` applies the partition-predicate projection and file-level metrics filtering the spec describes (format/spec.md:1057-1067): `filterData`/`filterPartitions` drive a `ManifestEvaluator` with `Projections.inclusive(spec, ...)` (ManifestGroup.java:286-292, the inclusive projection of spec:1061-1063), rows are filtered per file, and the manifestEntryPredicate from step 3 is applied (ManifestGroup.java:375-377). Guards are the same ones used by a full scan — the server-side awareness of "EVALUATING filters on added files only" — so the delta scan is exactly a full scan restricted to the append set. The data-filter/metrics `Evaluator` (ManifestGroup.java:294-299) matches the spec's metrics-based data/delete file filtering (:1067).
+
+6. Immutability and no locks are inherited, per the spec's serializable-isolation goal (:91-99, :71).
+   The scan resolves the end snapshot once and reads committed snapshots; the range validation in `BaseIncrementalScan` never acquires a lock — it reads `table().snapshot(id)` and `table().refs()` against committed metadata. That's the spec's "readers do not acquire locks" contract.
+
+7. Parallelism as an optimization only (spec's "Scale" goal, :73).
+   When more than one manifest is in range and an executor is available, `planWith(planExecutor())` parallelizes manifest scanning (BaseIncrementalAppendScan.java:94-96; ManifestGroup.java:165-169, 216-220) — job planning stays on the client, not a central metadata store.
+
+## Bottom line
+
+The implementation is a faithful encoding of the spec's design: it selects only `APPEND` snapshots (spec's additive-only operation), walks the `parent-snapshot-id` lineage between the requested bounds, reads only the `ADDED` entries of the in-range snapshots' data manifests, prunes whole manifests via the manifest-list added/existing counts, and then reuses the standard inclusive-projection/metrics scan planner on just that increment. Everything that makes the delta cheap in theory — fast append, manifest-list counts, ADDED-only filtering, snapshot reuse via the manifest's own snapshotId — is exactly what the code does, meaning O(delta) planning as the spec intends.

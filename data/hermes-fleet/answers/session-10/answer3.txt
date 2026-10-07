@@ -1,0 +1,80 @@
+I now have enough to write a complete, well-cited answer.
+
+## Edge cases and failure modes for branches and tags, and how the code guards against each
+
+### 1. Tag with snapshot-retention settings (invalid state)
+
+The spec says `min-snapshots-to-keep` and `max-snapshot-age-ms` are branch-only (spec.md:1112-1113). A tag carrying them would be meaningless (tags don't advance). Guarded at the builder so the bad state can't be constructed:
+
+- `Builder.minSnapshotsToKeep` throws `Preconditions.checkArgument(... !type.equals(TAG), "Tags do not support setting minSnapshotsToKeep")` (SnapshotRef.java:154-162).
+- `Builder.maxSnapshotAgeMs` throws similarly "Tags do not support setting maxSnapshotAgeMs" (SnapshotRef.java:164-172).
+
+### 2. Non-positive retention values
+
+All three retention fields are defined as positive in the spec (spec.md:1112-1114). Guarded:
+
+- `minSnapshotsToKeep`: `value > 0` (SnapshotRef.java:158-159).
+- `maxSnapshotAgeMs`: `value > 0` (SnapshotRef.java:168-169).
+- `maxRefAgeMs`: `value > 0` (SnapshotRef.java:175-176).
+
+### 3. `main` set to a tag
+
+The spec requires `main` to always be a branch (spec.md:1103, 1167). If someone set `main` to a tag, the immutable-permanent-branch invariant breaks. Guarded:
+
+- `Builder.setRef` throws "Cannot set main to a tag, it must be a branch" when the name is `main` and the ref isn't a branch (TableMetadata.java:1330-1333).
+- Restated at parse/validation time so even hand-crafted metadata gets caught: `validateRefs` forces `current-snapshot-id == main.snapshotId()` (TableMetadata.java:879-889).
+
+### 4. `current-snapshot-id` out of sync with the `main` branch
+
+The spec requires `current-snapshot-id` to equal the `main` branch's snapshot (spec.md:1161). Divergence would make `currentSnapshot()` (TableMetadata.java:536-537) disagree with `refs["main"]` and break readers. Guarded on mutation and on load:
+
+- `setRef` assigns `this.currentSnapshotId = ref.snapshotId()` whenever setting `main` (TableMetadata.java:1335-1336).
+- `validateRefs` throws if `currentSnapshotId != main.snapshotId()` (TableMetadata.java:880-885).
+
+### 5. Reference points at a snapshot that doesn't exist (dangling ref)
+
+A ref must name a valid snapshot; a dangling ref resolves to nothing at read time. Guarded at three layers:
+
+- Builder allows only existing snapshots: `setRef` validates `snapshot != null`, throwing "Cannot set %s to unknown snapshot" (TableMetadata.java:1326-1329); `setBranchSnapshot` likewise (TableMetadata.java:1311-1313).
+- On load: `validateRefs` throws if `snapshotsById` lacks the ref's snapshot (TableMetadata.java:872-877).
+- If a snapshot is about to be removed (e.g. some non-branch API path), dangling refs are cleaned up in `removeSnapshotsInternal` (TableMetadata.java:1461-1469).
+- In expiration, refs whose snapshot is gone are dropped with a warning rather than silently kept (RemoveSnapshots.java:295-297).
+
+### 6. Deleting a snapshot that a branch/tag still references
+
+Expiration must never garbage-collect a snapshot that is the head of a branch or a tag — the spec's step 3 pins referenced snapshots (spec.md:1128). Guarded:
+
+- Explicit `expireSnapshotId` requests are rejected when the id is still referenced: `Preconditions.checkArgument(refsForId == null, "Cannot expire %s. Still referenced by refs: %s")` (RemoveSnapshots.java:215-222).
+- The general pass starts `idsToRetain` with every retained ref's snapshot (RemoveSnapshots.java:208-213) and the retained-ref set already excluded main-expired/age-expired refs (computeRetainedRefs, :278-301) before any snapshot is marked for removal (:233-237).
+
+### 7. A branch marker's snapshot is too old (ref-age expiration)
+
+`max-ref-age-ms` lets a branch/tag reference itself expire so old refs don't pin data forever. Guarded in `computeRetainedRefs`: any non-main ref whose snapshot is older than `maxRefAgeMs` (falling back to the table default) is dropped (RemoveSnapshots.java:283-294) — the spec's step 2 (spec.md:1127). Importantly `main` is skipped at :283, so the main branch can't be age-expired (spec.md:1114). When a ref is dropped this way, its removal is committed via `removeRef` over the non-retained ref set (RemoveSnapshots.java:229-231).
+
+### 8. A branch's ancestry older than the retention window
+
+For branch history, the cutoff is "older than `max-snapshot-age-ms` AND past the first `min-snapshots-to-keep`" (spec.md:1130-1132). Guarded in `computeBranchSnapshotsToRetain` — it walks ancestors and keeps each while `idsToRetain.size() < minSnapshotsToKeep || ancestor.timestampMillis() >= expireSnapshotsOlderThan`, returning (stopping) the moment both are false (RemoveSnapshots.java:320-333). Both values fall back to table defaults when unset (:307-310). The branch-only gate `ref.isBranch()` at :306 prevents tags from walking ancestry.
+
+### 9. Tags accidentally pinning an entire history
+
+A tag should protect exactly one snapshot, not its whole ancestry. Guarded in `unreferencedSnapshotsToRetain`: branches add their full ancestor chain, but tags add only their single snapshot (RemoveSnapshots.java:337-344), matching the spec's step 3/4 (only branches retain ancestors).
+
+### 10. Concurrent/missing-branch read edge cases (null ref)
+
+Callers that look up a ref by name can get `null` (branch never created, or already removed). Read helpers handle this explicitly rather than NPE:
+
+- `SnapshotUtil.latestSnapshot` returns the table's current snapshot when the branch is null or missing (SnapshotUtil.java:456-488) — the documented "falls back for backwards compatibility with the old current-snapshot path" (:445-455).
+- `SnapshotUtil.schemaFor` treats a missing ref or a branch as "use table schema" (SnapshotUtil.java:407-418, 431-443), so schema lookup never dereferences a missing tag.
+- `TableMetadata.ref(name)` returns `refs.get(name)` which yields null for unknown names (TableMetadata.java:562-564).
+
+### 11. Creating a ref with an unknown snapshot at commit time
+
+Even though builders validate, the sane `SetSnapshotRef`/`RemoveSnapshotRef` metadata updates must be applied consistently. `UpdateSnapshotReferencesOperation.apply` re-checks and only mutates refs that still exist / only sets refs with valid targets (UpdateSnapshotReferencesOperation.java:43, 195, 205), and the whole commit goes through the atomic metadata-swap + retry machinery (RemoveSnapshots.java:360-367), so a failed concurrent update is retried rather than silently lost.
+
+### 12. Race: expiring a snapshot while a ref is being set on it
+
+Because expiration computes `retainedRefs`/`idsToRetain` from `base.refs()` and `base.snapshots()` atomically at commit (RemoveSnapshots.java:204-237), and the commit is a single atomic metadata swap, a branch/tag set in the same or a later committed version is either already reflected in `base` (retained) or the expiration retries against the newer base. The `validateRefs` on-load check (TableMetadata.java:872-877) then guarantees no committed metadata ever persists a dangling ref after the dust settles.
+
+---
+
+Net: the guard pattern is consistently "fail fast and refuse to write invalid metadata." Invalid *states* (tag with branch-only fields, non-positive values, `main` as a tag) are rejected at the `SnapshotRef.Builder`/`TableMetadata.Builder` boundary; invalid *referencing* (dangling ref, current-id mismatch, expiring a referenced snapshot) is rejected both at the builder and re-validated on load (`validateRefs`) and during expiration (`removeRef` of dangling refs, `Preconditions` on referenced-expire). This double enforcement (write-time + load-time) is what keeps the `refs` map self-consistent even across concurrent commits.

@@ -1,0 +1,38 @@
+Here are the edge cases and failure modes for sort orders, what could go wrong, and how the code defends (or fails to defend) against each, citing file:line.
+
+## A. The reserved unsorted ID (0)
+
+The spec says id 0 is reserved for unsorted (spec.md:652). Two failure modes:
+
+- **Creating a real sort order with id 0** would collide with the unsorted sentinel. Guard: `SortOrder.java:277-279` throws `IllegalArgumentException("Sort order ID 0 is reserved for unsorted order")` for any non-empty order with id 0.
+- **An empty/sorted-less order with a non-zero id** is also invalid (an "unsorted" order must be id 0). Guard: `SortOrder.java:271-273`; the unbound path duplicates it at `UnboundSortOrder.java:108-110`.
+- **A stale/unset id**: if no id is supplied, both builders silently default to `1` because 0 is taken — `SortOrder.java:282`, `UnboundSortOrder.java:119`. Note this coupling to the shared integer space is exactly what makes id 0 correctness-critical.
+
+## B. Invalid source references
+
+- **Source column does not exist in the schema.** Guard: `checkCompatibility` throws a `ValidationException` when `schema.findType(field.sourceId())` is null — `SortOrder.java:301-302`.
+- **Source column is a nested/non-primitive type** (map, list, struct). The spec requires sortable sources to be primitive (spec.md:645). Guard: `SortOrder.java:303-306` (`Cannot sort by non-primitive source field`).
+- **Term passed to the builder isn't an unbound term.** Guard: `Preconditions.checkArgument(term instanceof UnboundTerm, ...)` at `SortOrder.java:246`. The builder binds it to the schema and reads the resolved field id (`SortOrder.java:249-250`), so a wrong reference surfaces early.
+
+## C. Transform/type mismatches
+
+- **Transform incompatible with the source type** (e.g., `day()` on an int, or `bucket()` on a type it can't hash). Guard: `checkCompatibility` verifies `transform.canTransform(sourceType)` at `SortOrder.java:307-311` (the check is backed by `Transform.canTransform`, `Transform.java:69`).
+- **Malformed parameterized transforms** — `truncate[0]`, `bucket[0]`, or a bogus width parse. Guard: `Transforms.fromString` throws `IllegalArgumentException` for non-positive widths/counts (documented at `Transforms.java:52-53`) and for unknown names (`Transforms.java:113` default).
+
+## D. Parse-time malformed metadata
+
+- **JSON is not an object / non-array `fields` / non-object field.** Guards: `Preconditions` at `SortOrderParser.java:138-139`, `147-149`, `154-155`.
+- **Unrecognized `direction` or `null-order` strings.** Guards: `SortDirection.fromString` (`SortDirection.java:28-36`) throws for anything other than asc/desc (case-insensitive); `toNullOrder` for anything other than `nulls-first`/`nulls-last` (`SortOrderParser.java:170-179`).
+- **Missing required JSON fields** (`order-id`, `transform`, `source-id`, `direction`, `null-order`). Guards: `JsonUtil.getInt` / `getString` fail on absence (`SortOrderParser.java:140`, `157-164`).
+
+## E. Logical/assumption risks
+
+- **Order-comparison traps.** `satisfies` (`SortOrder.java:88-102`) protects the two invariants that could otherwise let a planner claim a false ordering guarantee: any order satisfies an unsorted order (90-92), and an order with fewer fields can never satisfy one with more (95-97). `sameOrder` correctly compares fields while ignoring the id (`SortOrder.java:110-112`) so equivalence isn't broken by id churn.
+- **Canonical-string round-trip.** Serialization writes `transform.toString()` (`SortOrderParser.java:71`) and equality on `SortField` is by `transform.toString()` (`SortField.java:99`). If two parsers rendered the same transform differently (e.g. `bucket[16]` vs `bucket [16]`), equality/sameOrder could disagree across implementations. The code relies on the transform's canonical `toString` (used as `dedupName`, `Transform.java:210-212`) being stable — the spec's "accept optional whitespace" rule (spec.md:1698) means readers must tolerate that divergence, but the in-memory equality is only trustworthy if `toString` is canonical.
+
+## F. Gaps — what is NOT fully guarded
+
+- **Unknown transform forward-compatibility is partial.** The spec requires v3+ readers to read tables with unknown transforms and ignore them (spec.md:1766). The unbound/bound split exists to defer this (`SortOrderParser.java:119-127`, `UnboundSortOrder.java:40-65`), but `UnboundSortField`'s constructor eagerly calls `Transforms.fromString(transformAsString)` (`UnboundSortOrder.java:132`), which throws on a transform name it doesn't recognize (`Transforms.java:113`). So a genuinely unknown transform string will fail during parse rather than being tolerated and ignored. Only "known-transform, unknown-to-this-builder" cases survive via `bindUnchecked`.
+- **Duplicate sort fields are not rejected.** Sorting by the same expression twice is redundant but not incorrect, and there's no dedup guard in `SortOrder.java` (unlike the partition `dedupName` machinery, `Transform.java:210`). Not a correctness bug, but a place where two orderings could silently differ only by a redundant field and still be judged `!sameOrder`.
+
+So the build path (B, C, first half of A) is well-guarded through `build()`/`checkCompatibility`, the parse path (D) is rigorous, and the planner-facing logic (E) is sound — the main honest gap is F.1, where full spec forward-compatibility with unknown transforms outruns what `Transforms.fromString` currently accepts.

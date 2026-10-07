@@ -1,0 +1,52 @@
+I have the full picture: Spark consumes the index in two stages — planning (build it, attach deletes per task) and reading (apply `task.deletes()`). Flink relies entirely on the core `ManifestGroup` path rather than calling `DeleteFileIndex` directly. Here's the explanation with citations.
+
+## Two engines, one pattern
+
+Flink has zero direct references to `DeleteFileIndex` (the search across `flink/` returned nothing). Flink reads through the engine-agnostic core planner, which is exactly the `ManifestGroup` path below. Spark additionally has a distributed-planning variant (`SparkDistributedDataScan`) that builds the index on a Spark cluster instead of the driver, but the resulting object feeds the same `forDataFile`/`forEntry` machinery.
+
+## Stage 1 — Planning: build the index, attach deletes to each data file task
+
+Core `ManifestGroup` — the shared planner used by Spark (and via Flink) scans:
+```
+core/src/main/java/org/apache/iceberg/ManifestGroup.java:191   DeleteFileIndex deleteFiles = deleteIndexBuilder...build();
+core/src/main/java/org/apache/iceberg/ManifestGroup.java:400   DeleteFile[] deleteFiles = ctx.deletes().forEntry(entry);
+core/src/main/java/org/apache/iceberg/ManifestGroup.java:402-403 new BaseFileScanTask(dataFile, deleteFiles, ...)
+```
+For every data-file manifest entry, `forEntry(entry)` (DeleteFileIndex.java:150-152 → `forDataFile(entry.dataSequenceNumber(), entry.file())`, 158-175) returns exactly the delete files that apply, and they're bundled into the `FileScanTask` (ManifestGroup.java:402-403). That `forEntry` is the same lookup I described in the previous turns — partition map + binary search on data sequence number + equality range pruning.
+
+Spark's distributed variant offloads building the index to cluster executors:
+```
+spark/v3.5/spark/src/main/java/org/apache/iceberg/SparkDistributedDataScan.java:151-173
+    .flatMap(new ReadDeleteManifest(...))        // executors read delete manifests
+    .collect();                                   // gather DeleteFiles on driver
+    return DeleteFileIndex.builderFor(deleteFiles)
+        .specsById(specs())
+        .caseSensitive(isCaseSensitive())
+        .scanMetrics(scanMetrics())
+        .build();
+```
+This is the `builderFor(Iterable<DeleteFile>)` overload (DeleteFileIndex.java:401-403) — it builds the partitioned/sequence-sorted index directly "from files" rather than from manifests, and is what `SparkScanBuilder`/the base scan use downstream. The per-executor manifest read applies the row filter to skip irrelevant deletes early (SparkDistributedDataScan.java:272-276). The base `BaseDistributedDataScan` runs data and delete planning concurrently and joins on the index future, then calls `forDataFile(dataFile)` on it (core/src/main/java/org/apache/iceberg/BaseDistributedDataScan.java:164, 337, 369).
+
+## Stage 2 — Reading: apply `task.deletes()` row-by-row
+
+The deletes bundled into each `FileScanTask` are what readers actually execute. Spark's readers pass them to `SparkDeleteFilter`:
+
+```
+spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/BatchDataReader.java:100-102  referencedFiles: data file + task.deletes()
+                                      115-127  new SparkDeleteFilter(filePath, task.deletes(), ...) -> reads rows through it
+RowDataReader.java:99                        same SparkDeleteFilter construction
+EqualityDeleteRowReader.java:54              SparkDeleteFilter for equality-scanned tables
+ChangelogRowReader.java:121,177             SparkDeleteFilter + task.deletes()
+```
+
+`SparkDeleteFilter` (the `DeleteFilter` hierarchy) is where the semantics land: for a position delete it looks up `_file`/`_pos`; for a deletion vector it tests the bitmap; for an equality delete it compares delete columns — all driven by the delete files the index attached. Other Spark code also keys off `task.deletes()`: `SparkBatchQueryScan.java:171` iterates them for pushdown decisions, `SparkBatch.java:193` and `SparkPlanningUtil.java:76` use "has deletes" to choose read paths/skip optimizations, `SparkWrite.java:416`/`RemoveDanglingDeletesSparkAction.java:119` collect single-DV files from them, and `SparkScanBuilder.java:246` checks emptiness.
+
+## How the whole chain matches the spec
+
+The division of labor is exactly the spec's intent:
+- Planning (Stage 1) does the spec's "same partition, age via data sequence number" matching and metrics pruning — the index is the manifestation of the spec's "delete file indexed by sequence number" (DeleteFileIndex.java:63-69). No data file is ever opened to decide which deletes apply.
+- The `DeleteFile[]` array attached to each task is the per-data-file answer, so the reader (Stage 2) applies only the specific deletes that specification says apply — never a global scan of all delete files.
+
+The result: O(log k)-ish per-file matching at planning (binary search in DeleteFileIndex.java:687-703), and readers get a bounded, pre-matched delete set to apply row-by-row — which is what lets Spark/Flink execute row-level deletes without rewriting data files, matching the v2/v3 design goal.
+
+One note on scope: the same `manifest.content()==DELETES`, live-entries, and sequence-number guarantees I traced earlier in `ManifestReader`/`ManifestFiles` are what make the delete files that reach a reader trustworthy — the engine layer (Spark) assumes that pipeline is correct and doesn't re-validate partition/sequence edges; it consumes `task.deletes()` as authoritative.

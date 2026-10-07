@@ -1,0 +1,61 @@
+Here are the edge cases and failure modes in delete file indexing, and the guard for each, with file:line references. "Guards" fall into three kinds: hard validation that throws, conservative fallbacks that over-apply (safe), and the sequence-number math that keeps deletes from leaking across commits.
+
+## Corruption / correctness guards (hard failures)
+
+1. Multiple DVs for one data file. The spec requires at most one DV per data file. `add(dvByPath, ...)` uses `putIfAbsent` and throws `ValidationException("Can't index multiple DVs for %s...")` if a second is seen (DeleteFileIndex.java:568-576). A second DV would otherwise make which positions are deleted ambiguous.
+
+2. DV older than its data file. `findDV` checks `dv.dataSequenceNumber() >= seq` and throws if a DV's data sequence number is below the data file's (DeleteFileIndex.java:224-228). The spec says a DV applies only when the data file's data sequence number ≤ the vector's, so this is metadata corruption.
+
+3. Mismatched partition spec / partition tuple. `validatePartitionMatch` throws `ValidationException` when a path-scoped delete's `specId` differs from the data file's, or when the partition tuples don't compare equal (DeleteFileIndex.java:234-255). Without this, a file-scoped delete could be applied to the wrong data file that happens to share a path key. The comparator is built per spec ID from `specsById` (95-99).
+
+4. Unknown `content` type. `build()` throws `UnsupportedOperationException` on any `file.content()` that isn't POSITION or EQUALITY (DeleteFileIndex.java:553-554).
+
+5. Equality field id not in schema. `EqualityDeleteFile.equalityFields()` throws `Preconditions("Cannot find field for ID %s")` when a delete's `equality_ids` references a nonexistent field (DeleteFileIndex.java:897-900).
+
+6. Missing partition spec at index-build time. `PartitionMap.newPartitionMap` throws `Preconditions("Cannot find spec with ID %s")` (PartitionMap.java:179-181).
+
+## Sequence-number edge cases (guards against cross-commit leaks)
+
+7. Applying a delete to a data file written in a *later* commit. Each group is sorted by data sequence number and `findStartIndex`/`filter` return only the suffix with seq ≥ the data file's seq (DeleteFileIndex.java:687-703, 726-743, html). A delete can never apply to data that came after it. The `afterSequenceNumber`/`minSequenceNumber` builder filter does the same pruning earlier (432-435, 488-520).
+
+8. Equality delete must apply only to data strictly *older* than it. This is the trickiest one. The spec requires "data sequence number is strictly less than the delete's" for equality deletes (unlike position deletes which allow equal). The code encodes this as `applySequenceNumber = wrapped.dataSequenceNumber() - 1` (DeleteFileIndex.java:881), then reuses the same `>=` binary search. Consequence: an equality delete at seq X applies to data files with seq ≤ X-1, and correctly excludes a same-commit data file (seq X), while a position delete at the same seq would include it — matching the spec's asymmetry.
+
+9. Same-commit position deletes (spec allows deleting rows added in the same commit, data seq == delete seq). `findStartIndex` returns the *first* occurrence by decrementing past equal values (DeleteFileIndex.java:694-700), so a position delete with seq equal to the data file's seq is included.
+
+## Conservative over-application (safe when stats are missing)
+
+These never drop a needed delete; they only risk doing more work.
+
+10. Missing or partial upper/lower bounds. `canContainEqDeletesForFile` sets `checkRanges=false` if either side lacks bounds and then `continue`s, i.e. assumes the delete may match (DeleteFileIndex.java:266-267, 298-301); individual missing bounds likewise continue rather than prune (308-311).
+
+11. Nested-type equality fields. Stats aren't kept for nested types, so the code `continue`s (assumes match) instead of prunilng (DeleteFileIndex.java:274-277).
+
+12. Null-count edges. If the data has nulls and the delete deletes nulls, it continues (must apply) (280-283); if the data is all-null for a field but the delete only matches non-null values, it can return false (285-289); symmetric case for delete-side all-null (291-296). When null-count maps are missing, `containsNull`/`allNull`/`allNonNull` return conservative values (assume possible, 344-395).
+
+13. Unrecoverable referenced data file path. `referencedDataFile` only returns a path when the delete file's lower and upper `file_path` bounds are present *and* equal; otherwise it returns null (ContentFileUtil.java:63-89). A null referenced path means the delete is indexed by partition rather than by path (DeleteFileIndex.java:582-594) — this is always a safe downgrade (broader scope), never a wrong file-scope.
+
+## Concurrency / lifecycle guards
+
+14. Adding files after indexing. `PositionDeletes.add`/`EqualityDeletes.add` throw `Preconditions("Can't add files upon indexing")` once the buffer is null (DeleteFileIndex.java:722, 804). `indexIfNeeded` uses a volatile buffer with double-checked locking so the build-then-freeze transition is safe (755-765, 839-849).
+
+15. Parallel manifest loading. Files accumulate into a `ConcurrentLinkedQueue` (DeleteFileIndex.java:495, 503-518), with `closeQuietly`-style handling — `RuntimeIOException("Failed to close")` if a manifest reader fails to close (515-517), so I/O failures surface instead of leaking resources.
+
+16. PartitionMap concurrency model. Documented as "not designed for concurrent modification ... supports safe concurrent reads" (PartitionMap.java:46-47). The index builds it single-threaded then reads it concurrently — a concurrent put would be a bug, which is why all mutation happens in the builder before the index is published.
+
+17. Pushdown filters unsupported when built from an explicit file list. `filterData`/`filterPartitions`/`filterPartitions(PartitionSet)` throw `Preconditions` if `deleteFiles != null` (DeleteFileIndex.java:448-449, 456-457, 463), because a files-based index has no manifests to push into.
+
+## Manifest/pruning failure modes
+
+18. Skipping a delete manifest it shouldn't. The eval cache only opens manifests that are `DELETES`, have added/existing files, and pass `ManifestEvaluator` on the inclusive projection (DeleteFileIndex.java:651-653, 616-640). Because it's the spec's *inclusive* projection (a superset), a wrongly-included manifest is safe (extra reads); the risk of *excluding* a needed delete is bounded by the projector/matcher both using the same spec (Projections.inclusive, 626).
+
+19. DELETED entries leaking into results. `liveEntries()`/`isLiveEntry` filters `status() != DELETED` (ManifestReader.java:354-365), so logically-deleted manifest entries are never indexed.
+
+20. Reading a data manifest as a delete manifest. `readDeleteManifest` asserts `manifest.content() == ManifestContent.DELETES`, else `Preconditions` (ManifestFiles.java:298-301).
+
+## Notes / residual gaps
+
+- Empty index short-circuits to `EMPTY_DELETES` before any lookup (DeleteFileIndex.java:159-161), and empty buckets are nulled out at construction (560-565) — avoids wasted lookups when a table has no deletes.
+- One subtle edge worth flagging: an equality delete with data sequence number 0 (e.g. from a v1-era default) would get `applySequenceNumber = -1` (881) and so never match a data file at seq 0 — an equality delete can then apply to nothing. This matches the "strictly less than" rule literally, but if a v0-seq equality delete were ever meant to delete v0 data files, this boundary behaves as a silent no-op. In practice v1 tables have no equality deletes, so this is mostly theoretical.
+- The entire design trusts the sequence numbers and partition tuples stored in manifest metadata (line 555's fast-path build is unvalidated beyond the checks above). Metadata corruption that produces *plausible but wrong* seq/partition values won't be caught by `DeleteFileIndex` itself — `validatePartitionMatch` only guards path-scoped files, and `findDV` only checks the DV-seq relationship; the partition-scoped position/equality lookups rely on `PartitionMap` equality, not a hard cross-check. That's by design (the index is a read-side accelerator, not a validator), but it is the main blind spot.
+
+I read all of DeleteFileIndex.java plus ContentFileUtil.java, PartitionMap.java, and the relevant bits of ManifestReader.java and ManifestFiles.java.

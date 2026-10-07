@@ -1,0 +1,46 @@
+Having read the full file and the code it delegates to (`BucketUtil`, `DateTimeUtil.nanosToMicros`), here's how `Bucket.java` implements the spec.
+
+## The bucket formula (`Bucket.java:112-117`)
+
+The spec's budget formula is `bucket_N(x) = (murmur3_x86_32_hash(x) & Integer.MAX_VALUE) % N`. The implementation is exact:
+
+```java
+public Integer apply(T value) {
+  if (value == null) {
+    return null;
+  }
+  return (hash(value) & Integer.MAX_VALUE) % numBuckets;
+}
+```
+
+- Null input → null (`:113-115`), matching the spec rule "all transforms must return null for a null input value."
+- Sign-bit discard via `& Integer.MAX_VALUE` and positive mod via `% numBuckets` (`:116`), matching the spec pseudo-code verbatim.
+- `numBuckets` is checked `> 0` in the factory (`:41-42`, `:55-56`), and the spec's `bucket[N]` requires a positive N. The `toString()` renders as `bucket[<N>]` (`:157`), the JSON transform string form from Appendix C.
+
+## Type dispatch and support (`Bucket.java:120-136`)
+
+`canTransform` (`:120-136`) allows exactly the spec's bucket source types: INTEGER, LONG, DATE, TIME, TIMESTAMP, TIMESTAMP_NANO, STRING, BINARY, FIXED, DECIMAL, UUID — and rejects everything else. The deprecated `get(type, numBuckets)` (`:58-80`) maps each type to a specialized subclass and throws for unsupported types. Note the absence: the spec does not list float/double/boolean as valid bucket sources, and `canTransform` returns false for them even though `BucketUtil` happens to define their hashes for other uses.
+
+`getResultType` returns `Types.IntegerType.get()` (`:205-207`), matching the spec's "result type: int."
+
+## Per-type hashing (inside `BucketUtil`)
+
+Each subtype's `hash()` delegates to `BucketUtil`, which uses Guava's `Hashing.murmur3_32_fixed()` (`BucketUtil.java:34`) — the 32-bit Murmur3 x86 variant seeded with 0, exactly what the spec requires.
+
+- int/long (`BucketInteger.java:217-219`, `BucketLong.java:230-232` → `BucketUtil.hash(int/long)` `:38-44`): both call `MURMUR3.hashLong(value)`, so a value hashed as int and as long yields the same result. This implements Appendix B note 1: "Integer and long hash results must be identical ... so schema evolution does not change bucket partition values if integer types are promoted." The spec's promotion rule permits int→long for a bucket source because of exactly this fact.
+- timestamp_ns (`BucketTimestampNano.java:244-246`): converts nanos to micros via `DateTimeUtil.nanosToMicros(nanos)` (`DateTimeUtil.java:104-106`, `Math.floorDiv(nanos, 1000)`) before hashing, then calls `BucketUtil.hash(long)`. This implements Appendix B note 3: nanosecond timestamps are converted to microseconds so they hash identically to microsecond timestamps (and the class comment at `:235` states this intent explicitly).
+- string (`BucketString.java:257-259` → `BucketUtil.hash(CharSequence)` `:66-68`): hashed as UTF-8 bytes via `hashString(value, UTF_8)`, matching "string: hashBytes(utf8Bytes(v))."
+- fixed/binary (`BucketByteBuffer.java:270-272` → `BucketUtil.hash(ByteBuffer)` `:74-90`): hashes the buffer's remaining bytes, matching "fixed: hashBytes(v)" / "binary: hashBytes(v)."
+- uuid (`BucketUUID.java:283-285` → `BucketUtil.hash(UUID)` `:92-99`): writes the 16 bytes big-endian via `Long.reverseBytes` on each half, matching Appendix B note 4's requirement that UUIDs be encoded big-endian.
+- decimal (`BucketDecimal.java:296-298` → `BucketUtil.hash(BigDecimal)` `:101-103`): hashes `value.unscaledValue().toByteArray()`, which is the minimal two's-complement big-endian unscaled value — exactly `hashBytes(minBigEndian(unscaled(v)))`. This also yields Appendix B note 2's property that the hash is independent of scale (scale is not part of the hash input).
+- date/time/timestamp/timestamptz (`BucketInteger`/`BucketLong` since DATE→int, TIME/TIMESTAMP→long at `:59-65`): by the time they reach `BucketUtil`, DATE is already an epoch-day int and TIME/TIMESTAMP are epoch-micro longs, so `hashInt`/`hashLong` semantics match the spec's "hash from the epoch value."
+
+## Projection (predicate pushdown)
+
+`project`/`projectStrict` (`:160-202`) only project predicates whose partition value is exactly determined by the transform: equality/`IN` for the inclusive projection and not-eq/`NOT IN` for the strict projection, translating literals through `function.apply(...)`. Comparison predicates can't be projected (a range over the source maps to a range of hash buckets that isn't a single value). This aligns with the spec's inclusive-projection concept — partitioned bucketed columns only prune on exact bucket matches, never on "less than" etc.
+
+One small spec-vs-code note: the spec's canonical name is `timestamp(ns)` types; the code calls them `TIMESTAMP_NANO`. Same thing.
+
+Summary: the code follows the spec precisely on the transform formula, the set of supported source types, the null rule, the result type, and the per-type hash encodings; the only apparent "extra" hash functions in `BucketUtil` (float/double/boolean) exist for completeness but are never reachable through `Bucket`, because `canTransform` gates them out — consistent with the spec not listing them as valid bucket sources.
+
+I made no code changes — this was a read-and-analyze task.

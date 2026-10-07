@@ -1,0 +1,65 @@
+Here are the concrete failure modes for overwrite, grouped by how they fail, with the guard each one uses.
+
+## A. Concurrency / commit conflicts
+
+**A1. Lost update: two writers commit the same base metadata.**
+An overwrite builds a new metadata file from a base, then atomically swaps the pointer. If another writer committed first, the swap fails. Guard: `commit()` retries only on `CommitFailedException` with exponential backoff (SnapshotProducer.java:489-496) and does the swap via `taskOps.commit(base, updated)` on the catalog's check-and-put (SnapshotProducer.java:533). The loser re-runs `apply()` against the newer base (SnapshotProducer.java:500) so its changes are re-based.
+
+**A2. The files an overwrite intends to delete were already removed concurrently.**
+This is the spec's key retry rule. Guard: `failMissingDeletePaths()` (BaseOverwriteFiles.java:118,125) sets the flag that makes `validateRequiredDeletes` throw "Missing required files to delete" (ManifestFilterManager.java:281-303) unless every targeted file still appears in the filtered manifests. Without this, a stale overwrite could silently "succeed" and drop files it no longer had any right to touch.
+
+**A3. A concurrent writer added new matching data during the overwrite.**
+Deleting by a row filter could clobber rows another writer just appended. Guard: `validateNoConflictingData` -> `validateAddedDataFiles` (BaseOverwriteFiles.java:116-120, 163-165 -> MergingSnapshotProducer.java:391-412). It scans only the validation window of `append`/`overwrite` snapshots (MergingSnapshotProducer.java:435-441) and throws if any new data file matches the conflict filter (MergingSnapshotProducer.java:401-405, using `addedDataFiles` at 424-464).
+
+**A4. A concurrent writer added a delete file that should apply to data being kept.**
+Guard: `validateNoConflictingDeletes` (BaseOverwriteFiles.java:123-127) -> `validateNoNewDeleteFiles` (MergingSnapshotProducer.java:574-584) and `validateNoNewDeletesForDataFiles` (475-553), which build a `DeleteFileIndex` per snapshot and fail if a new delete would hit the affected data (MergingSnapshotProducer.java:531-552). It is skipped when the filter is `alwaysFalse` (BaseOverwriteFiles.java:168) and anchored to the given sequence number (MergingSnapshotProducer.java:534, 785-792).
+
+**A5. Snapshot ID collision after retry.**
+Commit retries must not reuse a snapshot id that now exists. Guard: `snapshotId()` loops while the candidate id is already present, regenerating via `ops.newSnapshotId()` (SnapshotProducer.java:697-706).
+
+## B. Filter correctness (whole-file replacement)
+
+**B1. Deleting a file where only SOME rows match the filter.**
+Overwrite-by-row-filter is a file-level operation: it drops whole files. If a file has matching and non-matching rows, deleting it removes non-matching rows — silent data loss. Guard: in both the scan and rewrite passes, a file is only deleted if every row must match (`rowsMustMatch`); "some, but not all" throws `ValidationException` ("Cannot delete file where some, but not all, rows match filter", ManifestFilterManager.java:472-489 and 527-535). The matching is computed by partition projection + metrics via `ResidualEvaluator` (ManifestFilterManager.java:583-630).
+
+**B2. Added replacement files contain rows outside the filter.**
+A user could ask to overwrite `WHERE x=1` but add files holding `x=2`, corrupting the table. Guard: `validateAddedFilesMatchOverwriteFilter()` (BaseOverwriteFiles.java:96-99) then `validate()` uses inclusive projection + `StrictMetricsEvaluator` to require each added file's rows all match (BaseOverwriteFiles.java:137-161).
+
+## C. Delete-file / DV lifecycle
+
+**C1. Removing a data file leaves orphaned position deletes / DVs.**
+Guard: `apply()` passes the data files being deleted into `removeDanglingDeletesFor` (MergingSnapshotProducer.java:1038-1039), and delete manifests drop DVs whose referenced data file is gone (`isDanglingDV`, ManifestFilterManager.java:498-500, used at 517). This mirrors the spec rule that removing a data file also removes its deletion vector.
+
+**C2. Never-usable old delete files accumulate.**
+Deletes older than the oldest live data file can no longer match anything. Guard: `dropDeleteFilesOlderThan(minDataSequenceNumber)` (MergingSnapshotProducer.java:1025-1034 -> ManifestFilterManager.java:160-164) prunes them during filtering (ManifestFilterManager.java:466-470, 523-526).
+
+**C3. Duplicate DVs for one data file.**
+An overwrite adding multiple DVs for the same referenced file would violate the "at most one DV per file" invariant. Guard: `mergeDVs()` collapses them into a single merged vector (MergingSnapshotProducer.java:1209-1236).
+
+**C4. Wrong delete-file type for the format version.**
+Guard: `validateDeleteFileForVersion` rejects deletes in v1, DVs for position deletes in v2, and non-DV position deletes in v3/v4 (MergingSnapshotProducer.java:295-316); re-checked against the live format at `apply()` time (MergingSnapshotProducer.java:1011-1015, 1019) so a concurrent format upgrade can't slip through.
+
+## D. Cleanup / retry / crash
+
+**D1. Commit state unknown (fs/catalog failure mid-commit).**
+If the swap outcome is unknown, cleaning up could delete data that actually committed. Guard: `commit()` rethrows `CommitStateUnknownException` *without* cleanup (SnapshotProducer.java:536-537); cleanup only runs on a confirmed commit (SnapshotProducer.java:546-569) or a `CleanableFailure` when strict cleanup is on (SnapshotProducer.java:538-543).
+
+**D2. Orphaned manifests/manifest-lists from aborted attempts and retries.**
+Each attempt writes new manifests and manifest lists; failed attempts must not leak them. Guard: `cleanUncommitted` deletes uncommitted new/rewritten manifests (MergingSnapshotProducer.java:1112-1132), and `commit()` deletes unused manifest lists after the winner is found (SnapshotProducer.java:559-564). `apply()` being called repeatedly on retry reuses cached manifests instead of rewriting (MergingSnapshotProducer.java:1148-1165), invalidating and cleaning them only when needed (1150-1152).
+
+**D3. Double-deleting a path / duplicate delete entries.**
+Can distort summary counts (the spec's `deleted-duplicate-files` metric). Guard: duplicate deletes are detected and counted separately, not double-added (ManifestFilterManager.java:541-551).
+
+## E. Malformed inputs / state
+
+**E1. Adding a data file whose partition spec is unknown, or mixing specs.**
+Guard: `add()` throws if the spec is missing (MergingSnapshotProducer.java:242-247); `dataSpec()` asserts exactly one spec when needed (MergingSnapshotProducer.java:154-162).
+
+**E2. Null conflict-detection filter.**
+Guard: `conflictDetectionFilter` rejects null with `Preconditions` (BaseOverwriteFiles.java:108-113).
+
+## The overall pattern
+
+The two classes of correctness risk are (1) **filter/range semantics** — replacements must be whole files (B1) and must cover whole files (B2) — and (2) **stale-base concurrency** — the overwrite must only commit if the files it removes still exist (A2) and no concurrent add/delete conflicts (A3, A4). Both are enforced as pre-commit `ValidationException`s inside `BaseOverwriteFiles.validate()` (BaseOverwriteFiles.java:136-179), which runs before the atomic metadata swap. Everything else is about making the retry/cleanup path safe and leak-free so a failed optimistic commit never corrupts committed data or leaves garbage.
+
+One honest caveat: several guards are opt-in rather than default. `validateNoConflictingData`, `validateNoConflictingDeletes`, and `validateAddedFilesMatchOverwriteFilter` are enabled only when the caller invokes those builder methods (BaseOverwriteFiles.java:116, 123, 96). The hard, always-on guards are the atomic swap (A1) and the whole-file filter check (B1); the stronger concurrent-write validations (A3/A4 and B2) are things engines opt into.

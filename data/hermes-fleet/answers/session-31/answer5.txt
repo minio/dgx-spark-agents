@@ -1,0 +1,14 @@
+Ten-point orientation for a new contributor, each with one file:line to start with.
+
+1. What a catalog is: the DB only stores a pointer to the current metadata file, not the data. Read how `JdbcCatalog` is initialized and wires up `FileIO` (object storage) + the connection pool — JdbcCatalog.java:116-168.
+2. The catalog table schema: one row per table, `metadata_location` + `previous_metadata_location`, keyed by (catalog, namespace, name). Read JdbcUtil.java:128-149.
+3. The central commit primitive (check-and-put): a commit flips the pointer only if it still points at the base version, via `UPDATE ... WHERE metadata_location = ?`. Read JdbcTableOperations.java:103-144.
+4. The check-and-put SQL itself — where the optimistic-concurrency magic actually lives. Read JdbcUtil.java:111-127.
+5. Commit result handling: 1 row = success, 0 rows = contention → `CommitFailedException`. Read JdbcTableOperations.java:146-162.
+6. Table creation is enforced by the PK constraint, mapped to `AlreadyExistsException`; also the pre-check. Read JdbcTableOperations.java:165-198.
+7. Reads are lock-free pointer loads (no locks), then the metadata JSON is read from storage. Read JdbcTableOperations.java:69-100.
+8. How connections are pooled and transient/deadlock errors are retried, using `ClientPoolImpl` + retryable SQLSTATEs. Read JdbcClientPool.java:35-114.
+9. The shared base class that drives `commit`/refresh and UUID-verifies metadata; `JdbcTableOperations` just supplies `doCommit`/`doRefresh`. Read BaseMetastoreTableOperations.java:109-135.
+10. How the `type=jdbc`/`catalog-impl` option makes engines load this class reflectively (Spark/Flink don't import it directly). Read CatalogUtil.java:312-353.
+
+Starting points in order of importance: 3 and 4 (the commit mechanism) define the whole catalog; 2 (the schema) tells you what's stored; the rest flesh out lifecycle, error handling, and how it plugs in.

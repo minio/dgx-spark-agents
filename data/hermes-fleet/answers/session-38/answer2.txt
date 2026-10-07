@@ -1,0 +1,40 @@
+I read `SingleValueParser.java` (417 lines) in full, plus the code it backs for defaults. Here's how the pieces implement the spec.
+
+## What SingleValueParser is, and the spec it implements
+
+`SingleValueParser` is the (de)serializer for the JSON single-value format that Appendix D and the "Default values" section reference. The spec (format/spec.md:349) says defaults are "serialized with fields in the JSON format. See Appendix C," and Appendix C (spec.md:1700) says defaults use "the JSON single-value serialization in Appendix D." `SingleValueParser` is that Appendix D encoding — its `fromJson`/`toJson` implement exactly the JSON single-value table.
+
+## Serialization path: SchemaParser
+
+`SchemaParser` owns the struct-field JSON (Appendix C schema encoding) and delegates each default's value to `SingleValueParser`:
+
+- Shadowing the spec's kebab-case keys `initial-default`/`write-default` — `INITIAL_DEFAULT`/`WRITE_DEFAULT` at SchemaParser.java:54-55.
+- Write (SchemaParser.java:96-104): writes `initial-default` then `write-default` only when non-null, each encoded via `SingleValueParser.toJson(field.type(), ...)`. This matches the spec's "Optional fields: only write when non-null" convention and the two-fields-per-field structure (spec.md:329-330, 349).
+- Read (SchemaParser.java:198-211): `defaultFromJson` calls `SingleValueParser.fromJson(type, json.get(defaultField))` and wraps the result in a `Literal` (`Expressions.lit`), with a special `Expressions.nanos` path for nanosecond timestamps (line 201-205). The read constructor then attaches both defaults to the field via `withInitialDefault`/`withWriteDefault` (SchemaParser.java:237-248).
+
+So `SingleValueParser` provides the per-type value conversion; `SchemaParser` places those values in the field's JSON object exactly as the spec's struct JSON example shows (spec.md:1691 shows `"initial-default"` and `"write-default"` as field attributes).
+
+The per-type checks in SingleValueParser mirror Appendix D's JSON single-value table: UUID as a 36-char lowercase string (SingleValueParser.java:107-120), binary/fixed as hex (157-176), decimal with matching scale (87-102), struct as an object keyed by field ID (188-203, matching spec.md:1889), map as `{keys, values}` arrays (205-232, matching spec.md:1891), list as an array (234-239).
+
+## Read / projection path: ValueReaders
+
+The spec's column-projection rule (spec.md:399-410) says a value for a missing field id is resolved from partition metadata → name mapping → `initial-default` → `null`. The Avro read path implements the `initial-default` step:
+
+`createMissingFieldReader` (ValueReaders.java:302-326) is invoked for fields absent from a data file (the "missing field" read plan at ValueReaders.java:296-297). After checking a supplied constant, it checks `field.initialDefault() != null` and returns `ValueReaders.constant(convert.apply(type, initialDefault))` (ValueReaders.java:315-316) — i.e., materializes the initial default for every row in the old data file. That is exactly the spec's "initial-default is used to populate the field's value for all records written before the field was added" (spec.md:329) and the projection-order note (spec.md:407).
+
+Notably the read path uses `initial-default` and *not* `write-default` — consistent with the spec: the initial default freezes historical-row interpretation, while the write default only affects new writes (spec.md:329-330). And if there's no constant and no initial default, an *optional* field falls back to `null` (ValueReaders.java:321-322, matching "if either default is not set for an optional field, then the default value is null" — spec.md:332), while a *required* field with no default throws "Missing required field" (ValueReaders.java:325, matching "If the write default for a required field is not set, the writer must fail" / the reader-side required-fields-fail behavior in spec.md:334 and Appendix E v3 note at spec.md:1932).
+
+## Evolution path: SchemaUpdate + UnionByNameVisitor
+
+The spec's struct-evolution rules (spec.md:389-397) — `initial-default` set at add and immutable, `write-default` set at add and mutable, required add needs a non-null default, etc. — are enforced here:
+
+- **Add column** (`internalAddColumn`, SchemaUpdate.java:113-187): sets both `withInitialDefault(defaultValue)` and `withWriteDefault(defaultValue)` to the same value (lines 181-182), which is spec's "write-default is initially set to the same value as initial-default" (spec.md:332).
+- **Required-without-default guard** (SchemaUpdate.java:160-163): `Preconditions.checkArgument(defaultValue != null || isOptional || allowIncompatibleChanges, "cannot add required column without a default value")` — enforces spec's "When a required field is added, both defaults must be set to a non-null value" (spec.md:393).
+- **Default change** (`updateColumnDefault`, SchemaUpdate.java:322-343): converts the new default to the field type, and uses `withWriteDefault(newDefault)` only — leaving the initial default untouched (line 339). This is precisely "write-default... can be changed through schema evolution" while "initial-default... cannot change" (spec.md:330, 391). The type conversion also matches Appendix E's note that `write-default` is a write-time-only, forward-compatible change (spec.md:1931).
+- **Union by name** (`UnionByNameVisitor`, UnionByNameVisitor.java:163-168, 171-195): when merging a schema, `addColumn` seeds the initial default (line 167) then `updateColumnDefault` with the write default (line 168), and `updateColumn` propagates write-default changes when they differ (lines 192-194), preserving the initial default throughout.
+
+## Summary
+
+`SingleValueParser` is the low-level encoder/decoder for the Appendix D single-value format. Three call sites give it meaning against the spec: SchemaParser places those values as the `initial-default`/`write-default` field attributes (Appendix C), ValueReaders turns the *initial* default into a read-time constant for missing columns (the projection rule), and SchemaUpdate/UnionByNameVisitor enforce the evolution rules — immutable initial default, mutable write default, fresh required add needing a non-null default. The write default is deliberately a write-time-only concept and, unlike the initial default, never appears in the read/projection path.
+
+One thing to flag: I traced the core read (projection) and evolution paths, but the actual writer that *applies* `write-default` when a value isn't supplied is engine-layer (Spark/Flink) or data-layer code rather than core default-value plumbing — worth confirming in the specific writer if you need that exact branch.

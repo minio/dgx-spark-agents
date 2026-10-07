@@ -1,0 +1,53 @@
+Here's how `ResolvingFileIO` and the code it calls map onto the spec (citing `path:line`).
+
+## What ResolvingFileIO is
+
+`ResolvingFileIO` is not itself a file system adapter — it's a dispatcher/router. Its Javadoc says exactly this: "FileIO implementation that uses location scheme to choose the correct FileIO implementation" (ResolvingFileIO.java:47-51). It implements `DelegateFileIO` (ResolvingFileIO.java:52-53), which is just `FileIO + SupportsPrefixOperations + SupportsBulkOperations` (DelegateFileIO.java:25).
+
+Every read/write/delete call is forwarded to a per-scheme delegate (ResolvingFileIO.java:89-106):
+- `newInputFile(location)` -> `io(location).newInputFile(location)` (:90)
+- `newOutputFile(location)` -> `io(location).newOutputFile(location)` (:100)
+- `deleteFile(location)` -> `io(location).deleteFile(location)` (:105)
+- `deleteFiles(paths)` batches and groups by resolved IO, then calls each delegate's bulk delete (:109-121).
+
+## Paths as scheme-ful URIs -> pick the adapter (spec "File Locations in Metadata" / "Path Resolution")
+
+The spec says an absolute path is identified by its URI scheme and used as-is (spec.md:192, 201). ResolvingFileIO implements the scheme-to-implementation mapping directly:
+
+- `scheme(location)` (ResolvingFileIO.java:248-255) takes the substring before the first `:`, i.e. the URI scheme.
+- `implFromLocation(location)` (ResolvingFileIO.java:235-237) looks that scheme up in `SCHEME_TO_FILE_IO` (ResolvingFileIO.java:60-69): `s3/s3a/s3n -> S3FileIO`, `gs -> GCSFileIO`, `abfs/abfss/wasb/wasbs -> ADLSFileIO`, anything else (including `hdfs:` and `file:`) falls back to `HadoopFileIO`.
+
+This is a direct embodiment of the spec's portability goal: the format is storage-agnostic, and the code that touches a specific storage backend is chosen by the path's scheme at runtime — never hardcoded into the data model.
+
+## Concurrency-safe on-demand loading (spec "Scale" / pluggable FileIO)
+
+Delegates are created lazily and cached per scheme in a `ConcurrentMap` (ResolvingFileIO.java:71, :187 via `computeIfAbsent`), so concurrent readers/writers of the same scheme share one instance rather than bottlenecking on a metadata store — mirroring the spec's "scale/job planning handled primarily by clients."
+
+Loading itself is dynamic reflection through `CatalogUtil.loadFileIO` (ResolvingFileIO.java:198). That loader (CatalogUtil.java:392-425):
+- builds the class by name with a no-arg constructor (:398-408),
+- instantiates it and verifies it's a `FileIO` (:412-416),
+- applies the Hadoop conf if configurable (:418 → `configureHadoopConf` :434),
+- pushes storage credentials if supported (:419-421),
+- calls `initialize(properties)` (:423).
+
+ResolvingFileIO also enforces that a delegate implements `DelegateFileIO` (ResolvingFileIO.java:226-228) and, if a cloud-specific class is absent, falls back to HadoopFileIO (ResolvingFileIO.java:199-223). Note the constants are plain class-name strings (ResolvingFileIO.java:56-59); the core module has no compile-time dependency on the S3/GCS/ADLS implementations — again, runtime resolution, not baked-in coupling.
+
+`initialize()` (ResolvingFileIO.java:129-133) closes any prior instances and copies the catalog property map; `close()` (ResolvingFileIO.java:136-147) closes and clears all cached delegates. Credentials and the Hadoop conf are propagated to each delegate (ResolvingFileIO.java:170-182), supporting the v3 encryption / secure-credential plumbing.
+
+## The three storage operations (spec "File System Operations")
+
+The spec requires only in-place write, seekable reads, and deletes. The `FileIO`/`InputFile`/`OutputFile` contracts are exactly that surface:
+
+- Reads: `InputFile.getLength()` (InputFile.java:37), `newStream()` returning a `SeekableInputStream` (InputFile.java:46), `exists()` (:60). HadoopFileIO implements `newInputFile` (HadoopFileIO.java:82-89) via `HadoopInputFile.fromLocation`; `newStream()` does `fs.open(path)` wrapped as seekable (HadoopInputFile.java:183-191), satisfying the spec's "Seekable reads — data file formats require seek support" (spec.md:126). Length is lazy, from a `getFileStatus` stat (HadoopInputFile.java:161-180).
+- Writes / in-place immutability: `OutputFile.create()` must throw `AlreadyExistsException` if the path exists (OutputFile.java:32-41) — i.e. each file is written once and never overwritten, matching "in-place write … files are not moved or altered once written" (spec.md:125). HadoopOutputFile.create does `fs.create(path, false)` (HadoopOutputFile.java:72-80), which surfaces `FileAlreadyExistsException`; `createOrOverwrite()` (HadoopOutputFile.java:83-89) is the explicit opt-in exception used only where the spec's immutability isn't required.
+- Deletes: `deleteFile` (HadoopFileIO.java:97-105) and, for the snapshot-GC workflow where "tables delete files that are no longer used" (spec.md:127), bulk `deleteFiles` via `Tasks.foreach` with retry and parallel worker pool (HadoopFileIO.java:173-190, :192-208), plus `listPrefix`/`deletePrefix` (HadoopFileIO.java:139-170) to enumerate an expired snapshot's tree. The same surface exists on S3FileIO (S3FileIO.java:151-169, :202, :364-366).
+
+## Efficient/lazy reads (spec "Speed")
+
+`FileIO` already carries known file length into the input file so a plan-time scan doesn't have to make a stats call: `newInputFile(file.location(), file.fileSizeInBytes())` for data/delete/manifest files (FileIO.java:50-72), and `HadoopInputFile` only hits the FileSystem for length when it wasn't provided (HadoopInputFile.java:127-134 keeps a final `length`). This matches the spec's goal that planning span "O(1) remote calls" (spec.md:72): the manifest already holds `file_size_in_bytes`, so opening a file needs no extra round-trip.
+
+## Where the spec's logic does NOT live here
+
+A useful boundary: `FileIO` is purely a byte-level read/write/delete facade (FileIO.java:30-36). The spec's concurrency and atomic-swap commit semantics, sequence numbers, and manifest/metrics machinery are implemented elsewhere (table operations, writers, manifest code), not in the FileIO layer. ResolvingFileIO's job is only "given a path with a scheme, route to the right storage adapter" — which is precisely the spec's requirement that the core format stay independent of any one storage backend (spec.md:129, "These requirements are compatible with object stores, like S3").
+
+I read ResolvingFileIO.java in full, plus the code it calls: the `FileIO`/`InputFile`/`OutputFile`/`DelegateFileIO` contracts (api/io), `SupportsPrefixOperations`/`SupportsBulkOperations`, `HadoopFileIO`, `HadoopInputFile`, `HadoopOutputFile`, the `CatalogUtil.loadFileIO` loader, and the relevant S3FileIO entry points. I did not trace the full S3/GCS/ADLS internals (S3InputFile/S3OutputFile/streams) or the writers in `core/io` since those weren't needed to answer how ResolvingFileIO follows the spec.

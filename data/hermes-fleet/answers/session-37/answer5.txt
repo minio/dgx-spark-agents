@@ -1,0 +1,23 @@
+Here are ten bullets for a new contributor, each grounded in the file and line to read first.
+
+- **What metadata columns are**: Iceberg reserves the top ~108 field IDs for virtual columns exposed to engines (`_file`, `_pos`, `_deleted`, `_spec_id`, `_partition`, changelog columns, and the lineage pair). Read `core/src/main/java/org/apache/iceberg/MetadataColumns.java:33` — the constant definitions and the two reserved-ID blocks (metadata vs. position-delete columns).
+
+- **The lineage columns**: `_row_id` (unique per row, stable across rewrites) and `_last_updated_sequence_number` (commit that last touched the row); both optional. Read `core/src/main/java/org/apache/iceberg/MetadataColumns.java:97` and the matching spec contract `format/spec.md:443`.
+
+- **Why they're deferred (the core design)**: row IDs and the last-updated sequence can't be known until a snapshot commits (and change on retry), so writers store null and readers assign by inheritance. Read the rationale in `format/spec.md:463` ("assigned and updated by inheritance because the commit sequence number and starting row ID are not assigned until the snapshot is successfully committed").
+
+- **The inheritance chain (table → snapshot → manifest → file → row)**: `next-row-id` seeds the snapshot's `first-row-id`, which steps down through manifest `first_row_id`, data-file `first_row_id`, and finally `_row_id = first_row_id + _pos`. Read `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:335` where it computes `nextRowId` and `assignedRows`.
+
+- **Manifest-level assignment**: the writer assigns each data manifest a `first_row_id`, stepping by its added+existing row counts. Read `core/src/main/java/org/apache/iceberg/ManifestListWriter.java:138` (v4) — the same logic exists for v3 at `:198`.
+
+- **Read-side assignment**: at read time a file with null `first_row_id` is assigned the manifest's value plus the record counts of preceding files. Read `core/src/main/java/org/apache/iceberg/ManifestReader.java:440` (`idAssigner`) and `core/src/main/java/org/apache/iceberg/TrackingStruct.java:163` (`assignFirstRowId`, v4).
+
+- **Per-row resolution**: the file-level `first_row_id` becomes a constant, and the row reader produces `_row_id = firstRowId + pos` (or the stored value) and `_last_updated_sequence_number` = stored value or the file's data sequence number. Read `core/src/main/java/org/apache/iceberg/util/PartitionUtil.java:56` and `avro/ValueReaders.java:1293` (`RowIdReader`) / `:1328` (`LastUpdatedSeqReader`).
+
+- **Commit-time invariants are enforced**: adding a v3+ snapshot requires a non-null, non-regressing `first-row-id` and advances `next-row-id`. Read `core/src/main/java/org/apache/iceberg/TableMetadata.java:1278` (`Builder.addSnapshot`).
+
+- **How Spark consumes it**: `_row_id` makes UPDATE/MERGE row-preserving — the rewrite copies `_row_id` to itself and nulls `_last_updated_sequence_number`. Read `spark/v3.5/spark-extensions/src/main/scala/org/apache/spark/sql/catalyst/analysis/RewriteUpdateTableForRowLineage.scala:40`.
+
+- **How Flink consumes it**: Flink's data rewrite (compaction) projects and rewrites the lineage columns unchanged to keep row identity stable. Read `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/maintenance/operator/DataFileRewriteRunner.java:184`.
+
+A good next step after these: `MetadataColumns.schemaWithRowLineage` (`MetadataColumns.java:157`) — it's the single join helper that rewrites use to carry lineage in and out.

@@ -1,0 +1,23 @@
+Schema evolution for a new contributor — one briefing, ten pointers:
+
+1. The whole engine-agnostic evolution API lives in one class: SchemaUpdate implements UpdateSchema and accumulates pending changes (add/delete/rename/update/move) without touching the current schema until `apply()`/`commit()`. Read the field state and entry points at core/src/main/java/org/apache/iceberg/SchemaUpdate.java:51-91, then follow `apply()` at :466-470 and `commit()` at :472-476.
+
+2. Rules are enforced at the API call site, not lazily. Adding a column checks for duplicates, invalid parents, and the required-without-default case; renaming keeps the field id; type changes only allow promotion. See internalAddColumn (SchemaUpdate.java:113-187), deleteColumn (:190-202), renameColumn (:205-227), updateColumn (:273-298).
+
+3. "Evolution" means produce a new schema with a fresh ID and make it current, while keeping the old ones. `commit()` -> `TableMetadata.updateSchema` -> `Builder.setCurrentSchema` -> `addSchemaInternal` assigns the new schema-id, appends to `schemas`, and sets `current-schema-id`. Read TableMetadata.java:603-607 and :1614-1656.
+
+4. Fresh IDs are allocated monotonically and for every nested field; `last-column-id` only ever grows, so concurrent commits can't reuse ids. See SchemaUpdate.assignNewColumnId (:478-482), its use of TypeUtil.assignFreshIds (SchemaUpdate.java:179), and the monotonicity check in TableMetadata.java:1615-1618.
+
+5. The type-promotion whitelist (int->long, float->double, decimal widen) is centralized in one shared predicate with the partition-compatibility caveat spelled out in its comment. Read api/src/main/java/org/apache/iceberg/types/TypeUtil.java:471-497; it's called from SchemaUpdate.java:285-290.
+
+6. Identifier fields get special handling: names are tracked across rename, re-validated against the final schema, and you can't delete one (or an ancestor struct holding one). Start with SchemaUpdate.applyChanges (:541-563) and the validator api/src/main/java/org/apache/iceberg/Schema.java:163-205.
+
+7. The spec forbids restructuring map keys / list elements, and the code enforces it: `map()` throws on any key-side delete/update/add/alter, `list()` throws on element deletion. Read the ApplyChanges visitor, SchemaUpdate.java:590-758 (map at :714-725, list at :689-711). Marks/updates/moves/in-line additions are staged via `updates`, `deletes`, `parentToAddedIds`, `moves` maps built in the mutators.
+
+8. Column moves must stay inside one struct; cross-struct moves and moving a field relative to itself are rejected in internalMove. Read SchemaUpdate.java:432-457 and the reorder logic moveFields (:783-818).
+
+9. Defaults ride along in the field: adding a column sets both `initial-default` and `write-default`; `updateColumnDefault` changes only `write-default`. The commit path also refreshes the `schema.name-mapping.default` property for new/renamed fields (non-fatally, on failure it just logs). See SchemaUpdate.java:174-183, :322-343, and the metadata side-effects :484-531.
+
+10. Engines consume this API rather than duplicating it — Flink's dynamic sink drives `UpdateSchema` from a schema diff and Spark's DDL calls `updateSchema()`; on the read side both project by field id with constant fallbacks. Use `TableUpdater.findOrCreateSchema` (flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/dynamic/TableUpdater.java:124-179) and `PartitionUtil.constantsMap` (core/src/main/java/org/apache/iceberg/util/PartitionUtil.java:46-103) as concrete examples of the two halves.
+
+Start with #1 (SchemaUpdate.java:51-91) — everything else hangs off the pending-changes state it defines, and #3 (TableMetadata.java:1614-1656) is where the new schema actually becomes current metadata.

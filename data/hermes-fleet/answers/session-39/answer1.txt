@@ -1,0 +1,54 @@
+I've read format/spec.md in full (lines 1–2153). Here's what the spec says about the variant type and the design rationale behind it.
+
+## What the spec says
+
+**Definition (Semi-structured Types, lines 244–260).** A `variant` is a value that stores semi-structured data. The key properties:
+
+- The structure and data types inside a variant are NOT consistent across rows in a table or data file — each row can hold differently-shaped data.
+- It is deliberately neither a primitive type nor a nested type (line 248).
+- The type and its binary encoding are defined externally, in the Parquet project's VariantEncoding.md, with support currently for V1 (line 246). Iceberg delegates the wire format to Parquet rather than inventing its own.
+- It's added in Iceberg v3 (line 246, 1934).
+
+**Relationship to JSON (line 250).** Variants are "similar to JSON with a wider set of primitive values including date, timestamp, timestamptz, binary, and decimals." So it's a superset of what JSON can naturally express.
+
+**Internal structure (lines 252–255).** Variant values may contain:
+- an *array* — an ordered collection of variant values, and
+- an *object* — a collection of string-key → variant-value fields.
+
+**Key differences from Iceberg's other types (lines 257–260):**
+- Variant *arrays* are similar to lists but may contain any variant value, not a fixed element type.
+- Variant *objects* are similar to structs but may have variable fields identified by name, and field values may be any variant value — not a fixed field type.
+
+So the semantic point is: a variant is a self-describing, schemaless container, whereas Iceberg's list/map/struct are strictly typed with fixed element/field types and tracked field IDs.
+
+**Other places variant appears:**
+- Default values: variant columns must default to null; non-null defaults are invalid (line 336).
+- Hashing: no 32-bit hash is defined for variant "because there are multiple representations for equivalent values" (line 1647) — so it can't be used for bucketing.
+- Binary single-value serialization: not supported (line 1853).
+- JSON serialization of the type string: `"variant"` (line 1694).
+- File-format encodings:
+  - Avro (line 1511): a record with `metadata` and `value` fields (no field IDs); shredding not supported.
+  - Parquet (line 1566): a group with `metadata` and `value` fields, `VARIANT` logical type; supports both the variant encoding and variant *shredding* encoding.
+  - ORC (line 1598): a struct with `metadata` and `value`, `iceberg.struct-type=VARIANT`; shredding not supported.
+
+**Stats / bounds for variant (lines 781–797, 892).** This is the one place Iceberg can't treat variant as fully opaque, because file pruning needs bounds. Bounds for a variant column are themselves variant objects whose keys are normalized JSON path expressions (e.g. `$['location']['latitude']`, or `$` for the root) and whose values are primitive-typed lower/upper bounds for that field. Bounds must be accurate for all non-null values and must not be written when a field has mixed variant types (other than null) — e.g. an int64+null field may have bounds, but a field that also contains a string "0" may not. The bound variant is serialized by concatenating the variant encoding of the metadata (the paths) with the bounds object (line 787, 1865).
+
+## Why it's designed that way
+
+The design is a direct response to the tension between Iceberg's core identity and the reality of real-world nested data:
+
+1. **Iceberg is a schematized, id-based format.** Every struct/map/list field has an assigned integer ID, schema evolution is ID-based, and files are pruned using fixed typed columns. Traditional nested types require you to know the shape up front.
+
+2. **JSON-y data doesn't fit that.** Log/event/analytics data frequently has varied, ad-hoc, or evolving structure (think ingestion payloads, nested measured values). Forcing all of it into typed structs means painful schema evolution or storing a single `string` blob.
+
+3. **The spec answers this by importing a schemaless, self-describing container** rather than re-architecting Iceberg's typed model. That's why variant is explicitly "neither primitive nor nested" (line 248): it slots in as a third category so it doesn't force list/struct semantics (fixed element type, tracked field IDs, typed field values) onto values that don't have them.
+
+4. **Dependable types + engine neutrality via Parquet.** By delegating the binary encoding to the Parquet project, Iceberg gets a single canonical wire format that Avro, ORC, and Parquet can all embed (each as metadata+value), so variant values are interchangeable across engines and file formats. Iceberg controls the *type*; Parquet controls the *bytes*.
+
+5. **A richer primitive set than JSON.** Including date/time/timestamps/binary/decimal (line 250) means the same column can hold types JSON can't, without lossy string coercion — this is the value-add over just storing JSON text.
+
+6. **It's opt-in and version-gated (v3+).** Variant is a forward-compatibility-breaking feature, so it's introduced in v3 where new types live, and it's not retrofitted into the v1/v2 model. The "must default to null, no non-null defaults" rule (line 336) and the "no hash for bucketing" rule (line 1647) both stem from variant's schemaless, multiply-representable nature: you can't reliably assign/default or deterministically bucket values whose types vary per row.
+
+7. **It stays compatible with Iceberg's pruning machinery, partially.** Because Iceberg can't ignore variant entirely (files need pruning), the spec carves out the *one* place a schema-aware system can still help: per-field path-based bounds (lines 781–797). The requirement that bounds only exist for uniform-type fields, and that they're expressed as nested variant objects keyed by normalized JSON paths, lets engines prune on known leaf fields while acknowledging the rest of the document is opaque. This is the architectural compromise: full generality in storage, bounded assist in stats.
+
+In short: variant exists to let Iceberg store schemaless, mixed-structure data in a typed table without forcing users into rigid structs or opaque strings — designed as a distinct semi-structured category, with its encoding owned by Parquet for interoperability, v3-gated for forward compatibility, and given just enough pruning support (path-based bounds) to stay useful for scans without pretending to understand the whole document.

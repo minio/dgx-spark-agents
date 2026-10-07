@@ -1,0 +1,43 @@
+I read all 2,153 lines of format/spec.md in consecutive chunks. Before answering, I want to flag an important distinction, because it determines what's actually in this document.
+
+## A naming clarification
+
+The file format/spec.md is the Iceberg table *format* specification. It specifies the metadata layer of the table format itself — the JSON table-metadata file, snapshots, manifests, and manifest lists that Iceberg uses to track the files in a table.
+
+It does **not** describe "metadata tables" in the sense of Iceberg's queryable metadata tables you might know from the engines (`$files`, `$manifests`, `$snapshots`, `$history`, `$refs`, `$partitions`, `$all_manifests`, etc.). Those are an implementation feature of the Java/Spark/Flink integrations and are documented in the Iceberg website docs, not in the format spec. So I can't point to a "Metadata Tables" section here — that concept lives outside this spec.
+
+What this spec *does* cover, extensively, is the metadata fabric underneath the table — and I'll explain that design and the reasoning the spec gives for it. That's almost certainly the substance you're after.
+
+## What the spec says about the metadata design
+
+**The core model (lines ~79-107, 1134-1136).** Iceberg tracks individual data files rather than directories. All table state lives in *metadata files*, and every change to table state produces a new metadata file that replaces the old one via an atomic swap. The table metadata file records the schema, partition config, table properties, and a list of valid *snapshots*. A snapshot is "the state of a table at some point in time, including the set of all data files."
+
+The metadata is a three-tier tree:
+- Table metadata JSON — one per committed version, holding schema(s), partition specs, and the list of snapshots plus their manifest-list locations.
+- Manifest list — one per snapshot, a small file that lists the manifest files for that snapshot with per-manifest summary stats (added/existing/deleted file and row counts, and partition value bounds).
+- Manifests — immutable Avro files that each list a subset of data (or delete) files, one row per file with its partition tuple, metrics, and tracking info.
+
+**Why it's designed this way — the goals the spec states up front (lines 69-77):**
+- Serializable isolation. The atomic swap of one metadata file is the foundation: readers use a committed snapshot, writers commit optimistically and retry on conflict. No reader locks.
+- Speed / O(1) planning. Manifests are reused across snapshots because metadata is "slow-changing"; the manifest list's summary stats let planning skip manifests without opening them, so scan planning is O(1) remote calls, not O(n).
+- Scale. Job planning is pushed to clients, not a central metadata store, so it doesn't bottleneck.
+- Evolution. Because manifests store a schema and partition spec per manifest, tables can evolve schema and partitioning without rewriting old files — reads use the spec stored in each manifest, not the current table spec (see lines 666, 1156-1158).
+
+**The two design principles that recur throughout:**
+1. **Immutability + atomic swap.** Data and metadata files are written in place and never altered once written (lines 83, 131). This is what makes optim-concurrency retries and serializable isolation possible, and it's why the commit mechanisms (file-system rename, metastore check-and-put, lines 1321-1354) only need to swap a single pointer. The spec even deprecates the file-system rename scheme as unsafe on object stores (lines 1322-1323).
+
+2. **Metadata is reusable and incremental, to keep writes cheap** — the "slow-changing" reuse of manifests (line 87), "fast append" adding a new manifest instead of rewriting one (lines 978-980), and sequence-number *inheritance* so a manifest can be written once and reused across commit retries without rewrites (lines 105, 107, 932-937). The same inheritance idea reappears in v3's row-lineage `first-row-id`/`_row_id` assignment (lines 466-468, 941-949).
+
+**Other metadata content the spec defines and why:**
+- *Field-level metrics* (value counts, null/NaN counts, lower/upper bounds) stored per file in manifests, and partition *field summaries* in the manifest list. These exist specifically so scan planning can prune files and manifests using column predicates without reading the data (lines 89, 757-769, 1005, 1067). Metrics double as the filter for delete files.
+- *Table statistics* and *partition statistics* files (lines 1207-1295) — optional Puffin files and per-partition summary rows. The spec is explicit these are informational, "not required for reading or planning," so a reader can ignore them and tables still read correctly (lines 1209-1211, 1239).
+- *Snapshot references / retention* (lines 1100-1132) — tags and branches, with retention rules governing snapshot expiration, which is what lets physically deleted files actually be reclaimed safely.
+- *Metadata-log and snapshot-log* (lines 1163-1164): append-only histories of previous metadata files and current-snapshot changes. The spec points to snapshot-log as the authoritative source for one-time/point-in-time reads (lines 2075-2080).
+
+**Version-to-version motivation.** The spec frames each format version as restoring metadata consistency or adding capability without breaking forward-compat: v1→v2 added sequence numbers and made fields required/stricter for writers (Appendix E); v3 added default values, row lineage, deletion vectors, encryption keys; v4 restructures stats into a typed `content_stats` struct and adds relative paths so tables can relocate without rewriting metadata (lines 60-67, 799-926, 1897-1925).
+
+## The bottom line
+
+The spec's answer to "why is the metadata designed that way" is: **track files, not directories; make everything immutable and swap one metadata pointer for isolation; reuse and inherit through the metadata tree to keep writes cheap and planning O(1); and push planning to clients so it scales.** All the structures it defines (manifests, manifest lists, per-file metrics, stats, refs, logs) exist to serve those goals.
+
+If what you actually wanted was the engine-side *queryable* metadata tables (`$files`, `$snapshots`, `$history`, ...), those aren't specified in format/spec.md — they're covered in the Iceberg engine docs (e.g., site/docs/spark-queries.md "Metadata Tables"). I can read that instead if you point me at the file or the docs URL you mean.

@@ -1,0 +1,50 @@
+Confirmed. Query engines do not use transactions on the read path or for ordinary DML — transactions are used exclusively for DDL/metadata changes, and there are exactly three production call sites. Here's how each works and where it lands in the code we analyzed.
+
+## How the engines get a transaction
+
+Both engines call `Table.newTransaction()`, which routes to `BaseTable.newTransaction()` → `Transactions.newTransaction(...)` → `new BaseTransaction(tableName, ops, TransactionType.SIMPLE, ops.refresh())` ([BaseTable.java:269-270](core/src/main/java/org/apache/iceberg/BaseTable.java#L269); [Transactions.java:63-64](core/src/main/java/org/apache/iceberg/Transactions.java#L63)). So every engine use is the `SIMPLE` path in `BaseTransaction` (the multi-update atomic commit via `commitSimpleTransaction`, [BaseTransaction.java:350-413](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L350)), not create/replace.
+
+## Use 1: Spark DDL — combining ALTER clauses on one table
+
+Spark's ALTER TABLE maps user clauses into multiple `TableChange`s, then commits them together as one transaction so a single ALTER statement is all-or-nothing. Entry point is in `SparkCatalog`:
+
+- `commitChanges(...)` is the SparkCatalog ALTER handler ([SparkCatalog.java:842-881](core/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L842), v3.5 equivalent [:862](core/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L862)).
+- It opens `table.newTransaction()` at [SparkCatalog.java:866](core/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L866).
+- Location, property, and schema changes are each added and committed against the transaction ([SparkCatalog.java:868-878](core/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L868)), then one `transaction.commitTransaction()` publishes them atomically ([SparkCatalog.java:880](core/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L880)).
+
+Because these updates wrap in `TransactionTableOperations`, each `.commit()` only advances the in-memory `current` ([BaseTransaction.java:482-494](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L482)) and the single `commitTransaction()` performs the one real CAS against the table ([BaseTransaction.java:371](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L371)). So `ALTER TABLE ... SET TBLPROPERTIES (...) , ALTER COLUMN ...` either all lands or none does — the atomically-swapped metadata pointer from the spec ([spec.md:85, 93](format/spec.md)).
+
+## Use 2: Spark DDL — set write distribution and ordering
+
+The `ALTER TABLE ... WRITE DISTRIBUTED BY / ORDERED BY` extension commits a new sort order and the distribution-mode property in a single transaction:
+
+- `SetWriteDistributionAndOrderingExec.run()` calls `iceberg.table.newTransaction()` ([SetWriteDistributionAndOrderingExec.scala:48](spark/v4.1/spark-extensions/src/main/scala/org/apache/spark/sql/execution/datasources/v2/SetWriteDistributionAndOrderingExec.scala#L48)).
+- It builds the sort order via `txn.replaceSortOrder()...commit()` ([SetWriteDistributionAndOrderingExec.scala:50-57](spark/v4.1/spark-extensions/src/main/scala/org/apache/spark/sql/execution/datasources/v2/SetWriteDistributionAndOrderingExec.scala#L50)) and sets the `write.distribution-mode` property via `txn.updateProperties()` ([SetWriteDistributionAndOrderingExec.scala:59-64](spark/v4.1/spark-extensions/src/main/scala/org/apache/spark/sql/execution/datasources/v2/SetWriteDistributionAndOrderingExec.scala#L59)).
+- Both commit atomically with `txn.commitTransaction()` ([SetWriteDistributionAndOrderingExec.scala:66](spark/v4.1/spark-extensions/src/main/scala/org/apache/spark/sql/execution/datasources/v2/SetWriteDistributionAndOrderingExec.scala#L66)).
+
+## Use 3: Flink DDL — ALTER TABLE, same atomic pattern
+
+Flink mirrors Spark in `FlinkAlterTableUtil.commitChanges`:
+
+- Opens `table.newTransaction()` ([FlinkAlterTableUtil.java:45](flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/util/FlinkAlterTableUtil.java#L45) and [:76](flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/util/FlinkAlterTableUtil.java#L76)) for the two overloads (location+properties, and schema+properties).
+- Stages location/property/schema updates against the transaction ([FlinkAlterTableUtil.java:47-62](flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/util/FlinkAlterTableUtil.java#L47) and [:78-92](flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/util/FlinkAlterTableUtil.java#L78)), then one `transaction.commitTransaction()` ([FlinkAlterTableUtil.java:64, 94](flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/util/FlinkAlterTableUtil.java#L64)).
+
+## Key observation: snapshot management is deliberately OUTSIDE the transaction
+
+In both engines, setting/cherry-picking the current snapshot is handled separately from the transaction, not inside it:
+
+- Spark: `setSnapshotId`/`pickSnapshotId` are committed directly on `table.manageSnapshots()` before creating the transaction ([SparkCatalog.java:855-864](core/../spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L855)), with a guard rejecting both at once because order is ambiguous ([SparkCatalog.java:851-853](core/../spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L851)).
+- Flink: identical, in `commitManageSnapshots`, called before the transaction opens ([FlinkAlterTableUtil.java:97-115](flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/util/FlinkAlterTableUtil.java#L97)).
+
+This is a real design subtlety worth naming: `BaseTransaction`'s `manageSnapshots()` actually throws `UnsupportedOperationException` on a transaction table ([BaseTransaction.java:683-686](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L683)), and `BaseTransaction` itself forbids nested transactions ([BaseTransaction.java:689-691](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L689)). So the engines' split — snapshot ops outside, metadata-edit ops inside one transaction — is the documented way these operations compose, because a snapshot jump is a state replacement that doesn't need (and can't share) the metadata-edit transaction's retry/re-apply semantics.
+
+## What they rely on from BaseTransaction
+
+All three sites depend on the same guarantees from the `SIMPLE` transaction path:
+
+- Atomicity across multiple DDL clauses: single `commitTransaction` → one `ops.commit(base, current)` CAS ([BaseTransaction.java:371](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L371)); the CAS rejects stale bases with `CommitFailedException` ([BaseMetastoreTableOperations.java:111-113](core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java#L111)).
+- Conflict retry with defined re-apply: the transaction loop refreshes and re-runs the whole update chain if the base moved ([BaseTransaction.java:438-453](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L438)), using `onlyRetryOn(CommitFailedException)` ([BaseTransaction.java:366](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L366)).
+- No partial visibility on failure: cleanup deletes only uncommitted files and never committed-snapshot manifests ([BaseTransaction.java:390-413](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L390)).
+- Unknown-commit-state safety: `CommitStateUnknownException` is re-thrown without cleanup ([BaseTransaction.java:374-376](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L374)).
+
+So the engines treat a transaction as "one atomic, retryable, all-or-nothing unit for a set of metadata edits" — exactly the spec's single-commit serializable isolation — and rely on `BaseTransaction` to make N separate update calls behave like one commit.

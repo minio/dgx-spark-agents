@@ -1,0 +1,64 @@
+I have the complete picture across both engines. Here's how query engines plug into Iceberg scan planning.
+
+## The split: driver-side planning on the coordinator, executor-side reading
+
+Planning happens once on the driver/JM: each engine calls `scan.planFiles()`/`planTasks()`, which runs the core `ManifestGroup` pipeline (covered in the previous answers), then packages the resulting `ScanTaskGroup`s as serializable Spark `InputPartition`s / Flink `InputSplit`s. Executors/TMs receive those pre-planned tasks and use two pieces of information the planner attached to each task: the **file + split range** and the **deletes + residual predicate**. The engine never re-plans; it consumes the plan.
+
+---
+
+## Spark
+
+Driver path:
+
+1. **Filter pushdown** — `SparkScanBuilder` converts Spark filters into an Iceberg `Expression` and hands it to the Iceberg scan: `newBatchScan().filter(filterExpression()).project(expectedSchema)` (SparkScanBuilder.java:476-481). This is exactly the predicate that `ManifestGroup.filterData` feeds into the inclusive projection / column-stats filters.
+2. **The core plan** — `SparkBatchQueryScan` holds the Iceberg `BatchScan` and, lazily, calls `scan.planFiles()` in `tasks()` (SparkPartitioningAwareScan.java:181). That triggers the whole `DataTableScan`/`ManifestGroup` pipeline described before. It validates task types (`ValidationException` if an unexpected task type, SparkPartitioningAwareScan.java:185-189).
+3. **Grouping into tasks** — `taskGroups()` combines the planned files into `ScanTaskGroup`s, either plain or keyed by a grouping key type for `preserveDataGrouping`, using `TableScanUtil.planTaskGroups` with split size/lookback/open-file-cost (SparkPartitioningAwareScan.java:204-242). Iceberg reports this as `KeyGroupedPartitioning` so Spark knows records sharing a grouping key are within one task group (SparkPartitioningAwareScan.java:107-122) — this is how Iceberg's partition layout feeds Spark's join/sort shuffles.
+4. **Runtime filtering** — the scan implements Spark's `SupportsRuntimeV2Filtering`: `filter(Predicate[])` gets join-derived filters at runtime and prunes already-planned tasks by re-applying the *inclusive projection* over each spec's partition type (`Projections.inclusive(spec, caseSensitive).project(...)`, SparkBatchQueryScan.java:133-137, 140-147), then `resetTasks` to re-plan only the surviving tasks (SparkBatchQueryScan.java:157-159). This reuses the exact spec-level inclusive-projection mechanism from planning.
+5. **Packaging for executors** — `SparkScan.toBatch()` builds a `SparkBatch` carrying the `taskGroups` (SparkScan.java:166-177). `SparkBatch.planInputPartitions()` broadcasts the table metadata and `FileIO` to executors and creates one `SparkInputPartition` per task group, plus preferred locations for locality (SparkBatch.java:86-113, 115-127).
+
+Executor path — `SparkBatch.createReaderFactory()` picks a reader factory (SparkBatch.java:129-140), and the reader opens each `FileScanTask`:
+
+- Applies the **residual** filter from the planned task: `.filter(residual)` (BaseBatchReader.java:95) — the strict-projection residual that `ManifestGroup` attached to the task.
+- Applies the **deletes** that the planner attached (`task.deletes()`), via `SparkDeleteFilter` and, for vectorized reads, the `BatchDeleteFilter` that filters/masks rows by position and equality deletes (BaseBatchReader.java:105, 127-173).
+- Reads the exact split range `task.start()/length`, projecting to the required schema (BaseBatchReader.java:94).
+
+So Spark's executor trusts the planner's file/partition/deletes selection and only does intra-file row filtering (residual + deletes).
+
+Other Spark consumers of the plan: `SparkTable` lists a plan (`scan.planFiles()`) to compute/report statistics (SparkTable.java:372-382), and `SparkScanBuilder` does a light-weight `planFiles()` to estimate rows for the metrics reporter (SparkScanBuilder.java:244). The micro-batch path also plans: `SparkMicroBatchStream.planInputPartitions` → `planner.planFiles` → `TableScanUtil.planTasks(...)` (SparkMicroBatchStream.java:131-156); incremental views in Flink's style use `SparkChangelogScan` which plans `IncrementalChangelogScan` task groups (SparkChangelogScan.java:119).
+
+---
+
+## Flink
+
+Driver path is the symmetric mirror, centralized in `FlinkSplitPlanner`:
+
+- `planTasks()` is the single entry point. It decides between a **batch** scan and an **incremental append** scan from `ScanContext` (FlinkSplitPlanner.java:86-88, 147-156), then builds the Iceberg scan accordingly and calls `scan.planTasks()` (FlinkSplitPlanner.java:119, 136). This mirrors `scan.planFiles()` + `BaseTableScan.planTasks()` grouping/splitting (BaseTableScan.java:43-49).
+- It translates Flink's read context onto the Iceberg scan: `scan.caseSensitive().project().planWith(workerPool)`, `includeColumnStats`, and split size/lookback/open-file-cost options (FlinkSplitPlanner.java:159-179).
+- It honors time travel and refs exactly as the spec's snapshot access requires: `useSnapshot`, `useRef` (tag/branch), `asOfTime` (FlinkSplitPlanner.java:124-134).
+- For incremental append, it validates start/end tags and snapshot ids with `Preconditions` and applies `fromSnapshotExclusive`/`toSnapshot` (FlinkSplitPlanner.java:91-119).
+- The planned `CombinedScanTask`s become either `FlinkInputSplit`s (with block locations for locality) via `planInputSplits` (FlinkSplitPlanner.java:46-70) or FLIP-27 `IcebergSourceSplit`s via `planIcebergSourceSplits` (FlinkSplitPlanner.java:73-82).
+
+Streaming: `StreamingMonitorFunction` re-invokes `FlinkSplitPlanner.planInputSplits` per discovered snapshot or between offsets (`copyWithSnapshotId`/`copyWithAppendsBetween`, StreamingMonitorFunction.java:203-219), i.e. the plan is recomputed incrementally per snapshot.
+
+Executor path — `RowDataFileScanTaskReader.open(FileScanTask, ...)` consumes a single planned task (RowDataFileScanTaskReader.java:76-96):
+
+- Reads `task.start()/length` split, `.filter(task.residual())` (RowDataFileScanTaskReader.java:119-121) — the planner's residual again.
+- Applies `task.deletes()` through a `FlinkDeleteFilter` (RowDataFileScanTaskReader.java:79-83, 137-146) which does position/equality row filtering.
+- Folds in partition constants via `PartitionUtil.constantsMap(task, ...)` so partition columns are materialized from the file's partition tuple without reading them from the file (RowDataFileScanTaskReader.java:78) — this relies on the partition values the planner read from the manifest.
+
+`DataIterator` walks a `CombinedScanTask`'s `FileScanTask`s opening each through the reader (DataIterator.java:53-57, 140-141).
+
+---
+
+## Summary of the shared contract
+
+Both engines depend on the same three outputs of planning, all produced on the driver and serialized into tasks:
+
+| Planner output | Spark usage | Flink usage |
+|---|---|---|
+| Selected file + split range (`task.start()/length`) | BaseBatchReader.java:94 | RowDataFileScanTaskReader.java:119 |
+| Attached delete files (`task.deletes()`) | BaseBatchReader.java:105, 127-173 | RowDataFileScanTaskReader.java:79-83, 137-146 |
+| Attached residual predicate (`task.residual()`) | BaseBatchReader.java:95 | RowDataFileScanTaskReader.java:121 |
+| Grouping key / partitioning | SparkPartitioningAwareScan.java:107-122, 204-242 | (combined tasks) |
+
+The engines are pure consumers: they call `planFiles()`/`planTasks()` once, serialize the resulting tasks to workers, and on the workers only do intra-file work (residual filtering, delete application, projection, split reads) on the files the planner already proved could match. All the pruning logic — manifest-partition-summary skipping, per-spec inclusive projection, column-stats filtering, and sequence-number-gated delete selection — runs in `DataTableScan`/`ManifestGroup` and is invisible to, and reused identically by, both Spark and Flink.

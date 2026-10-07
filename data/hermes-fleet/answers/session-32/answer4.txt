@@ -1,0 +1,36 @@
+I've traced both integrations end to end. Here's how query engines use incremental append scans.
+
+## The boundary: where the engine hands off to core
+
+Both engines configure the same core `Table.newIncrementalAppendScan()` (core/.../BaseIncrementalAppendScan.java) and rely on `fromSnapshotExclusive`/`toSnapshot`, which the base class translates into the ADDED-entry delta (BaseIncrementalScan.java:159-187 → BaseIncrementalAppendScan.java:68-99, as covered earlier). The engine's job is to pick the snapshot range and feed it to `planFiles()`/`planTasks()`.
+
+## Spark — bounded, query-time incremental reads
+
+Entry point: user sets `start-snapshot-id` (exclusive) and `end-snapshot-id` (inclusive) read options (docs/docs/spark-queries.md:316-330; the note at :332-333 documents "only append, cannot support replace/overwrite/delete").
+
+1. Option detection. `Spark3Util.containsIncrementalOptions` returns true if either START_SNAPSHOT_ID or END_SNAPSHOT_ID is present (spark/v4.1/.../Spark3Util.java:571-574). When true, `SparkScanBuilder`'s constructor disallows time travel and reads the boundaries (spark/v4.1/.../source/SparkScanBuilder.java:116-124). The range is validated: start snapshot must be present, timestamps are rejected as changelog-only, and end-snapshot cannot be set without start (spark/v4.1/.../SparkReadConf.java:388-409, `incrementalAppendScanBoundaries`).
+
+2. Scan dispatch. `SparkScanBuilder.build()` routes to `buildIncrementalAppendScan()` when `startSnapshotId != null` (SparkScanBuilder.java:251-255), wrapping the core scan in a `SparkIncrementalAppendScan` (SparkScanBuilder.java:273-285).
+
+3. Core scan construction. `buildIcebergIncrementalAppendScan` calls `table().newIncrementalAppendScan().fromSnapshotExclusive(startSnapshotId)` and applies case sensitivity, filter, projection, then `toSnapshot(endSnapshotId)` when end is set (SparkScanBuilder.java:320-338). So Spark passes its read options straight through to the core exclusive/inclusive semantics.
+
+4. Task materialization. `SparkIncrementalAppendScan` extends `SparkRuntimeFilterableScan` (SparkIncrementalAppendScan.java:32), and the actual planning happens in `SparkPartitioningAwareScan.tasks()`, which calls `scan.planFiles()` on the wrapped Iceberg scan (SparkPartitioningAwareScan.java:180-183). This is where the core delta (`BaseIncrementalAppendScan.doPlanFiles`) is invoked and turned into Spark's task list. The scan also advertises partition source columns as Spark runtime-filter attributes so the optimizer can push additional join filters down onto the already-planned incremental tasks (SparkRuntimeFilterableScan.java:87-106, 109-146).
+
+5. Equality/serialization. `SparkIncrementalAppendScan.equals/hashCode/description` key on the table UUID, `startSnapshotId`, `endSnapshotId`, schema, and filters (SparkIncrementalAppendScan.java:52-94) — needed so Spark can dedupe/reuse the planned scan across query stages.
+
+## Flink — continuous/streaming reads (the primary consumer)
+
+Flink's streaming source replans on every poll, carrying a "last consumed snapshot" position forward.
+
+1. Mode detection. `FlinkSplitPlanner.checkScanMode` selects `INCREMENTAL_APPEND_SCAN` whenever start/end snapshot or start/end tag is set (flink/v1.20/.../source/FlinkSplitPlanner.java:146-156).
+
+2. Core scan construction. `planTasks` builds `table.newIncrementalAppendScan()` (FlinkSplitPlanner.java:88), applies shared configs (`refineScanWithBaseConfigs`: case sensitivity, projection, worker pool, split options, filters — FlinkSplitPlanner.java:159-188), then maps tags/snapshot ids onto `fromSnapshotExclusive` and `toSnapshot` (FlinkSplitPlanner.java:91-117), with mutual-exclusion checks for start/end ID vs tag (FlinkSplitPlanner.java:100-101, 114-115). Finally `scan.planTasks()` produces the splits (FlinkSplitPlanner.java:119).
+
+3. The streaming loop. `ContinuousSplitPlannerImpl` is where incremental append scans make streaming work. On each enumeration it walks `SnapshotUtil.ancestorsBetween` from the current snapshot back to the last consumed one (ContinuousSplitPlannerImpl.java:89-94), bounds the range to `maxPlanningSnapshotCount`, then builds a `ScanContext` with `copyWithAppendsBetween(lastConsumedSnapshotId, toSnapshotInclusive)` and plans splits (ContinuousSplitPlannerImpl.java:124-139). If the current snapshot was already enumerated it returns empty splits and doesn't advance (ContinuousSplitPlannerImpl.java:120-122). Starting strategies such as `INCREMENTAL_FROM_LATEST_SNAPSHOT_EXCLUSIVE` and `INCREMENTAL_FROM_SNAPSHOT_ID` pick the first range (ContinuousSplitPlannerImpl.java:226-233). So Flink's checkpointable "enumerator position" is exactly the exclusive `fromSnapshotId` fed to core — the continuous source is, in effect, a repeated incremental append scan advanced one snapshot at a time.
+
+## Summary of the two models
+
+- Spark: bounded, one-shot query reads. It detects the two snapshot options at the scan builder, validates them, and routes to a dedicated `SparkIncrementalAppendScan` whose `planFiles()` is the core incremental delta. Used for "read what was appended between snapshot A and B" SQL/batch reads.
+- Flink: open-ended streaming. The continuous source runs the incremental append scan repeatedly, advancing an exclusive "last consumed snapshot" position each poll, so newly appended data streams out. Both use the exact same core contract — `newIncrementalAppendScan().fromSnapshotExclusive(...).toSnapshot(...)` — and both add engine-side validation (validating tags/snapshot existence, mutual-exclusion of conflicting start options) on top of the core's Preconditions checks.
+
+No files were modified — this was a read-and-explain task.

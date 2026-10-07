@@ -1,0 +1,30 @@
+I read format/spec.md in full (lines 1–2153). Here's what it says about fast appends and why it's designed that way.
+
+What the spec says
+
+The spec mentions fast appends explicitly in only one place, under "Snapshots" (format/spec.md:978–982):
+
+"Data and delete files for a snapshot can be stored in more than one manifest. This enables:
+- Appends can add a new manifest to minimize the amount of data written, instead of adding new records by rewriting and appending to an existing manifest. (This is called a "fast append".)"
+
+So the whole idea: a snapshot is a manifest list pointing at one or more manifests, each of which indexes a subset of the table's data files. When you append, Iceberg does not open and rewrite the existing manifest(s) to squeeze new file entries into them. Instead it writes a brand-new manifest containing just the newly added data files, then writes a fresh manifest list that includes the new manifest alongside the previous ones.
+
+Two structural facts make this cheap and correct:
+
+1. Old manifests are immutable and reused across snapshots (format/spec.md:87). The new snapshot's manifest list simply references the pre-existing manifests, plus the one new manifest. Existing index data is never touched, so append cost does not scale with the size of the table.
+
+2. A snapshot's content is the union of all live files across its manifests (format/spec.md:87), so multiple manifests per snapshot are a first-class concept, not a hack.
+
+Why it's designed that way
+
+The design follows directly from the spec's stated goals and the commit mechanism:
+
+- Speed — appends are O(1) work relative to table size. Writing a new manifest is proportional to the new data, not to how many files the table already has. Rewriting an existing manifest to add entries would be O(files in that manifest) per append and would get progressively more expensive as the table grows. Fast append decouples write cost from table size. This is why append is the operation the spec says "can always be applied" on retry with no requirements (format/spec.md:1316) — it carries no precondition that existing files are unchanged.
+
+- Optimistic concurrency with immutable metadata (format/spec.md:91–99). Commits work by writing a new metadata file and atomically swapping a pointer. Because old manifests are never mutated, a concurrent fast append doesn't invalidate what another writer did; retries only re-author the new manifest list, not the data or manifests. This is the same reason sequence numbers and first-row-ids are written as null in new files and inherited at read time (format/spec.md:932–937) — so a manifest can be written once and reused across commit retries without rewriting.
+
+- Scale and parallelism — storing files across multiple manifests is also what lets job planning be parallelized and prevents a single manifest rewrite from becoming a bottleneck (format/spec.md:982–983).
+
+- Eviction / overhead context: the flip side is that fast append trades write-time cost for read-time cost and index bloat. Each append may add a manifest, so a table can accumulate many small manifests. The design leans on the manifest list's summary metadata (added/existing/deleted counts and partition summaries, format/spec.md:1005) so scanners can skip manifests that can't match (format/spec.md:1057), and it's exactly why compaction/rewriting manifests exists as a separate operation to merge many small manifests back into fewer, larger ones. The snapshot summary's `manifests-created` / `manifests-kept` / `manifests-replaced` fields (format/spec.md:2116–2118) exist to expose this for engines that want to optimize.
+
+In one line: fast append is the spec's way of making appends cost O(new data) rather than O(table size) by never rewriting existing immutable manifests, at the price of index fragmentation that gets cleaned up by compaction.

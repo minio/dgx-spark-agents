@@ -1,0 +1,57 @@
+I now have the full picture. Here's how `BaseRewriteManifests` and the code it calls follow the spec, with citations.
+
+## Reading flow: BaseRewriteManifests.java
+
+The class extends `SnapshotProducer` (line 49) and implements `RewriteManifests`. Every operation is declared as a **REPLACE** (`operation()`, line 87-89), matching the spec's snapshot summary `operation` values (spec.md:972 — "replace: ...compaction, changing the data file format, or relocating data files"). The spec's note that replace "without changing table data" is exactly what this code enforces: it partitions only on manifest clustering, never moves content.
+
+## Spec: "Manifest files are reused across snapshots" — BaseRewriteManifests:221-229, 239-276
+
+This is the central mechanism. `keepActiveManifests` (221-229) keeps any manifest that was **not** rewritten and **not** deleted, as-is — it is reused, not touched. `performRewrite` (239-276) only rewrites the manifests that match the `clusterByFunc` predicate (`matchesPredicate`, 282-284) and are pure data (`containsDeletes`, 278-280) — delete manifests never get rewritten, they're always kept (252-253). This matches spec.md:660 (manifests are immutable, reused across snapshots) and spec.md:982 (multiple manifests allow "reducing the cost of rewriting a manifest" — only the ones that need re-clustering are rewritten).
+
+## Spec: preserved EXISTING status, explicit sequence numbers — BaseRewriteManifests:256-270, 372
+
+For each rewritten manifest, the code reads its **live** entries (`liveEntries()`, line 260, which filters out DELETED — spec.md:691/1055, deletes are informational only) and re-writes each as an **existing** entry: `writer.existing(entry)` at line 372. `ManifestWriter.existing(ManifestEntry)` (ManifestWriter.java:190-192) calls `wrapExisting`, which preserves the file's original snapshot ID, data sequence number, and file sequence number. This is exactly spec.md:706 ("If the entry status is 0 (existing)... the entry must include both sequence numbers explicitly") and spec.md:935 ("When writing an existing file to a new manifest... the data and file sequence numbers must be non-null and set to the original values"). The reader-side `wrapExisting` requires non-null inherited values — the empty `InheritableMetadataFactory` (InheritableMetadataFactory.java:109-120) throws if any entry still has a null snapshot ID, enforcing that rewritten manifests carry explicit, complete metadata (matching spec.md:935).
+
+## Spec: reusing manifests and commit retries — SnapshotProducer.java:484-534
+
+`commit()` retries on `CommitFailedException` (SnapshotProducer.java:489-496) with exponential backoff, then re-runs `apply()` against the refreshed base. Because rewritten manifests carry explicit sequence numbers and snapshot IDs already, the same manifests are re-usable across retries — the only thing rewritten each attempt is the manifest list path (unique per attempt via `manifestListPath()`, 622-633). This is the spec's designed flow: "the same manifest can be reused in commit retries... only the manifest list must be rewritten" (spec.md:107, 937). The spec's replace commit condition ("verify the files that will be deleted are still in the table," spec.md:1317) is handled below.
+
+## Spec: manifest reuse correct only because new + old sets preserve file count — BaseRewriteManifests:300-314
+
+`validateFilesCounts` (300-314) computes the active file count of the created manifests (`newManifests + addedManifests + rewrittenAddedManifests`) and the replaced manifests (`rewrittenManifests + deletedManifests`), and requires them **equal** (309-313). This enforces that a rewrite is a pure metadata reshuffle: the same live data files in, the same out — no data added or dropped. That is what makes `replace` semantically identical to the spec's description ("added and removed files without changing table data", spec.md:972) and why it's safe to declare as REPLACE.
+
+## Spec: REPLACE retry requires verifying deleted files are still present — BaseRewriteManifests:286-298
+
+`validateDeletedManifests` (286-298) throws a `ValidationException` if a directly-deleted manifest is not present in the current snapshot's manifest list. This is the implementation of spec.md:1317 for the `deleteManifest` path — a replace operation must confirm the manifests it removes are still in the table, and if a concurrent commit removed them, the op fails rather than double-applying.
+
+## Spec: snapshot manifest list = reused + new manifests — BaseRewriteManifests:184-194
+
+`apply` (170-195) puts the new/rewritten/added manifests at the front and appends the kept (reused) ones (189-192). Each new manifest is stamped with the new snapshot ID via `GenericManifestFile.copyOf(...).withSnapshotId(snapshotId())` (184-187). The returned list is written to a fresh manifest list by SnapshotProducer.apply (SnapshotProducer.java:304-333). This matches the spec: a snapshot's state = the manifest list file referencing both reused and new manifests (spec.md:984, 1003 — "A new manifest list is written for each attempt").
+
+## Spec: inherited snapshot ID / sequence on newly added manifests — BaseRewriteManifests:143-149, SnapshotProducer.java:708-710, ManifestWriter.java:40-42
+
+`addManifest` (133-152) checks the incoming manifest has no added/deleted files and unassigned snapshot/sequence (134-141), then either adds it directly (if snapshot-ID inheritance is enabled, line 143-144) or rewrites a copy stamped with this snapshot's ID (146-148). `canInheritSnapshotId` (SnapshotProducer.java:708-710) is true for v2+ (or the inheritance property), matching spec.md:105-106 where new entries are written with `null` sequence numbers and inherit from the manifest list at read time. `ManifestWriter` uses `UNASSIGNED_SEQ = -1L` (ManifestWriter.java:42) for not-yet-assigned sequence numbers, and `toManifestFile()` writes them as unassigned (233-249) so the manifest list writer fills them in — spec.md:1055 state that "a new manifest list is written for each attempt... the sequence number of the snapshot is written for all new manifest files."
+
+## Spec: v3 row-lineage inheritance — BaseRewriteManifests:154-167, ManifestFiles.java:455-481
+
+For v3+, `copyManifest` (154-167) passes `manifest.firstRowId()` through to `ManifestFiles.copyRewriteManifest` (ManifestFiles.java:455-481), which creates an `EmptyInheritableMetadata` reader (466) to force explicit snapshot IDs, and re-writes entries as EXISTING (477) with the carried `firstRowId`. The `firstRowId` is threaded into the writer (ManifestFiles.java:493) and out via `toManifestFile` (ManifestWriter.java:249). This preserves row IDs when data files are moved to new manifests — spec.md:942-949 ("any null first_row_id must be assigned via inheritance... existing data files in upgraded tables in the first commit after upgrading to v3").
+
+## Spec: per-manifest partition spec — one spec per manifest — BaseRewriteManifests:331-343
+
+`getWriter` (340-343) keys writers by `(clusterKey, partitionSpecId)`, so a rewritten manifest is written against a single spec — matching spec.md:666 ("a manifest stores files for a single partition spec"). Rewriting retains each file's original spec id because the entry's originating `partitionSpecId` is passed through and used for the writer (258-266, 342).
+
+## Spec: all changes commit as one new snapshot — SnapshotProducer.java:499-533
+
+`commit()` builds new metadata and atomically sets the branch snapshot (515), producing serializable isolation and a new metadata version (spec.md:93-99, 1136). Uncommitted manifests are cleaned up only for the leaf where the commit actually succeeded (SnapshotProducer.java:546-569), and `cleanUncommitted` (BaseRewriteManifests.java:345-351) deletes only the manifests created by this op, keeping the reused originals — the "kept" manifests are never deleted because they're still live in the manifest list.
+
+## Summary of correspondence
+
+The implementation maps line-by-line onto the spec's design intent:
+- Reuse manifests unless they need re-clustering (spec 87/982 ↔ BaseRewriteManifests:221-229).
+- Rewritten copies carry explicit EXISTING status + sequence/snapshot ids so they're valid regardless of which commit wins (spec 706/935/937 ↔ 256-270, 372, ManifestWriter:190-192).
+- Pure metadata reshuffle enforced by equal active-file counts (spec 972 ↔ 300-314), which is what legitimizes `operation = REPLACE`.
+- Replace/delete validated against the current snapshot for safe retry (spec 1317 ↔ 286-298; SnapshotProducer:489-496).
+- New manifest list each attempt reusing the same manifest files (spec 984/1003/107 ↔ 184-194, SnapshotProducer:304-333).
+- Inheritance for snapshot id, sequence numbers, and (v3) first_row_id all explicit in the copy paths (spec 105-106/941-949 ↔ 143-149, 154-167, ManifestFiles:455-481, ManifestWriter:42).
+
+One notable detail: `BaseRewriteManifests` itself does the "replace" manifest rewrite almost entirely by **re-using** manifests; the only manifest files it physically rewrites are those whose entries need re-clustering under a new `clusterByFunc`, plus copied `addManifest` inputs. Everything else is carried forward unchanged — which is the spec's whole point of separating manifest reuse from manifest rewriting.

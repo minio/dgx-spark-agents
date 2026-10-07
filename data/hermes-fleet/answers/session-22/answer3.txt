@@ -1,0 +1,92 @@
+Here's a catalog of what can go wrong with snapshot summaries, and how the code guards each case. All the guards live in `SnapshotProducer` (the layer that assembles the final summary) and `SnapshotSummary` (the per-snapshot metrics), because the spec deliberately keeps the summary informational and nullable — so most defenses are "fail safe by omitting a field," not "throw."
+
+## 1. `operation` missing or malformed (spec requires it)
+The spec requires `summary.operation` (spec.md:963, 969). Failure mode: a summary without an operation, or with one not in {append, replace, overwrite, delete}.
+
+Guard — the parser hard-defaults it:
+- On read, `SnapshotParser.fromJson` extracts `operation` from the summary and, when absent (pre-v2/v1 snapshots where it was optional), defaults to `OVERWRITE` (SnapshotParser.java:153-154, 167). Older files never become unreadable.
+- On write, `SnapshotProducer.apply` always passes `operation()` into the new `BaseSnapshot` (SnapshotProducer.java:366), and serialization always writes `operation` first and de-duplicates it (SnapshotParser.java:70-83). So a produced snapshot can't carry a duplicate or missing operation.
+- The set of values is constrained to the four by construction: producers only ever return a `DataOperations` constant (DataOperations.java:36-57), wired per producer (FastAppend.java:62-63, BaseRewriteFiles.java:43-44, etc.).
+
+Residual: nothing validates an *arbitrary* unknown operation string if a producer misbehaves — the code trusts its own producers.
+
+## 2. Self-contradictory summary — REPLACE claiming added > replaced
+A `replace` (compaction/rewrite) must leave logical row count unchanged; `added-records` exceeding `deleted-records` means the rewrite actually grew the table, which a `replace` must not.
+
+Guard — hard assertion at commit:
+- SnapshotProducer.java:345-357: if operation is REPLACE, it parses `added-records` and `deleted-records` (defaulting to 0) and `checkArgument(addedRecords <= replacedRecords)`, failing the commit otherwise. The code even notes the correct case where added < replaced due to rows already removed by delete files (line 351). This is the one summary inconsistency that aborts, rather than degrades.
+
+## 3. `total-*` counters going negative
+`total-records` / `total-files-size` / `total-data-files` / `total-delete-files` / `total-position-deletes` / `total-equality-deletes` are rolling cumulative metrics (SnapshotProducer.java:426-467). If a `removed-*` value exceeds the accumulated total (e.g. imported v1 metadata that never carried totals, or a stale/partial previous summary), the total could go negative — which is nonsensical as a live count.
+
+Guard — clamp-to-safe and skip, in `updateTotal` (SnapshotProducer.java:898-928):
+- If the previous total is missing, nothing is written (line 905-906).
+- `newTotal` is only added-subtracted while it stays `>= 0` (lines 911, 916); if it ever would drop below zero, the field is simply omitted (line 920-922) rather than emitting a negative number.
+- Unparseable totals throw `NumberFormatException`, which is caught and ignored — the total is dropped (lines 924-925). Defensive: a bad/stale number can't corrupt the new snapshot's summary.
+
+## 4. No previous snapshot (first commit) — no baseline to compute totals
+`total-*` are defined relative to a prior snapshot; there is none on the table's first snapshot.
+
+Guard — seed the baseline at zero:
+- SnapshotProducer.java:409-418: when there's no prior branch head, the previous summary is synthesized with `total-records`, `total-files-size`, `total-data-files`, `total-delete-files`, `total-position-deletes`, `total-equality-deletes` all set to `"0"`, so the first snapshot's totals correctly equal its added values (via updateTotal).
+
+## 5. Previous snapshot had no summary at all
+An upgraded v1 table (or a producer that wrote no summary) has no previous summary to roll forward from.
+
+Guard — treat it as empty:
+- SnapshotProducer.java:402-407: if the parent snapshot's summary is null, `previousSummary = ImmutableMap.of()`. Combined with updateTotal's "missing total → omit" behavior, the new snapshot just won't have totals until one exists to build on — it never fabricates wrong numbers.
+
+## 6. Zero-value / empty summaries and single empty-snapshot deltas
+Emitting a bunch of `0`-valued keys bloats the JSON and, worse, can overwrite a real prior total with a zero.
+
+Guard — only non-zero deltas are ever emitted, via `setIf`:
+- Every metric in `SnapshotSummary.addTo` is written only `if (x > 0)` (SnapshotSummary.java:267-289, 386-394). So an append added nothing / a no-op delta produces no `added-*` keys.
+- In `updateTotal`, an absent added/deleted key contributes nothing (SnapshotProducer.java:910-917): a snapshot with no `added-records` doesn't zero out the running total — prior total carries through (because previous total is read, addedStr null → no change, newTotal stays, and is written at line 921).
+- A producer that supplies no summary at all yields `ImmutableMap.of()` (SnapshotProducer.java:395-397).
+
+## 7. Numeric overflow in accumulated counters
+Files/records/sizes are `long` counters (SnapshotSummary.java:224-241). On a huge table, `addedSize`/`total-*` could theoretically overflow `Long.MAX_VALUE`.
+
+Guard — none explicit on the accumulator; overflow is deliberately not checked as a failure path.
+
+Residual risk: `addedSize += ...` (SnapshotSummary.java:292, 320) and the `+`/`-` in updateTotal (SnapshotProducer.java:912, 917) could wrap. The `>= 0` checks in updateTotal (lines 911, 916, 920) incidentally catch the common negative-wrap case and drop the field, but a positive overflow (wrap to negative then to a still-positive value) isn't robustly defended. File counts are `int` (SnapshotSummary.java:226-235), so a snapshot adding > ~2^31 files mis-counts (an int not exposed by the earlier reads I did; flagging as a theoretical limit).
+
+## 8. Size computation wrong for delete files / DVs
+`added-files-size` / `removed-files-size` must measure the right thing: a deletion vector is a blob *inside* a Puffin file, so using the host file size would over-count.
+
+Guard — correct size source in `ScanTaskUtil.contentSizeInBytes` (ScanTaskUtil.java:30-37), called from SnapshotSummary.java:292, 320: data files use `fileSizeInBytes()`, DVs use `contentSizeInBytes()`, other delete files use `fileSizeInBytes()`. DV identification is `FileFormat.PUFFIN` (ContentFileUtil.java:142-144). So DVs are sized by their blob, not their container.
+
+## 9. Split-brain / stale or conflicting accumulation during optimistic commit retries
+Iceberg commits speculatively and retries on `CommitFailedException` (SnapshotProducer.java:489-496: exponential backoff/retry). If summaries were recomputed from a moving base across retries, the retry could double-count or produce inconsistent totals.
+
+Guard — each `apply()` rebuilds the snapshot/summary fresh from its own base in `summary(previous)` (SnapshotProducer.java:392-423), and `runValidations` re-validates ancestry on retry (SnapshotProducer.java:375-386). The summary is recomputed, not incrementally mutated, so retries produce a consistent summary for whichever base the retry actually commits against.
+
+Residual: I did not re-read every commit/retry path end-to-end; the recompute-per-apply pattern is the key defense, but if you want certainty I can trace `apply()` across retries in full.
+
+## 10. Trusting per-partition / per-file metrics that aren't actually available
+When a snapshot is built by rewriting whole manifests (BaseRewriteManifests, compaction), the per-file and per-partition detail isn't reliably known — reporting it would be a lie.
+
+Guard — `SnapshotSummary.addedManifest` disables partition/size/delete-record trust:
+- It sets `trustPartitionMetrics = false` and clears accumulated partition metrics (SnapshotSummary.java:149-153), and inside `UpdateMetrics.addedManifest`, for DELETES content it sets `trustSizeAndDeleteCounts = false` (SnapshotSummary.java:358).
+- The guarded fields are then suppressed: `build()` skips per-partition summaries once untrusted (SnapshotSummary.java:202), and `addTo` skips size/pos/eq delete-count metrics when `!trustSizeAndDeleteCounts` (SnapshotSummary.java:281-288). This is the implementation honoring the spec's note that these are *recommended, informational* fields (spec.md:2082-2084) — better absent than wrong.
+
+## 11. Key collisions (e.g. custom `properties` overriding a metric)
+Producers can set arbitrary properties merged into the summary (`SnapshotProducer.summary` calls `builder.putAll(summary)` at SnapshotProducer.java:424, and `builder.putAll(EnvironmentContext.get())` at 469). If a custom property used a reserved metric key, it'd shadow the computed value.
+
+Guard — mostly ordering convention, not hard protection:
+- Constants for all reserved keys are centralized (SnapshotSummary.java:32-68) so producers refer to keys rather than string literals.
+- `SnapshotParser` protects the one reserved key it owns: `operation` is written first and skipped in the map loop so it can't be duplicated or overridden (SnapshotParser.java:70-83).
+- `SnapshotSerializer`/`SnapshotParser` web `summary` handling is where a duplicate would surface; the `operation` de-dup is the concrete guard.
+- Residual: a producer passing a raw map containing, say, `"total-records"` could still collide with `updateTotal`'s output — the code relies on producers not doing that, not on enforcement.
+
+## 12. Summary is huge (partition-summary blowup)
+`changed-partition-count` / per-partition summaries under `partitions.` (SnapshotSummary.java:57-58) can explode the metadata for a wide write.
+
+Guard — a configurable cap:
+- `setPartitionSummaryLimit` limits `maxChangedPartitionsForSummaries` (SnapshotSummary.java:96-108); `build()` only emits `partition-summaries-included=true` and the per-partition entries while changed-partitions <= that limit (SnapshotSummary.java:202-211). Beyond it, only the count is emitted.
+- Residual: the cap is a set value, not a spec requirement — a caller that never sets it keeps the default (0 → no per-partition summaries), which is safe by default.
+
+## Summary of the failure-mode posture
+The spec treats the summary as informational and optional-by-value, and the code's posture matches: **only `operation` presence and the REPLACE row-count invariant are hard-asserted** (SnapshotProducer.java:345-357, SnapshotParser.java:70-83); everything numeric degrades safely — consistent values emitted only when they're non-zero and trusted, totals clamped and skipped rather than written negative, missing baselines synthesized as zero or treated as empty, DVs sized by blob not container, and per-partition/per-file details dropped when the producer can't certify them.
+
+The two residual gaps worth knowing: (a) no explicit guard against `long`/`int` overflow in the counters (only incidental coverage via the `>= 0` clamps), and (b) no enforcement against a careless producer colliding with a reserved metric key — both are compensated by trusting the in-repo producers.

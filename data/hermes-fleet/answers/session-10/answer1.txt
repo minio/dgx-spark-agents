@@ -1,0 +1,41 @@
+I read format/spec.md end to end (all 2,153 lines). Here is what the spec says about branches and tags, and the reasoning behind the design.
+
+## What the spec says
+
+**Branches and tags are both "snapshot references."** The spec defines them in the "Snapshot References" section (format/spec.md:1100-1116). A snapshot reference is a record with three relevant properties:
+
+- `snapshot-id` — the snapshot it points at
+- `type` — either `tag` or `branch`
+- retention settings — `min-snapshots-to-keep`, `max-snapshot-age-ms`, `max-ref-age-ms`
+
+The key conceptual distinction (line 1103):
+
+- **Tags are labels for individual snapshots** — they point at one fixed snapshot and never move.
+- **Branches are mutable named references** — they can be advanced by committing a new snapshot as the branch's referenced snapshot, using the same commit-conflict-resolution-and-retry procedure as the `main` branch.
+
+References live in the `refs` map in table metadata (lines 1116, 1167). The `main` branch always exists — it points at `current-snapshot-id`, even when the `refs` map is null.
+
+**Retention policy** (lines 1118-1132): whether a snapshot survives garbage collection depends on references. Expiration works like this:
+
+1. Start with an empty set of retained snapshots.
+2. Drop any reference (other than `main`) whose referenced snapshot is older than `max-ref-age-ms` — the reference itself expires.
+3. Add one snapshot per branch/tag reference to the retained set.
+4. For each branch, also retain its ancestors until they are both older than `max-snapshot-age-ms` AND not among the first `min-snapshots-to-keep`.
+5. Expire everything not retained.
+
+A few rules worth calling out (lines 1108-1115):
+- `min-snapshots-to-keep` and `max-snapshot-age-ms` apply **only to branches**.
+- `max-ref-age-ms` applies to all references **except `main`** — the `main` branch never expires.
+- Any of these can default to the corresponding table property (`history.expire.*`) when not set on the reference.
+
+## The design reasons
+
+**Branches and tags encode fundamentally different intents, and the retention rules reflect that.** A branch is an actively-editable line of table history — it can keep advancing, so it needs *ancestry retention* (min snapshots kept, max age) to decide how much of its history to keep as it moves forward. A tag is a frozen bookmark on one specific snapshot — it has no notion of advancing, so ancestry retention is meaningless; instead it needs `max-ref-age-ms` to say how long the tag itself should live before being dropped. This is why the min/max-age options are branch-only: they describe how a moving pointer retains its past, which tags don't have.
+
+**References are what keep snapshots alive.** Table data files must not be deleted while any snapshot referencing them is still valid (line 1162). Because retention is computed *from* the set of references (line 1128: "For each branch and tag, add the referenced snapshot to the retained set"), a branch or tag is the mechanism that pins a snapshot (and its ancestry) against expiration. Without references, snapshots are subject to the global `history.expire.*` table properties. This creates a clean layering: the global policy governs everything, and references narrow down what the policy treats as protected.
+
+**The `main` branch is special-cased deliberately.** Since `main` is the table's current state and the entry point for all readers and writers, it must never expire (line 1114: "The `main` branch never expires"). Its retention is therefore governed only by min-snapshots-to-keep and max-snapshot-age-ms — that's how a normal table's history is time-boxed — but it can never be evicted as a reference entirely.
+
+**Branch writes reuse the same optimistic-concurrency machinery as `main`.** Branches advance by committing a new snapshot the same way `main` does. In Iceberg, table state is only ever changed by atomically swapping one metadata file for another (line 1136), and commits detect conflicts and retry (lines 1312-1319). By making branches use that same procedure, the spec gives side branches the exact same correctness guarantees (serializable isolation, atomicity, conflict retry) as the main line, without inventing a parallel commit protocol. Tags, by contrast, don't commit at all — they just label an existing snapshot.
+
+In short: the design separates *what a snapshot reference is* (a name → snapshot-id mapping) from *how long it survives* (its retention fields), and the different retention semantics fall out naturally from the fact that branches move and tags don't. This keeps a single `refs` map handling both, with `main` given unconditional permanence as the foundation.

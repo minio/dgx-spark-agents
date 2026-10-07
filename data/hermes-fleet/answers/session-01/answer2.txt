@@ -1,0 +1,55 @@
+I now have the full call chain. Here is the explanation.
+
+## The call chain
+
+`BaseUpdatePartitionSpec.commit()` → `TableMetadata.updatePartitionSpec`/`addPartitionSpec` → `TableMetadata.Builder.setDefaultPartitionSpec/addPartitionSpec` → `addPartitionSpecInternal` → `PartitionSpec.checkCompatibility` + `hasSequentialIds` + `freshSpec`. `apply()` uses `PartitionSpec.Builder`, and field ID assignment uses `TableMetadata.lastAssignedPartitionId()` and `PartitionSpec.Builder.add`.
+
+## add / remove / rename record the *intent*, then `apply()` builds the new spec
+
+The mutation methods don't touch metadata — they only accumulate pending changes:
+- `addField` (`BaseUpdatePartitionSpec.java:178-241`) resolves the term, rejects duplicates, and appends the new `PartitionField` to `adds` (`:238`).
+- `removeField` (`:244-279`) adds the field's ID to `deletes` (`:255`, `:276`).
+- `renameField` (`:282-301`) records `name -> newName` in `renames` (`:298`).
+
+`apply()` (`:304-335`) then rebuilds the target spec field-by-field:
+- Keeps every current field not in `deletes`, applying any rename — reproducing the same source ID, field ID, and name through `builder.add(sourceId, fieldId, name, transform)` (`:310-314`) so IDs are preserved.
+- For a removed field in a **v1** table (`formatVersion < 2`, `:315-327`), instead of dropping it, it adds the field back with `Transforms.alwaysNull()` — the `void` transform — keeping the same field ID. This is the spec's recommended v1 behavior (spec.md #633-637: don't drop, but replace with `void` to preserve tuple shape).
+- In v2+, removed fields are simply not included (`:308`), which is the clean drop the spec allows.
+- Finally appends all new `adds` at the end (`:330-332`).
+
+`PartitionSpec.Builder.add(...)` (`api/.../PartitionSpec.java:623-628`) is what preserves/stores the IDs: it calls `checkAndAddPartitionName` and tracks the max field ID in `lastAssignedFieldId` (`:626`). `build()` (`:630-638`) runs `checkCompatibility`.
+
+## Stable partition field IDs — the core spec requirement
+
+The spec says "changes should not cause partition field IDs to change" (spec.md #629). The implementation guarantees this two ways:
+
+1. **V2 field-ID reuse across specs.** `recycleOrCreatePartitionField` (`BaseUpdatePartitionSpec.java:122-144`) — for format v2+ — scans *all historical specs* (`base.specs()`, `:129-131`) and, if a field already exists with the same source ID and equal transform (and optional matching name), reuses that field verbatim (`:133-140`). Only when nothing matches does it mint a new ID via `assignFieldId()` (`:108-111`, called at `:143`), and `assignFieldId` increments `lastAssignedPartitionId`, seeded from `base.lastAssignedPartitionId()` (`:75`). This is the spec's "partition field ids must be reused if an existing partition spec contains an equivalent field" (spec.md #567) and "in v2, ... new IDs are assigned based on the last assigned partition ID" (spec.md #631).
+2. **`apply()` carries IDs forward.** Even outside the recycle path, reapplying existing fields carries their current field ID (`:311-313`), so a rename or non-destructive rewrite never reassigns an ID.
+
+`addPartitionSpecInternal` (`TableMetadata.java:1671-1702`) then bumps the table-wide `lastAssignedPartitionId` to `max(lastAssignedPartitionId, newSpec.lastAssignedFieldId())` (`:1692-1693`), mirroring the spec's `last-partition-id` tracking (spec.md #1159) so future evolutions get unused IDs.
+
+## Unique spec, no duplicate equivalent specs
+
+`addPartitionSpecInternal` calls `reuseOrCreateNewSpecId` (`:1704-1716`): if the new spec `compatibleWith` an existing one it reuses that spec's ID (`:1708-1709`), otherwise it takes `highest spec ID + 1` (`:1711`). This implements the spec rule "Writers must not create a new partition spec if there already exists a compatible partition spec" (spec.md #565) — where `compatibleWith` is the spec's field-by-field equivalence (same source IDs, transform, name, spec.md #565). When the new spec is set as default, `setDefaultPartitionSpec(int)` (`:1146-1166`) writes a `MetadataUpdate.SetDefaultPartitionSpec` change when the default actually changes (no-op if it's already current, `:1153-1156`), letting the whole evolution be expressed as serializable metadata updates for REST.
+
+## Compatibility validation at the boundary
+
+`checkCompatibility` (`api/.../PartitionSpec.java:649-686`) enforces the spec's constraints before committing:
+- Source field must exist, be **primitive**, and the transform must `canTransform(sourceType)` (`:663-674`) — the spec's "source columns ... must be a primitive type" (spec.md #559).
+- The source ID must be nested only under struct types (`:677-683`) — the spec's "cannot be contained in a map or list" (spec.md #559).
+- A `void` transform bypasses the source-type check (`:663`), because a dropped v1 field's source column may be gone — exactly the spec's comment that a void-replaced field no longer needs a valid source (spec.md #660).
+- For v1, `hasSequentialIds` (`:688-695`) is enforced in `addPartitionSpecInternal` (`TableMetadata.java:1686-1689`): v1 partition IDs must be exactly `1000 + index`, matching the spec's "assigned sequentially starting at 1000" (spec.md #633).
+
+## v1 vs v2 divergence is deliberate
+
+The branch on `formatVersion` shows the two spec regimes:
+- **v1** (spec.md #633-637): no reorder, no drop (use `void`), field IDs sequential from 1000 — enforced by `hasSequentialIds` (`PartitionSpec.java:688`) and the `void` replacement in `apply()` (`:315-327`) and `reassignPartitionIds` (`TableMetadata.java:690-711`).
+- **v2+** (spec.md #631): free add/rename/drop with explicit, table-unique IDs — handled by the recycle path, `assignFieldId`, and simply omitting dropped fields.
+
+`reassignPartitionIds` (`TableMetadata.java:657-715`) additionally shows how a **v2+** rebuild reuses existing field IDs across specs (`:663-678`), while the **v1** path carries forward every field, replacing missing ones with `void` and appending new fields at the end (`:690-711`) — reusing the field ID when a field is carried forward.
+
+## Reading uses per-manifest specs, not the default
+
+Nothing in this update rewrites data or old manifests. The evolution just adds a new spec to `partition-specs` and (optionally) sets `default-spec-id` (`TableMetadata.java:1158`). Each manifest keeps its `partition-spec-id`, and scans convert predicates using the spec that wrote each manifest rather than the default — consistent with spec.md #1059. That's why changing the default only affects newly written files and why the whole operation is a cheap metadata-only change.
+
+In short: the implementation mirrors the spec's design almost one-to-one — stable field IDs across specs (v2 recycle + carry-forward), unique/compatible spec detection, `void`-based drop for v1 vs. clean drop for v2+, sequential-v1-ID enforcement, primitive/struct-parent validation, and `last-partition-id` bookkeeping — all producing serializable metadata updates so the evolved spec lands as a new entry in `partition-specs` without disturbing existing data files or old manifests.

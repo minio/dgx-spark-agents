@@ -1,0 +1,14 @@
+Here's a ten-point orientation, each with the first place to read.
+
+1. Why manifests get merged at all — the spec's fast-append design. Read spec.md:978-984 (Snapshots): appends add a new manifest cheaply instead of rewriting, which accumulates manifests that a merge later consolidates.
+2. The entry point. Read ManifestMergeManager.java:79 (mergeManifests): the top-level driver; bails if merging is disabled or there's only one manifest.
+3. Never mix partition specs. Read ManifestMergeManager.java:129 (groupBySpec): groups manifests by partitionSpecId so each merged manifest keeps a single spec (spec.md:660, 666).
+4. How manifests are chosen to merge. Read ManifestMergeManager.java:139 (mergeGroup): bin-packs manifests to a target size with a lookback of 1 to avoid reordering.
+5. Single-manifest bins are never rewritten. Read ManifestMergeManager.java:164: passes a size-1 bin through untouched — reuse instead of rewrite.
+6. The core correctness rule — entry status on merge. Read ManifestMergeManager.java:202 (createManifest body): DELETED suppressed unless deleted this snapshot, ADDED-by-this-snapshot stays ADDED, everything else becomes EXISTING.
+7. Sequence numbers are preserved, not re-inherited. Read ManifestWriter.java:190 (existing(entry)): existing entries keep their data/file sequence numbers, as spec.md:935 requires.
+8. Merges are cached for commit retries. Read ManifestMergeManager.java:187: reuses a previously merged file when the same bin comes up again on a retry.
+9. Uncommitted merged manifests are cleaned up. Read ManifestMergeManager.java:108 (cleanUncommitted): deletes any merged manifest not committed and fixes the replaced-count.
+10. Where it's wired and tuned, and where Spark does it explicitly. Read MergingSnapshotProducer.java:120-133 (knobs from table properties) and MergingSnapshotProducer.java:1066 (called per commit); then spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/actions/RewriteManifestsSparkAction.java:228 for Spark's separate distributed rewrite (Flink relies only on the core merge via newAppend, e.g. IcebergFilesCommitter.java:337).
+
+Quick mental model: the spec only requires single-spec, immutable, correctly-sequenced manifests and fast appends; `ManifestMergeManager` is the implementation that consolidates those appends later. The two invariants that matter most — group by spec (3) and reclassify entries correctly (6) — are where bugs are most likely to hide.

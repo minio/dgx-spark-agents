@@ -1,0 +1,70 @@
+The shared Parquet layer lives in the `parquet/` module. I have what I need to explain how query engines use the variant type. Let me give the complete picture.
+
+## How query engines use the variant type
+
+Both Spark and Flink treat a variant column as an **opaque binary payload: immutable metadata bytes + value bytes**, carried through an engine-native handle (`VariantVal` in Spark, `BinaryVariant` in Flink). The engines never interpret the bytes themselves — they shuttle them in/out of Parquet and pass the whole blob to their own SQL runtime for field access via JSON-path / `field()` functions. The variant is shredded (columnarized into typed child columns) when that's enabled, to speed up access to hot fields.
+
+The integration has four layers that are identical in purpose in both engines:
+
+### 1. Schema mapping (variant ⇄ engine type)
+
+The variant is a first-class but opaque type in each engine's type system, mapped 1:1 to Iceberg's `VariantType`.
+
+Spark:
+- `TypeToSparkType.variant` → `VariantType$.MODULE$` (spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/TypeToSparkType.java:119-121)
+- `SparkTypeToType.variant` → `Types.VariantType.get()` (spark/v4.2/.../SparkTypeToType.java:154-157)
+
+Flink:
+- `TypeToFlinkType.variant` → `new VariantType()` (flink/v2.3/.../TypeToFlinkType.java:87-90)
+- `FlinkTypeToType.visit(VariantType)` → `Types.VariantType.get()` (flink/v2.3/.../FlinkTypeToType.java:211-214)
+
+Column pruning treats variant as atomic (never recursed into as struct subfields): `PruneColumnsWithoutReordering.variant` returns the type unchanged (spark/v4.2/.../PruneColumnsWithoutReordering.java:200-203).
+
+### 2. The engine-side value handle
+
+Each engine exposes its own wrapper around the metadata+value bytes; the wrappers are matched by probe type in the writer and produced by the reader:
+
+- Spark: `org.apache.spark.unsafe.types.VariantVal`, imported at SparkParquetReaders.java:75 and SparkParquetWriters.java:77.
+- Flink: `org.apache.flink.types.variant.BinaryVariant`, imported at FlinkValueReaders.java:38, FlinkValueWriters.java:33, and BinaryVariantAccessorUtils.java (the accessor that handles `getVariant()`).
+
+### 3. Parquet read path
+
+Spark Parquet reader — a `DelegatingValueReader<Variant, VariantVal>` that decodes Iceberg's `Variant` then re-serializes it into Spark's byte arrays:
+- `SparkParquetReaders.java:213-216` — the `variantVisitor()` returns a `VariantReaderBuilder`, so the whole nested/shredded variant structure is parsed by the shared Parquet variant machinery.
+- `SparkParquetReaders.java:219-222` — `variant(...)` wraps the delegate in `VariantReader`.
+- `SparkParquetReaders.java:556-575` — `VariantReader.read` writes `variant.metadata()` and `variant.value()` into little-endian byte arrays and returns `new VariantVal(valueBytes, metadataBytes)`.
+
+Spark vectorized (Arrow) path: `VariantColumnVector` (spark/v4.2/.../vectorized/VariantColumnVector.java) exposes the column as two Arrow child vectors — value (child 0) and metadata (child 1):
+- `VariantColumnVector.java:33-37` builds it from `VectorHolder.VariantVectorHolder` with a value child and metadata child.
+- `getChild(int)` returns value/metadata for ordinals 0/1 (67-76); every typed getter (`getInt`, `getString`, `getArray`, ...) throws "Variant column only supports getVariant()" (78-140). This forces consumers to go through Spark's `getVariant()`, which is exactly how Spark's `VariantType` is meant to be read.
+- `closeIfFreeable()` is intentionally a no-op referencing SPARK-50235/SPARK-50463 (45-48) — Spark's own variant-vector lifecycle.
+
+Flink Parquet reader — reads metadata+value bytes into a `BinaryVariant`:
+- `FlinkParquetReaders` (via `FlinkValueReaders.variants()` → `VariantReader.INSTANCE`, FlinkValueReaders.java:83-85)
+- `VariantReader.read` (FlinkValueReaders.java:174-179) reads the metadata `byte[]` and value `byte[]` and returns `new BinaryVariant(value, metadata)`. This is unconditional (whatever the source format).
+
+Flink also has an Avro path: `FlinkValueReaders.java:163-179` is actually the Avro value reader, and it produces `BinaryVariant` from the Avro `metadata`/`value` bytes.
+
+### 4. Parquet write path + shredding
+
+Spark Parquet writer — converts Spark's `VariantVal` back into an Iceberg `Variant` for the shared Parquet writer:
+- `SparkParquetWriters.java:164-170` — `variant(...)` runs `ParquetVariantVisitor.visit` with a `VariantWriterBuilder`, then wraps in `VariantWriter`.
+- `SparkParquetWriters.java:645-663` — `VariantWriter.write` wraps `variantVal.getMetadata()` and `variantVal.getValue()` into little-endian ByteBuffers, builds `VariantMetadata.from` / `VariantValue.from`, and calls the underlying writer with `Variant.of(metadata, value)`.
+
+Flink Parquet writer — symmetric, but works directly on Flink's `BinaryVariant`:
+- `FlinkValueWriters.java:50-52` — `variants()` returns `VariantWriter.INSTANCE`.
+- `FlinkValueWriters.java:169-190` — `VariantWriter.write` requires the datum be a `BinaryVariant` (183-186) and writes its metadata and value bytes.
+
+**Shredding** (columnarizing the variant into typed child columns) is the key write-time feature and is config-gated in both engines:
+- Spark: `SparkWriteConf.shredVariants()` reads the `shred.variants` option/session/table-property, defaulting to `TableProperties.PARQUET_SHRED_VARIANTS_DEFAULT` (SparkWriteConf.java:736-744); when enabled it also configures the inference buffer size (746-751) and emits `PARQUET_SHRED_VARIANTS` plus `PARQUET_VARIANT_BUFFER_SIZE` into the write properties (507-514).
+- Flink: `FlinkWriteConf.parquetShredVariants()` (FlinkWriteConf.java:275-282) and `parquetVariantInferenceBufferSize()` (284-...), again defaulting to the same table property.
+
+Once shredding is on, both engines feed rows through the shared `VariantShreddingAnalyzer` / `VariantReaderBuilder`/`VariantWriterBuilder` in the `parquet/` module (e.g. `parquet/.../VariantReaderBuilder.java`, `VariantWriterBuilder.java`). Flink's adapter is `FlinkVariantShreddingAnalyzer` (flink/v2.3/.../FlinkVariantShreddingAnalyzer.java:37-66): it extracts `VariantValue`s from buffered Flink `RowData` rows — reading `row.getVariant(...)` (46), converting a `BinaryVariant` into an Iceberg `VariantValue` via little-endian ByteBuffers (48-57), and throwing `UnsupportedOperationException` for any non-`BinaryVariant` runtime type (57-60).
+
+### The shared, engine-agnostic core
+
+Both engines are thin adapters that wrap/unwrap the same engine-neutral objects from the `parquet/` + `api/` core:
+- The `api/` `org.apache.iceberg.variants` types (`Variant`, `VariantMetadata`, `VariantValue` + all `Serialized*`) do all the actual encoding/decoding as I described earlier.
+- `ParquetVariantVisitor`, `VariantReaderBuilder`, `VariantWriterBuilder`, and `VariantShreddingAnalyzer` (all in `parquet/src/main/java/org/apache/iceberg/parquet/`) own the group-with-metadata-and-value physical layout and the shredding decision.
+
+So the pattern is: **the engine's job is to serialize its own variant handle to/from the Iceberg metadata+value ByteBuffers and let the core Parquet layer handle the wire format and optional shredding; the engine's own SQL functions (`getVariant()`, `variant_get`, etc.) do the actual JSON-path field access against bytes the engine treats as opaque.** The variant is never expanded into Iceberg typed struct columns at the schema level — it stays a single atomic column whose *physical* storage (plain vs shredded) is tunable per write.

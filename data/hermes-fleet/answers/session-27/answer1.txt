@@ -1,0 +1,31 @@
+I've now read format/spec.md in full (all 2153 lines, in three consecutive chunks plus a content search), and verified every place it touches on the topic. Here's what the spec says about cherry-picking snapshots.
+
+## What the spec actually says
+
+The spec never uses the phrase "cherry-picking" as a defined operation. It describes cherry-picking almost entirely by implication, through the structures that make it possible. The concrete traces are:
+
+1. Snapshot storage and lineage (Specification, "Snapshots" section, lines ~951-978). Every snapshot has a `parent-snapshot-id` (optional, omitted for a snapshot with no parent) which encodes the parent/child lineage of snapshots. Snapshots are stored as a flat list in table metadata (`snapshots`), NOT as a tree — each one just records its own `snapshot-id`, `parent-snapshot-id`, `sequence-number`, `timestamp-ms`, `manifest-list`, `summary`, and `schema-id`.
+
+2. Snapshot references / branches and tags (lines ~1100-1116). Iceberg tracks named pointers to snapshots via `refs`: `tag` (immutable label on one snapshot) and `branch` (mutable pointer to a snapshot, the `main` branch being special). This is what lets a non-`main` branch or a tag exist off to the side of normal lineage.
+
+3. The `source-snapshot-id` summary field (Appendix F, line 2127). This is the single place the word "cherry-pick" appears: it's defined as "The original id of a cherry-picked snapshot" — a snapshot summary field recording which snapshot a new snapshot was cherry-picked from. It's classified under "Other Fields" (operational details), optional, string type.
+
+4. The `wap.id` / `published-wap-id` fields (lines 2125-2126), which are the closely related Write-Audit-Publish mechanism: a staged snapshot carries a `wap.id`, and when it gets promoted/published a `published-wap-id` records it.
+
+So the wire-level mechanics cherry-picking relies on are: a snapshot is an independently-addressable immutable set of files (manifest list) that can be appended to the table's snapshot list with any `parent-snapshot-id` and a chosen `sequence-number`, independent of where in the lineage it was originally created. Because a new metadata file is written for each commit and the `refs`/`current-snapshot-id` just point at whatever snapshot you nominate, you can introduce a copy of a historical snapshot as a new snapshot (or point a branch/tag at it) without it needing to descend linearly from the current one.
+
+## Why it's designed that way
+
+The design follows directly from Iceberg's core model, which the spec lays out early (Overview, lines 79-99):
+
+- Immutable snapshots as the unit of state. A snapshot is just "the state of a table at some point in time, including the set of all data files." It's a value object. Nothing about a snapshot requires it to be produced by any particular commit history, so re-adding an existing snapshot's contents is cheap — it means writing a new snapshot entry that reuses the existing manifest list and file set, not rewriting data.
+
+- Serializable isolation and optimistic concurrency. Reads always bind to a committed snapshot; the "current" state is whatever a `ref` says it is. So "publishing" a cherry-pick is just an atomic metadata swap that changes which snapshot a branch or `current-snapshot-id` points to. There's no locking, and readers never see a partial state.
+
+- Snapshots decoupled from each other by immutable files, not a single growing lineage. Because a snapshot only tracks a set of manifest files (which can be shared/reused across snapshots — the spec notes manifests are "reused across snapshots to avoid rewriting metadata"), cherry-picking a snapshot mostly re-points at already-existing manifests. The `parent-snapshot-id` is metadata, not a structural requirement for validity — which is exactly what lets a cherry-picked snapshot have a different (or no) parent than its linear predecessor.
+
+- Sequence numbers are per-commit and monotonically increasing, but they're assigned to the snapshot independently of its parent. A cherry-picked snapshot gets its own `sequence-number` in the new table sequence even though it reuses older file content — this keeps the "relative order of commits" contract intact (needed for delete planning and GC) regardless of which historical snapshot the content came from.
+
+- Why `source-snapshot-id` instead of a hardcoded mechanism: keeping it as an optional summary field rather than a structural one preserves backward compatibility and keeps cherry-picking engine behavior rather than spec-enforced behavior. The spec documents the intent (which original snapshot a new one came from) so engines/tools can trace provenance, but doesn't bake in a mandated commit procedure. Note the spec deliberately puts these in Appendix F, "Implementation Notes — topics not required by the specification but recommendations" — so WAP/cherry-pick is treated as operational guidance layered on the spec's snapshot model, not as a required part of the format.
+
+The one thing worth flagging: the spec describes the data model and the retention/summary hooks, but it does not define the exact steps an engine takes to perform a cherry-pick (that lives in the Iceberg operations/API layer and engine docs, not the format spec). If you want the operation-level contract, the spec alone won't give you `CherrypickSnapshot` — you'd want the API docs or the Java `CherrypickSnapshot`/`SnapshotProducer` code for that. But everything in the spec exists precisely to make that operation a simple atomic re-point at immutable state rather than a data rewrite.

@@ -1,0 +1,18 @@
+{
+ "label": "day1-1",
+ "wall_s": 63.9,
+ "server": {
+  "prompt_tokens_total": 162915.0,
+  "generation_tokens_total": 1433.0,
+  "prefix_cache_hits_total": 97792.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 30.4,
+  "time_to_first_token_seconds_count": 5.0,
+  "request_prefill_time_seconds_sum": 29.6,
+  "request_decode_time_seconds_sum": 30.6
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": " manifest lists files for a single partition spec (spec's field ids form the manifest schema). Each `manifest_entry` row has: status (0 EXISTING / 1 ADDED / 2 DELETED), snapshot_id, sequence_number, and the nested `data_file` struct. The `data_file` struct carries file_path, file_format, the partition tuple, record_count, file_size, and per-column metrics (value_counts, null_value_counts, nan_value_counts, lower_bounds, upper_bounds) plus split_offsets, sort_order_id, and for V3 first_row_id / content stats. A manifest holds only data files or only delete files, never both. Manifests are reused across snapshots when unchanged (that's what makes metadata updates cheap \u2014 slow-changing state isn't rewritten).\n\n### 5. Data files\nThe actual rows in Parquet/Avro/ORC, referenced by path. Delete files (position/equality files or V3 deletion vectors referenced via a Puffin file) are tracked the same way in separate delete manifests.\n\n## How a reader finds the data files for a query\n\nThe reader traces the pointer chain table metadata -> chosen snapshot -> manifest list -> manifests -> file paths, pruning at each level:\n\n1. Load table metadata, pick the snapshot (current, or via refs / snapshot-log for time travel). This pins an immutable consistent view \u2014 no locks; writers only affect future reads.\n\n2. Read that snapshot's manifest list. Using column bounds and file counts in `field_summary`, prune whole manifests whose partitions can't match.\n\n3. For each surviving manifest, convert the query's row predicates into partition predicates using the manifest's own partition spec (inclusive projection \u2014 may over-include, never under-include). This drops manifests and individual entries whose partitions can't contain a match.\n\n4. Within a manifest, further prune by column metrics on the `data_file` struct (lower/upper bounds and null/value counts keyed by field id) \u2014 a file whose bounds exclude the predicate is skipped without opening it. This also prunes delete files: if a delete file's metrics show no overlap with the predicate or with a data file, it's ignored.\n\n5. For data files that pass, apply any matching delete files at read time. Deletes apply only to older files in the same partition (position deletes/DVs: data sequence number <= delete's, same file_path and partition; equality deletes: data seq strictly less, same partition or global if unpartitioned). Position deletes from the same commit also apply, letting you delete rows added in the same snapshot.\n\n6. Only then does the engine actually open the surviving data files (optionally skipping whole row groups via split_offsets) and read the projection.\n\nKey consequences of this design: reads never lock and are isolated from concurrent writes; scan planning cost is proportional to the number of candidate manifests, pre-pruned by stats, not to table size; and because the manifest list/manifests carry partition + column stats, the expensive part of planning stays in metadata instead of in a central store.\n",
+ "stderr": ""
+}

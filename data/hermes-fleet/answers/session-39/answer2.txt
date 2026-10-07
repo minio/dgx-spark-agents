@@ -1,0 +1,78 @@
+I've now traced all the code that `Variants.java` calls. Here's how the implementation follows the specification.
+
+## Where things live
+
+`Variants.java` is a thin public factory in `core/` (`core/src/main/java/org/apache/iceberg/variants/Variants.java`), but the types it instantiates are in the `api/` module (`api/src/main/java/org/apache/iceberg/variants/`), while the in-memory mutables it uses (`PrimitiveWrapper`, `ValueArray`, `ShreddedObject`, `VariantVisitor`) are back in `core/`. `Variants.java` itself has no imports for these variant types because they're declared in the same *package name* (`org.apache.iceberg.variants`) split across the two modules.
+
+## Spec point 1: encoding owned by Parquet (`VariantEncoding.md`), V1 only
+
+The spec (format/spec.md:246) says the wire format is defined by the Parquet project, V1. SerializedMetadata.cs:28-50 confirms V1 support and version enforcement:
+
+- `SerializedMetadata.java:30-31` — `SUPPORTED_VERSION = 1`, `VERSION_MASK = 0b1111`
+- `SerializedMetadata.java:48-49` — checks `version == 1` and throws `Unsupported version` otherwise.
+- `SerializedMetadata.java:36-38` — the empty V1 metadata is literally the 3 bytes `{0x01, 0x00, 0x00}`, i.e. a header byte `0x01` (version 1, not sorted, 1-byte offset size) followed by dictionary size 0.
+
+The four container/header encoders `VariantUtil.java:147-166` — `metadataHeader`, `primitiveHeader`, `objectHeader`, `arrayHeader`, `shortStringHeader` — and the basic-type discriminator in `VariantUtil.java:168-182` (`basicType`) are the exact bit-packing from VariantEncoding.md.
+
+## Spec point 2: variant is its own category — object + array both "may contain any variant value"
+
+The spec (spec.md:252-260) defines the variant as self-describing: an *object* is name→value where values have no fixed type, and an *array* is an ordered collection of arbitrary values. The code models exactly this:
+
+- `Variants.java:105-121` — `object(...)` builds a `ShreddedObject`, whose `put(String, VariantValue)` (ShreddedObject:92-101) accepts any `VariantValue` keyed by any name; there is no declared element/field type.
+- `Variants.java:127-129` — `array()` builds a `ValueArray`, whose `add(VariantValue)` (ValueArray:45-48) accepts any value; no fixed element type.
+- The object stores only field names and values, resolved through a metadata *dictionary* rather than a fixed schema — `VariantObject.get(String)` (VariantObject.java:26), `fieldNames()` (VariantObject.java:29).
+
+This directly implements the spec's "variable fields identified by name and field values may be any variant value" — the opposite of Iceberg's typed `struct`/`list` with fixed field IDs.
+
+## Spec point 3: the wider primitive set than JSON
+
+The spec (spec.md:250) lists date, timestamp, timestamptz, binary, and decimals as extra primitive values. `Variants.java:131-243` exposes a factory for each physical primitive:
+
+- `Variants.java:167-169` `ofDate` / `ofIsoDate`, `175-177` `ofTimestamptz`, `183-185` `ofTimestampntz`, `213-215` `ofTime`, `221-231` the two nanosecond variants, `237-239` `ofUUID`, `205-207` `of(ByteBuffer)` for binary, `191-203` `of(BigDecimal)` for decimals, `209-211` `of(String)`, `143-165` the integer/float family, `139-141` booleans, `135-137` `ofNull`.
+
+The `PhysicalType` enum (`PhysicalType.java:26-49`) is the concrete inventory: it includes `DATE`, `TIMESTAMPTZ`, `TIMESTAMPNTZ`, `TIME`, `TIMESTAMPTZ_NANOS`, `TIMESTAMPNTZ_NANOS`, `BINARY`, `DECIMAL4/8/16`, `UUID`, plus the JSON-like scalar types and `ARRAY`/`OBJECT` for the containers. `Primitives.java:22-42` maps these 1:1 to the VariantEncoding primitive type ids (NULL=0 … UUID=20), matching the Parquet encoding's type enumeration.
+
+The spec's richer-than-JSON intent is visible end-to-end: e.g. `ofIsoTimestamptz` (Variants.java:179-181) converts an ISO string through `DateTimeUtil.isoTimestamptzToMicros` to the stored micros, and `VariantPrimitive.valueAsString()` (VariantPrimitive.java:36-55) renders dates/timestamps/decimals back out as ISO strings and binary as hex.
+
+## Spec point 4: so who is "schema-less" vs typed? The distinction in code
+
+The spec (spec.md:244-248) says a variant is "neither primitive nor nested type." The code maintains that boundary in a clean way:
+
+- `VariantValue` (VariantValue.java:24) is the root type; all values (objects, arrays, primitives) implement it.
+- `VariantValue.asPrimitive()/asObject()/asArray()` (VariantValue.java:41-61) throw unless the value is of the right kind — so a value's kind is discovered at read time, not enforced by a schema, matching the spec's variable-structure claim.
+- `VariantVisitor.visit` (VariantVisitor.java:49-84) is the structural dispatcher: it switches on `value.type()` and treats `ARRAY`/`OBJECT`/primitive differently, i.e. it handles the three "basic types" the VariantEncoding defines. Again no schema required.
+
+## Spec point 5: shredding (partial object reads)
+
+The spec (spec.md:246, 1566 reference to VariantShredding.md) supports unshredded and shredded storage; `ShreddedObject` (ShreddedObject.java:41-281) is exactly that:
+
+- It can hold an `unshredded` object plus a set of `shreddedFields` overrides and `removedFields` (ShreddedObject.java:42-46).
+- `get(String)` (ShreddedObject.java:103-120) gives shredded values precedence, else falls back to the unshredded object. This is the "partial shredding" the class Javadoc describes at ShreddedObject.java:33-40.
+- The class comment (ShreddedObject.java:36-39) explicitly notes metadata must be shared between shredded and unshredded forms "which could require recursively rewriting field IDs" — exactly why metadata is fixed per object.
+- `SerializedObject.sliceValue` (SerializedObject.java:248-270) avoids re-materializing values by slicing the raw buffer — the optimization described at ShreddedObject.java:174-176 ("use existing buffers instead of materializing values").
+
+## Spec point 6: how the spec's field bounds / JSON-path pruning connects
+
+The spec (spec.md:781-797) describes variant bounds as variant objects keyed by normalized JSON paths like `$['location']['latitude']`. The implementation supports the "field identified by path" notion through metadata dictionaries and the visitor:
+
+- Metadata is a name→id dictionary (`VariantMetadata.java:32` `id(String)`, `get(int)`), and object fields are looked up by name with binary search in `SerializedObject.get` (SerializedObject.java:222-240).
+- `VariantVisitor` (VariantVisitor.java:45-84) walks nested objects/arrays recursively, which is the machinery used to reach a specific path inside a column. (The actual path-bound serving is done by stats/`InclusiveStatsEvaluator`, which was flagged as a consumer, not by `Variants.java` directly.)
+
+## Spec point 7: safety and edge-case conformance
+
+Several details concretely follow spec *constraints*:
+
+- **Binary serde not mixed with single-value canonical form**: Variant values are carried as their raw little-endian encoded bytes. `SerializedValue` (SerializedValue.java:25-33) implements `sizeInBytes()`/`writeTo()` as a raw buffer copy, and every `Serialized*` class stores the original `ByteBuffer`. This matches the spec: the variant is opaque at the Iceberg-serialization level (Appendix D lists variant as "Not supported" for single-value, spec.md:1853), because its bytes belong to VariantEncoding, not Iceberg.
+- **Nesting-depth and element limits** are enforced as safety bounds (not spec limits) in `VariantUtil.MAX_VARIANT_DEPTH = 1000` (VariantUtil.java:39) and `MAX_ELEMENTS = 16_777_216` (VariantUtil.java:45), checked in `fromBuffer` (VariantUtil.java:50-57) and the container constructors (SerializedObject.java:84-88, SerializedArray.java:70-76, SerializedMetadata.java:69-73).
+- **Little-endian enforcement**: every parser/writer requires `ByteOrder.LITTLE_ENDIAN` (SerializedMetadata.java:45-46, SerializedObject.java:50-51, SerializedArray.java:44-45, SerializedPrimitive.java:39-40, and the core writers PrimitiveWrapper.java:147-148, ShreddedObject.java:134-135, ValueArray.java:62). The VariantEncoding is little-endian, so this is conformance, not taste.
+- **UTF-8 strings**: reading uses `StandardCharsets.UTF_8` (VariantUtil.java:91-99, SerializedMetadata.java:145); writing encodes names as UTF-8 (Variants.java:58) and strings as UTF-8 (PrimitiveWrapper.java:132).
+- **Field-name ordering**: metadata can be `isSorted`, and `VariantMetadata.FIELD_NAME_ORDER` (VariantMetadata.java:29) documents "unsigned UTF-8 byte order for field names, per VariantEncoding.md's sorted_strings rule." `SerializedObject.get`/`find` binary-search on that order (SerializedObject.java:224-225), and both `SerializedMetadata.id` (SerializedMetadata.java:114-116) and the writer path (`Variants.java:60` checking sortedness, `VariantUtil.find` at VariantUtil.java:102-133) honor it — with a legacy UTF-16 fallback for older dictionaries.
+- **Nullable/default: null** — `ofNull` (Variants.java:135-137) is the null primitive, consistent with the "variant must default to null" rule (spec.md:336).
+
+## One nuance worth flagging
+
+The spec (spec.md:1647) says no hash is defined for variant "because there are multiple representations for equivalent values." The code holds to this: `PhysicalType`/`Primitives` have no bucketing support for variant, and physical-type equality is bypassed — all equality/hash comparison is done at the *logical* level via `VariantPrimitive.equals/hash` (VariantPrimitive.java:61-76), `VariantObject` (VariantObject.java:63-94), and `VariantArray`. That way two differently-encoded-but-equivalent variants can compare equal logically without needing a canonical byte hash — consistent with why the spec refuses to define a bucketing hash.
+
+## Bottom line
+
+The `Variants.java` factory plus its `api/` call graph reimplement the Parquet VariantEncoding spec exactly: V1-only metadata with header/version/sorted-flag/offset-size fields, a primitive id set covering JSON plus Iceberg's extended types (date/time/timestamps/decimals/binary/uuid), self-describing object/array containers with no fixed types, little-endian storage with lazy buffer slicing for shredded reads, a shared metadata dictionary, and UTF-8 name ordering — with `core/` `ShreddedObject`/`ValueArray`/`PrimitiveWrapper` supplying the mutable in-memory wrappers and `VariantVisitor` the schema-free traversal. The one deliberate gap, matching the spec, is that variant gets no hash/bucket support and is treated as opaque bytes at Iceberg's own serialization layer.

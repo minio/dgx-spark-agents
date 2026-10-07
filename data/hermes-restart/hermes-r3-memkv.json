@@ -1,0 +1,18 @@
+{
+ "label": "memkv",
+ "wall_s": 110.9,
+ "server": {
+  "prompt_tokens_total": 1768567.0,
+  "generation_tokens_total": 4746.0,
+  "prefix_cache_hits_total": 1663744.0,
+  "external_prefix_cache_hits_total": 90368.0,
+  "time_to_first_token_seconds_sum": 18.1,
+  "time_to_first_token_seconds_count": 18.0,
+  "request_prefill_time_seconds_sum": 14.1,
+  "request_decode_time_seconds_sum": 89.0
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": ", v3 (prohibited in v4) | v2+ (must apply pre-existing ones in v4) |\n| Deletion vectors | v3+ | v3+ |\n\nVersion gating in code: writers use `formatVersion` to decide manifest behavior (e.g. SnapshotProducer.java:147, 155 branches on format version). The spec's Appendix E v2 list is what makes position/equality deletes appear together (v2 lines 39-45), and v3/v4 add DV and drop writes as above.\n\n## Compaction (rewrite)\n\nCompaction rewrites a set of data files so the rows are re-serialized into new files \u2014 which is exactly the mechanism that *materializes* deletes. `RewriteFiles` is the operation: it says \"replace these data/delete files, add these new ones\" (BaseRewriteFiles.java:48-116). The action planning (BaseRewriteDataFilesAction) reads the old files, applies the applicable deletes to drop deleted rows, and writes new files with only the survivors.\n\nTwo things matter:\n\n1. What compaction does to deletes: when it rewrites a data file, the deletes that covered it are folded into the new data \u2014 the deleted rows simply aren't written. Old data files and now-superseded delete files are removed from the snapshot. This is the exact semantics of `deleteFile(...)`/`addFile(...)` on `RewriteFiles` (BaseRewriteFiles.java:48-68). The spec calls compaction a `replace` operation and notes \"Data and delete files were added and removed without changing table data\" (Snapshot operation enum, spec line 974; code `operation()` for rewrites returns REPLACE).\n\n2. The safety rule: a rewrite must never accidentally re-introduce or drop deletes. So `RewriteFiles.validate` enforces `validateNoNewDeletesForDataFiles` \u2014 if you're replacing a data file, there must be **no new row-level deletes targeting it** that appeared after the rewrite was planned; otherwise the commit is rejected (BaseRewriteFiles.java:135-142, validate at line 140). This is why the rewrite is based on a specific `startingSnapshotId` and must be re-applied against the same lineage.\n\nSeparately, Iceberg ships a **delete-file compaction** action that rewrites/lays-out position-delete entries (and, in v3, merges position deletes into DVs) \u2014 see `RewritePositionDeletesCommitManager` and `BinPackRewritePositionDeletePlanner` (actions package). The spec mandates v3 writers merge position deletes into DVs when maintaining them (spec line 1366, Appendix E v3 line 1950-1956), so delete compaction in v3 converges old position-delete files into DVs.\n\nCitation index \u2014 spec: \u00a7Delete Formats (1356-1389), \u00a7Deletion Vectors (1375-1389), \u00a7Position Delete Files (1391-1417), \u00a7Equality Delete Files (1418-1469), \u00a7Scan Planning (1053-1098, apply rules 1075-1091), Data File Fields / content field (720, 739, 742-744), manifest content field (664, 678, 1017), snapshot operation enum (971-976), Appendix E v2/v3/v4 (1983+, 1927+, 1897+). Code: api/FileContent.java:25-27; BaseRewriteFiles.java:48-116, 135-142; data/DeleteFilter.java:90-109, 192-273; data/BaseDeleteLoader.java:100, 160, 266-284; SnapshotProducer.java:147, 155.\n",
+ "stderr": ""
+}

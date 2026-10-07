@@ -1,0 +1,25 @@
+Here are ten points for a new contributor, each pointing at where to start reading.
+
+1. Manifests are the middle layer of the metadata stack — table metadata → manifest list → manifest → data/delete files. The manifest lists the files, the manifest list summarizes the manifests. Start with the layout in the spec: format/spec.md:658-660 (Manifests), 999-1003 (Manifest Lists).
+
+2. A manifest is a valid, immutable Iceberg file whose schema is the `manifest_entry` struct: status, snapshot_id, sequence_number, file_sequence_number, and the nested `data_file`. The field ids are defined once here: api/src/main/java/org/apache/iceberg/ManifestEntry.java:51-56, and the `data_file` fields in api/.../DataFile.java:37-121.
+
+3. Entries carry a status of ADDED, EXISTING, or DELETED; DELETED is informational and never used in scans. See the status constants and `isLive()` in api/.../ManifestEntry.java:74-79 (keep reading through ~300 for the Status enum at the top of that file). Live means ADDED or EXISTING.
+
+4. The writer turns calls like `add`/`existing`/`delete` into wrapped manifest entries, reusing one entry object and copying into the appender immediately. Read it in a single pass: core/src/main/java/org/apache/iceberg/ManifestWriter.java:111-136 (addEntry) and 146-212 (add/existing/delete).
+
+5. Sequence numbers aren't known until commit, so new files write null and inherit the manifest's number from the manifest list at read time. The stand-in sentinel is `UNASSIGNED_SEQ` (ManifestWriter.java:42, 232); the validation that only ADDED can be null is in core/.../V2Metadata.java:321-336.
+
+6. A manifest stores files for exactly one partition spec, and its `partition` struct is typed from that spec (`spec.partitionType()`). Read where the schema is built per version: core/.../V2Metadata.java:245-257 (entrySchema/wrapFileSchema) and 259-279 (fileType).
+
+7. Manifest key-value metadata records schema, partition spec, spec id, format-version, and content ("data"/"deletes") in Avro metadata. Written via `.meta(...)` in each writer's newAppender: ManifestWriter.java:297-301 (V2Writer).
+
+8. Partition summaries (null/NaN flags plus min/max bounds per partition field) are accumulated while writing and stored so the manifest list can skip manifests during planning. See core/.../PartitionSummary.java:62-101 (PartitionFieldStats.update/toSummary), fed by ManifestWriter.java:127 and 241.
+
+9. Reading is the mirror image: `ManifestReader` reuses containers, so callers holding entries/files must copy them. It also assigns row IDs and filters entries. Read ManifestReader.java:267-294 (entries), 363-374 (live entries + defensive copy), and 440-474 (first_row_id assignment).
+
+10. Scans are built by `ManifestGroup`, which prunes manifests with partition summaries, reads the survivors, drops deleted entries, and builds FileScanTasks. That's the integration point for Spark and Flink. Read core/.../ManifestGroup.java:177-221 (plan/planFiles) and 393-405 (createFileScanTasks), and ManifestGroup.java:276-309 for manifest pruning.
+
+A couple of pointers to avoid surprises:
+- The entry/data_file column ids (100, 101, 102...) are hard spec requirements — change them and you break compatibility (AGENTS.md calls this out as a high-sensitivity area).
+- There are four parallel metadata classes (V1Metadata/V2Metadata/V3Metadata/V4Metadata); each has its own entrySchema/wrapper. Start with V2Metadata since it's the baseline for v2+ and the inheritance logic.

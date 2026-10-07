@@ -1,0 +1,39 @@
+I now have the full chain. Here's how query engines (Spark and Flink) use catalog commits in this repo.
+
+## The shape: engines build a `SnapshotUpdate`, then call `commit()`
+
+Query-engine writers never touch the `BaseMetastoreTableOperations` swap directly. They construct an update operation (append/overwrite/row-delta/etc.), add files, and call `operation.commit()`. That call flows through the retry loop in `SnapshotProducer.commit()` (`core/.../SnapshotProducer.java:484`), which eventually invokes `taskOps.commit(base, updated)` (`:533`) — the very `TableOperations.commit()` implemented by `BaseMetastoreTableOperations` (and hence the catalog's check-and-set swap). So the engine layer is the "writer that retries on the new current version" that spec.md:97 describes.
+
+## Spark
+
+Spark's write path lives in `SparkWrite.java` (`spark/v4.0/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java`). Each DataFrame write mode is a `BatchWrite` whose `commit(WriterCommitMessage[])` builds a table operation and commits:
+
+- **Append** — `BatchAppend.commit` builds `AppendFiles append = table.newAppend()`, appends each emitted data file, then calls `commitOperation(...)` (`SparkWrite.java:320-333`).
+- **Dynamic partition overwrite** (`INSERT OVERWRITE` on a partitioned table) — `DynamicOverwrite.commit` builds `ReplacePartitions dynamicOverwrite = table.newReplacePartitions()`, and — this is where engine isolation control meets the catalog — sets row-level conflict validation from `writeConf.isolationLevel()`: SERIALIZABLE → `validateNoConflictingData()` + `validateNoConflictingDeletes()`; SNAPSHOT → only deletes (`SparkWrite.java:346-371`). This is the "conditions required by a write to successfully commit determine the isolation level" from spec.md:99.
+- **Overwrite by filter** — `OverwriteByFilter.commit` builds `OverwriteFiles` and calls `overwriteByRowFilter(overwriteExpr)` (`SparkWrite.java:382-384`).
+- **Streaming micro-batch** — the streaming write uses `doCommit(epochId, messages)`, choosing `newAppend()` vs `newFastAppend()` (`SparkWrite.java:626-627`).
+
+All paths converge on `commitOperation` (`SparkWrite.java:231`), which sets Spark/application metadata (`:233-243`), supports **WAP (Write-Audit-Publish)** staging via `operation.stageOnly()` when `spark.wap.id` is set (`:245-250`), targets a branch with `operation.toBranch(branch)` (`:252-254`, used by Spark's branch writes / `FAST_FORWARD`), and calls `operation.commit()` with abort on failure (`:256-264`). `commit()` → `SnapshotProducer` retry loop → `ops.commit()` (`SnapshotProducer.java:533`), so a `CommitFailedException` from the catalog's swap triggers `Tasks.foreach(...).onlyRetryOn(CommitFailedException.class)` re-applying on a refreshed base (`SnapshotProducer.java:489-496`).
+
+Procedures and actions additionally drive commits the same way — e.g. `PublishChangesProcedure`, `CherrypickSnapshotProcedure`, `RollbackToSnapshotProcedure` (`SparkWrite`'s siblings under `procedures/`), plus `SparkTable` / `SparkCatalog` for refresh-on-cache (referenced in the files-only search above).
+
+## Flink
+
+Flink commits on **checkpoint boundaries** — the sink's committer operator runs at every checkpoint, which is how Flink ties its exactly-once/at-least-once semantics to Iceberg snapshots. The relevant operator is `IcebergFilesCommitter` (`flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/IcebergFilesCommitter.java`):
+
+- **Append commit** — `commitDeltaTxn` uses `AppendFiles appendFiles = table.newAppend()` for data-only results (noting "To be compatible with iceberg format V1", `:335-344`).
+- **Row delta (deletes/updates)** — when there are equality/position deletes, it iterates per-write-result and builds `RowDelta rowDelta = table.newRowDelta()` adding rows and deletes (`:361-365`). The comment there is a nice engine-specific rationale: it commits per transaction *sequentially*, not merged, "because the equality-delete files of txn2 are required to be applied to data files from txn1" (`:347-351`), and documents why retries are safe for streaming (`:354-360`).
+- **Overwrite** — `replacePartitions` builds `ReplacePartitions dynamicOverwrite` (`:313-318`) for checkpoint-driven dynamic overwrites.
+
+Every path funnels into `commitOperation(...)` (`IcebergFilesCommitter.java:370-403`), which stamps the snapshot with Flink's checkpoint id / `FLINK_JOB_ID` / `OPERATOR_ID` as snapshot properties (`:384-389`), targets a branch via `operation.toBranch(branch)` (`:390`), and calls `operation.commit()` with abort-on-failure (`:393`), then records commit-duration metrics.
+
+The checkpoint/commit lifecycle is wired through `FlinkSink` (builds the operator chain) and the per-task writers (`IcebergSinkWriter`/`IcebergStreamWriter`) that produce the `WriteResult`s the committer holds `pendingResults` for — surfaced in the earlier file search under `flink/v1.20/flink/src/main/.../sink/`.
+
+## What this tells us about engines and catalog commits
+
+- Engine-level commits are *all* funneled through the same core retry+swap machinery (`SnapshotProducer` → `TableOperations.commit` → catalog CAS), so conflict handling, `CommitFailedException` re-base-and-retry, and ambiguous-failure resolution are inherited uniformly (the failure modes from the previous section apply here).
+- Isolation is chosen per-write at the engine layer (Spark's `validateNoConflictingData/Deletes`) and enforced by the catalog's atomic swap — matching the spec's "writers can select what to validate."
+- Staging-style features (Spark WAP `stageOnly`, branch targeting in both engines) map directly onto the metadata model of staged snapshots and snapshot references (spec.md:1101-1132), with the actual pointer move still being one catalog commit.
+- Flink's model differs architecturally: commits are decoupled from task completion and driven by checkpoints, so the catalog commit is the durability/fencing point for Flink's exactly-once guarantees — which is why the commit failure path must surface retry/ambiguity correctly (the `CommitStateUnknownException` handling in `SnapshotProducer.java:536`).
+
+Want me to trace one specific engine path end-to-end (e.g. Spark `INSERT OVERWRITE` → `ReplacePartitions` → `SnapshotProducer` → catalog CAS), including where the engine maps its input DataFrame to the `DataFile`s handed to `commit`?

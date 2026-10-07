@@ -1,0 +1,68 @@
+I've now read TableMetadataParser.java in full, plus the collaborators it delegates to for table metadata: SnapshotParser.java, and the constants in TableMetadata.java (with the schema/partition/sort-order/snapshot-ref/stats/encryption parsers each being entered from TableMetadataParser). Here's how the Java implementation follows the spec, with citations.
+
+## The metadata file is a JSON object (spec: "Table metadata is stored as JSON")
+
+`toJson` opens the object and the reader asserts the node is an object before parsing:
+
+- TableMetadataParser.java:166 `generator.writeStartObject()` — top-level JSON object, matching Appendix C's "Table metadata is serialized as a JSON object."
+- :342-343 `node.isObject()`, "Cannot parse metadata from a non-object."
+
+## Field-by-field, the parser mirrors the spec's Table Metadata Fields tables
+
+The JSON key constants (TableMetadataParser.java:88-115) are exactly the spec's kebab-case field names (AGENTS convention: kebab-case JSON keys). The v1-v3 vs v4 requirement differences are handled explicitly:
+
+- **format-version** — written at :168; on read it is fetched first and validated against the supported version: :345-349 `formatVersion <= TableMetadata.SUPPORTED_TABLE_FORMAT_VERSION` ("Cannot read unsupported version"), matching spec "Implementations must throw an exception if a table's version is higher than the supported version." `SUPPORTED_TABLE_FORMAT_VERSION = 4` (TableMetadata.java:58), and v4 is the spec's in-development version.
+- **table-uuid** — written :169, read :351 `JsonUtil.getStringOrNull(TABLE_UUID, ...)`. The spec marks `table-uuid` _optional_ in v1 but _required_ in v2+. (Reader is lenient here as permitted by the spec's note that metadata JSON readers "may be more strict" — it stays permissive for older/odd files.)
+- **location** — written only when non-null :170-172 (spec: optional fields only written when present). Read with the v4 change honored: TableMetadataParser.java:353-356
+```
+formatVersion >= TableMetadata.MIN_FORMAT_VERSION_OPTIONAL_LOCATION
+```
+If v4+ it reads `getStringOrNull` (location optional), else `getString` (required), matching the spec's "location is required in v1-v3 but optional in v4." `MIN_FORMAT_VERSION_OPTIONAL_LOCATION = 4` (TableMetadata.java:61).
+- **last-sequence-number** — written only for `formatVersion() > 1` :173-175; on read defaults to `INITIAL_SEQUENCE_NUMBER` (0) for v1 :357-362. This exactly matches Appendix E v2: "default to 0 when reading v1 metadata."
+- **last-updated-ms**, **last-column-id** — written :176-177, read as required longs :363, :489, matching the spec's _required_ status in all versions.
+
+### Schema handling mirrors v1 vs v2+ (Appendix C / Table Metadata)
+
+- Writes the legacy single `schema` only for v1, comment at :179-185 ("only needed for v1 because support for schemas and current-schema-id is required in v2 and later"), then always writes `current-schema-id` + `schemas` array :188-193. This is exactly the spec's v1 `schema` (deprecated) vs the `schemas`/`current-schema-id` list design.
+- On read :369-402: if `schemas` array present, it requires `current-schema-id` and picks the matching schema (:374-391); if absent, it forces `formatVersion == 1` (:396-397) and reads the single `schema` field. Matches the spec's requirement that `schemas`+`current-schema-id` are required in v2+.
+
+### Partition specs — same dual-format pattern
+
+- Writes legacy `partition-spec` (as fields, `PartitionSpecParser.toJsonFields`) only for v1 :196-199, then always writes `default-spec-id` + `partition-specs` array :202-207. Spec: v1 `partition-spec` deprecated, v2+ uses `partition-specs`+`default-spec-id`.
+- On read :404-436: if the array exists it requires `default-spec-id` and binds each spec (notably binding only the default against the schema strictly, others `bindUnchecked` :417-420); if absent it requires v1 and uses the single `partition-spec`, defaulting `defaultSpecId = INITIAL_SPEC_ID` (0) :431. `last-partition-id` is derived if missing (v1) :438-446 — spec: used to ensure unused IDs when evolving specs.
+
+### Sort orders, properties, snapshot id, row id, keys, refs
+
+- **sort-orders** / **default-sort-order-id** written :212-217, read :450-466 with v1 fallback to `SortOrder.unsorted()` (order id 0 — the spec's reserved unsorted id).
+- **properties** written via `writeStringMap` :220, read as empty map when absent :468-474 (spec: optional).
+- **current-snapshot-id** written at :222-230 with two distinct encodings: writes JSON `null` for v3+ when no current snapshot, but `-1L` for v1/v2 (`MIN_NULL_CURRENT_SNAPSHOT_VERSION = 3`, :116). This directly implements Appendix F "Assignment of Snapshot IDs": "Java writes -1 for 'no current snapshot' with V1 and V2... and will use null for... version greater than or equal to V3." On read :476-480 it normalizes to `-1L` internally.
+- **next-row-id** written only for `formatVersion() >= 3` :232-234, read only for v3+ else `INITIAL_ROW_ID` (0) :482-487 — spec: `next-row-id` is the v3+ row-lineage field, plus "next-row-id is initialized to 0" on v3 upgrade (Appendix E v3).
+- **encryption-keys** written only when non-empty :236-242, read as empty when absent :491-496 (spec: optional v3 field).
+- **refs** written via `toJson(metadata.refs(), generator)` :244 / :285-293; on read, `refs` is parsed if present, otherwise a `main` branch is synthesized pointing at the current snapshot :498-508 — matching the spec's "always a main branch reference pointing to the current-snapshot-id even if the refs map is null."
+
+### Snapshots are embedded in the JSON (spec: "Snapshots are not serialized separately")
+
+`SNAPSHOTS` is written as an array inline in the metadata object (:246-250), and read likewise (:510-523), delegating each element to `SnapshotParser.fromJson`. Within the snapshot (SnapshotParser.java), the design follows the spec's Snapshot Fields table and the sequence-number/version rules:
+
+- `sequence-number` only written when > 0 (:60-62) and defaults to `INITIAL_SEQUENCE_NUMBER` on read (:128-131) — Appendix E v2 "sequence-number ... default to 0 when reading v1 metadata."
+- `manifest-list` is written when present; otherwise for v1 it embeds the v1 `manifests` list (:85-95, SnapshotParser.java:85-95) — spec: `manifest-list` required v2+, `manifests` must be omitted if `manifest-list` present, and is the v1-only fallback. Reading branches on `MANIFEST_LIST` vs embedded `MANIFESTS` (:179-207), mirroring spec.
+- v3 row-lineage snapshot fields `first-row-id` and `added-rows` written/read only if non-null (:102-108, :174-175).
+- `summary.operation` is handled as required within the summary map, defaulting to a fallback on read for robustness (:153-168) — spec makes `operation` required in the summary.
+
+### Statistics and partition statistics
+
+Written as arrays (:252-262) and read only when present (:525-537), delegating to `StatisticsFileParser` / `PartitionStatisticsFileParser`. Matches spec's optional `statistics` and `partition-statistics` lists.
+
+### The logs
+
+`snapshot-log` and `metadata-log` arrays are written (:264-280) and parsed (:539-561) — spec's optional fields encoding histories for time travel and GC, with `metadata-log` entries holding `timestamp-ms` + `metadata-file` (:276-277, :556-559; spec Appendix C).
+
+## Atomic commit / optimistic concurrency
+
+TableMetadataParser itself only reads/writes bytes; the linear-history and atomic-swap semantics live in the `TableOperations` implementations the parser feeds (`BaseMetastoreTableOperations`, and the deprecated `HadoopTableOperations`), which the spec explicitly leaves unstandardized. The parser's contribution to the model is that the `fromJson` result is constructed as a fully self-contained immutable `TableMetadata` (TableMetadataParser.java:563-589) — a new immutable snapshot-point of state, consistent with the spec's "Each table metadata change creates a new table metadata file" and the immutable-metadata pattern in AGENTS.md.
+
+## Notable strictness/leniency choices
+
+- The parser is lenient on v1 single-field forms and defaulting (`schema`/`partition-spec` only allowed for v1, `last-sequence-number`/`sequence-number` default to 0), but strict on v2+ required fields (e.g. forcing `formatVersion == 1` when `schemas`/`partition-specs`/`sort-orders` are absent). This matches the spec's two-tier rule: readers may be strict for metadata JSON (it always matches the table's version) while remaining permissive enough to read upgraded v1 files.
+
+One caveat on scope: I read TableMetadataParser and SnapshotParser in full and the TableMetadata constants; the deeper schema/partition/sort/stats/encryption parsers are entered by reference here. I didn't exhaustively trace those implementations, but the delegation points and their v1/v2 field requirements line up with the spec as described.

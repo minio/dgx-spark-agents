@@ -1,0 +1,42 @@
+I have the full picture — Flink's write path, the shared core machinery, and Spark's read path. Here's how the engines use equality deletes.
+
+THE CORE MACHINERY BOTH ENGINES SHARE
+Equality deletes are produced/consumed through core, not engine-specific code:
+- Write: `core/.../io/BaseTaskWriter.java` has `BaseEqualityDeltaWriter` (line 179). It maintains a `RollingEqDeleteWriter` (line 184/213) that wraps `EqualityDeleteWriter` and calls `writerFactory.newEqualityDeleteWriter(...)` (line 507-513), with `RollingEqDeleteWriter.complete` adding the result to `completedDeleteFiles` (line 526-528).
+- Read/apply: `data/.../DeleteFilter.java` is how a row stream gets filtered. `applyEqDeletes()` (line 192-225) groups delete files by their `equalityFieldIds()` (line 205), projects each record onto that delete schema (`projectRow`, line 216), and tests membership in a `StructLikeSet` loaded via `deleteLoader().loadEqualityDeletes` (line 218-220). The matches are OR-combined (line 229, 239), and `eqDeletedRowFilter()` (line 249-255) exposes the negated version used by the vectorized reader. Note it also forces the equality ids into the scan projection (line 297-299), so the delete columns are always present to match against.
+
+FLINK — UPSERT/PRIMARY-KEY DELTA WRITES (the main producer)
+Flink is an equality-delete *writer*. Configured by `FlinkWriteOptions.WRITE_UPSERT_ENABLED` ("upsert-enabled", FlinkWriteOptions.java:57-59) and the table's equality/primary-key fields, all flowing into `RowDataTaskWriterFactory`:
+- It builds a `FlinkFileWriterFactory` with the equality field ids and a delete row schema (RowDataTaskWriterFactory.java:140-149).
+- It decides at runtime whether to use deletion vectors instead: `useDv = formatVersion(table) > 2` (RowDataTaskWriterFactory.java:175). So on v2 tables Flink *must* write equality deletes; on v3+ it prefers DVs.
+- `create()` returns a `UnpartitionedDeltaWriter` or `PartitionedDeltaWriter` (RowDataTaskWriterFactory.java:216-242), both `BaseDeltaTaskWriter` (flink/.../BaseDeltaTaskWriter.java:42) that internally subclass the core `BaseEqualityDeltaWriter`.
+
+The delta task writer maps change-stream row kinds to deletes (BaseDeltaTaskWriter.java:84-106):
+- INSERT / UPDATE_AFTER: if upsert, it first emits a delete for the old row key (`writer.deleteKey(...)`, line 88) then writes the new row (line 90).
+- UPDATE_BEFORE: skipped entirely in upsert mode (line 93-97) to avoid double-deleting.
+- DELETE: deletes by key (upsert, line 101-102) or by full row (line 104).
+
+The delete is then executed by the core `BaseEqualityDeltaWriter`:
+- `deleteKey(T)` projects just the equality columns and writes them into the equality-delete file (BaseTaskWriter.java:303-307).
+- But first it checks an in-memory `insertedRowMap` of rows already written in THIS task (a `StructLikeMap` keyed on the equality fields, BaseTaskWriter.java:218). If the key is present, it removes it and emits a *position* delete instead (line 304 → `internalPosDelete`, line 273-283). This is a correctness optimization: a row being updated in the same commit doesn't need a value-based delete that would be blocked by the strict-< sequence rule; a positional delete targets it directly.
+
+Keying is slotted correctly across parallelism: `EqualityFieldKeySelector` shuffles records by the hash of their equality columns (EqualityFieldKeySelector.java:81-87), "to ensure same equality fields record will be emitted to same writer in order" (class doc, line 33). Without this, two writers could see the same key and only one would generate the delete.
+
+Schema choice for the delete file depends on mode:
+- Upsert: only the equality id columns are written (`equalityDeleteRowSchema` = `TypeUtil.select(schema, equalityFieldIds)`, RowDataTaskWriterFactory.java:147; commented rationale at 135-139), because the inserted row's other columns may already differ from the deleted row.
+- Non-upsert (full delta): the whole schema is the delete row schema (RowDataTaskWriterFactory.java:158), i.e. the "delete by full prior row" mode.
+
+Flink also has a maintenance path that *consumes/rewrites* equality deletes — `EqualityConvertPlanner`/`EqualityConvertReader`/`EqualityDeleteFileScanTask` (flink/.../maintenance/operator/) and a `ConvertEqualityDeletesConfig` gated by `CONVERT_EQUALITY_DELETES_ENABLE` ("convert-equality-deletes.enabled", FlinkWriteOptions.java:102-105). This is the v2-era workstation that converts equality deletes into cheaper deletes — the practical acknowledgment of the apply-cost that eventually led to the v4 prohibition.
+
+SPARK — READS AND APPLIES EQUALITY DELETES (the main consumer)
+Spark is primarily an equality-delete *reader*:
+- The plan-time index (`core/.../DeleteFileIndex.java`) already scoped and pruned the delete files (case EQUALITY_DELETES at line 550; global vs per-partition routing at 603-610; strict-< sequence at 881).
+- At read time, Spark uses the shared `DeleteFilter`/`Deletes` machinery. In `BaseBatchReader.next()` (spark/v3.5/.../BaseBatchReader.java:161-163), if `deletes.hasEqDeletes()`, it strips the extra equality-delete columns from the output via `ColumnarBatchUtil.removeExtraColumns`. Row filtering is done in `ColumnarBatchUtil.buildRowIdMapping`/`buildIsDeleted` (ColumnarBatchUtil.java:77-93, 161-169), each consulting `deletes.eqDeletedRowFilter()` (ColumnarBatchUtil.java:77, 161) — the equality-match predicate from `DeleteFilter.java:249-255`.
+- When rewriting deletes to DVs, `shouldRewrite` deliberately excludes equality deletes: for DVs it only rewrites non-equality deletes (`return deleteFile.content() != FileContent.EQUALITY_DELETES`, SparkBatchQueryScan.java:185-188). So Spark does not fold equality deletes into deletion vectors — they stay value-based and are applied by the `DeleteFilter` path.
+
+Spark also *produces* them in its own delta/rewrite writers — `SparkFileWriterFactory` configures an `equalityDeleteRowSchema` (SparkFileWriterFactory.java:135-136, validated at 156-157) and the `WritersBenchmark`/`IcebergSourceDeleteBenchmark` exercise `writeEqDeletes(...).equalityDeleteRowSchema(...)` — but the production write path is the Flink-style `BaseEqualityDeltaWriter`, which Spark's positional delta writers also use.
+
+SUMMARY OF WHO USES IT AND HOW
+- Flink: writes equality deletes for upsert/primary-key updates on v2 tables (falls back to DVs on v3+). Shuffles by equality key, deletes by projected key, avoids same-commit self-deletes with position deletes. Also runs a maintenance job to convert them away.
+- Spark: reads and applies them through the shared `DeleteFilter` (equality-set membership on projected delete columns), preserves them when rewriting to DVs, and can produce them in its writer factory.
+- Both rely on the same core contract: delete files carry `equality_ids`, application is value-equality against a `StructLikeSet` (null = null), and plan-time scope/sequence rules are enforced in `DeleteFileIndex` before either engine's reader is ever handed a delete file.

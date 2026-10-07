@@ -1,0 +1,6 @@
+# The agent image plus a read-only copy of Apache Iceberg (commit c24eeea) at /data/iceberg.
+FROM spark-agents:openclaw-2026.9.8
+USER root
+COPY --chown=root:root iceberg /data/iceberg
+RUN chmod -R a-w /data/iceberg
+USER sandbox

@@ -1,0 +1,75 @@
+Here's a failure-mode survey of the JDBC catalog, grouped by category. Every guard cites the code; I've also flagged the gaps where the code does *not* protect you.
+
+## 1. Concurrent writes on the same table (the core risk)
+
+**Lost-update / two writers, one base version.** The whole defense is the check-and-put: the commit `UPDATE` only flips the pointer when the row still points at the base version —
+`WHERE ... AND metadata_location = ?` (SQL at JdbcUtil.java:111-127; executed in JdbcTableOperations.java:146-162). Exactly 1 row affected = you won; 0 rows = someone else committed → `CommitFailedException` (JdbcTableOperations.java:157-162). Because the update is a single atomic SQL statement against the pointer row, concurrent writers can't both succeed.
+
+**Stale base metadata entering the commit.** `BaseMetastoreTableOperations.commit` rejects `base != current()` up front (`CommitFailedException`: "Cannot commit: stale table metadata", BaseMetastoreTableOperations.java:111-119), and `doCommit` re-checks against the freshly loaded row via `validateMetadataLocation` (JdbcTableOperations.java:200-209), which throws `CommitFailedException` if the DB location no longer equals the base's location. The `WHERE metadata_location = ?` is then a second, atomic re-check even if the row changed between the load and the update — a defense-in-depth against the spec's "metadata location has changed" condition (spec.md:1342).
+
+**What's NOT guarded:** the retry after a failed swap is *not* in these files. `updateTable` throws and stops (JdbcTableOperations.java:160-162); re-apply is left to an upper transaction layer. So a transient race surfaces as a `CommitFailedException` the caller must retry — detection, not recovery.
+
+## 2. Table lifecycle races (create / drop / rename / unregister)
+
+**Double-create.** Same name created concurrently, or a create against an existing row. Two guards:
+- Pre-check `JdbcUtil.tableExists` → `AlreadyExistsException` (JdbcTableOperations.java:179-181).
+- The DB primary key `(catalog_name, namespace, name)` (JdbcUtil.java:142-148) makes the INSERT fail atomically on the second writer; `JdbcUtil.isConstraintViolation` (JdbcUtil.java:531-535) maps that SQLSTATE/message to `AlreadyExistsException` (JdbcTableOperations.java:131-136).
+
+**Table dropped by another process while a reader refreshes.** `doRefresh` distinguishes two cases (JdbcTableOperations.java:83-92): if the row vanished but we'd already loaded a location, it throws `NoSuchTableException` ("dropped by another process"); if we'd never loaded one, it calls `disableRefresh()` and returns, so we don't error on a table that was never seen.
+
+**Drop vs. commit interleaving.** If a `DELETE` removes the row between a writer's load and its `UPDATE`, the pointer swap affects 0 rows → `CommitFailedException` (JdbcTableOperations.java:146-162). The drop itself is guarded by the affected-row count: 0 rows means the table didn't exist, and `dropTable` returns `false` instead of erroring (JdbcCatalog.java:362-365).
+
+**Unregister race.** `unregisterTable` must not detach a pointer that has moved. It drops only if the metadata still matches: `V0_UNREGISTER_TABLE_SQL = V0_DROP_TABLE_SQL AND metadata_location = ?` (JdbcUtil.java:336-337), invoked in `dropTableIfMetadataMatches` (JdbcCatalog.java:326-336); on mismatch it throws `CommitFailedException` (JdbcCatalog.java:315-319).
+
+**Rename onto an existing table.** Pre-check → `AlreadyExistsException` (JdbcCatalog.java:410-412), *and* a constraint-violation handler on the update itself (JdbcCatalog.java:414-419). Table↔view name clash in V1 is also pre-checked (JdbcCatalog.java:406-408).
+
+**Rename hitting 0 rows** (source gone between check and update) → `NoSuchTableException` (JdbcCatalog.java:432-433). A rename affecting >1 row signals a corrupted catalog table (Primary key assumption violated); the code only logs a warning, it does not roll back (JdbcCatalog.java:434-438).
+
+## 3. Namespace handling
+
+**Duplicate `createNamespace`.** Pre-check throws `AlreadyExistsException` (JdbcCatalog.java:453-454). Note the gap: `createNamespace` → `insertProperties` does *not* map the PK-constraint SQLState the way table create does (JdbcCatalog.java:878-898), so a true concurrent double-create surfaces as `UncheckedSQLException`, not `AlreadyExistsException`.
+
+**Dropping a non-empty namespace.** `dropNamespace` checks child namespaces, tables, and (V1) views and throws `NamespaceNotEmptyException` (JdbcCatalog.java:579-611).
+
+**Wildcard: namespace names containing `%`/`_`.** Lookups escape LIKE metacharacters with `!` (`namespaceExists`, JdbcUtil.java:799-800), and `listNamespaces` explicitly filters out fuzzy matches from a namespace that itself contains `%` or `_` (JdbcCatalog.java:538-547). This prevents a namespace string from being interpreted as a SQL pattern.
+
+**Creating a table in a namespace that doesn't exist.** Guarded *only* in strict mode: `jdbc.strict-mode=true` triggers a `NoSuchNamespaceException` (JdbcUtil.java:41, JdbcTableOperations.java:167-172). **Gap:** strict mode is off by default, so a table can be written into a non-existent namespace without complaint — by design, but if you want the invariant enforced you must set the property.
+
+**Partial property writes.** `insertProperties` / `updateProperties` validate the affected-row count equals the requested size and throw `IllegalStateException` otherwise (JdbcCatalog.java:886-897, 910-921), catching a half-applied batch.
+
+## 4. Connectivity and transient failures
+
+**Timeouts / connection failures / data truncation.** Explicit SQL exception mapping in `JdbcCatalog.initialize` and `updateSchemaIfRequired` (`SQLTimeoutException`, `SQLTransientConnectionException`, `SQLNonTransientConnectionException` → `UncheckedSQLException`, JdbcCatalog.java:225-234, 266-275), and in `doCommit` (`DataTruncation`, `SQLWarning`, connection errors, JdbcTableOperations.java:122-139).
+
+**Transient / deadlock serialization failures.** `JdbcClientPool` is built on `ClientPoolImpl` (JdbcClientPool.java:35, 69) and marks generic connection-failed SQLSTATEs (`08000/08003/08006/08007`) plus deadlock-serialization `40001` as retryable (JdbcClientPool.java:50-51, 110-114); it reconnects by closing and building a new client (JdbcClientPool.java:94-98). So transient DB hiccups are retried rather than surfacing as corruption.
+
+**Metadata file not yet visible (eventual consistency).** `refreshFromMetadataLocation` reads with exponential backoff and `stopRetryOn(NotFoundException)` (BaseMetastoreTableOperations.java:194-200), tolerating transient 404s from object stores.
+
+**Interrupted threads.** `InterruptedException` is re-armed (`Thread.currentThread().interrupt()`) and wrapped in `UncheckedInterruptedException` in every path (e.g., JdbcCatalog.java:231-233, 272-274, 819-821; JdbcTableOperations.java:140-142).
+
+## 5. Table identity / metadata integrity
+
+**Pointed at a different table's metadata.** After refresh, `BaseMetastoreTableOperations` verifies the table's `uuid` still matches (BaseMetastoreTableOperations.java:202-209), catching the case where a table was dropped and a *different* table now occupies the same name/location.
+
+**Metadata location null / malformed row.** `doRefresh` enforces a non-null location with `Preconditions.checkState` (JdbcTableOperations.java:95-98).
+
+**Same warehouse location for distinct tables.** `LocationUtil.tableLocation(table, uniqueTableLocation)` (JdbcCatalog.java:299-302, driven by `uniqueTableLocation` at JdbcCatalog.java:128-132) appends unique components so two tables don't collide and stale metadata from a retried create isn't clobbered.
+
+**Metadata file write collisions / S3 negative caching.** New metadata is written to a UUID-named file with `overwrite` (BaseMetastoreTableOperations.java:155-165) — the "unique file" the spec's metastore scheme requires (spec.md:1344).
+
+## 6. Initialization robustness
+
+**Catalog tables missing or concurrently created.** `initializeCatalogTables` (JdbcCatalog.java:213-235) creates `iceberg_tables` and `iceberg_namespace_properties` if absent, and `atomicCreateTable` tolerates another process/thread creating the table first (it re-checks existence and proceeds, JdbcCatalog.java:195-208). It also accounts for DBs that force identifiers to uppercase by testing both casings (JdbcCatalog.java:176-193).
+
+**View column absent when view support is off.** `updateSchemaIfRequired` detects whether the `iceberg_type` column exists; if it's absent and the user set `jdbc.schema-version=V1` it auto-migrates (JdbcUtil.java:150-151), otherwise it logs the "view support" warning (JdbcCatalog.java:237-276, 86-87). Every view operation is then gated on `schemaVersion == V1` and throws `UnsupportedOperationException` otherwise (JdbcCatalog.java:291-296, 692-694, 724-728, 744-747).
+
+## Gaps worth knowing about (where the code does NOT defend)
+
+- **No commit retry inside the catalog** — a failed check-and-put is surfaced as `CommitFailedException`; recovery is the caller's job (JdbcTableOperations.java:157-162; BaseMetastoreTableOperations.java:111-119).
+- **Namespace existence is optional by default** (non-strict mode), so dangling tables are possible (JdbcTableOperations.java:167-172).
+- **`createNamespace` race** returns `UncheckedSQLException` rather than `AlreadyExistsException` (JdbcCatalog.java:878-898).
+- **Rename PK-violation** is only warned on, never aborted (JdbcCatalog.java:434-438).
+- **Vendor-specific SQL** (the `LIMIT 1` in `GET_NAMESPACE_SQL`, JdbcUtil.java:338-351; `LIKE ... ESCAPE '!'`; primary-key semantics) means behavior is DB-dependent — portability across engines is a real risk, mitigated only by the retryable-SQLSTATE abstraction in `JdbcClientPool` (JdbcClientPool.java:50-51).
+- **Case-sensitivity / folding** is only special-cased for table existence during *initialization* (JdbcCatalog.java:191-193); normal lookups assume the DB preserves case.
+
+The strongest protections (atomic pointer swap, stale-base rejection, PK-enforced create, constraint-to-`AlreadyExistsException` mapping, UUID verification, backoff-on-404) all map directly to the spec's optimistic-concurrency / check-and-put contract — which is why the error surface is dominated by `CommitFailedException` and `AlreadyExistsException` rather than corruption. The main structural risk is that the code detects contention but defers true retry to upstream callers.

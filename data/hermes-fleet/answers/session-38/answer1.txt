@@ -1,0 +1,38 @@
+I read the full spec (2153 lines). Here's what it says about default values and the reasoning behind the design.
+
+## What the spec says (the "Default values" section, lines 325-349)
+
+Default values are a v3 feature. They're tracked on **struct fields** (both nested structs and the top-level schema's struct), and each field carries up to two defaults:
+
+- **`initial-default`** — fills in the field's value for *every record written before the field was added to the schema*. It's set once when a field is added, and *cannot change* afterward.
+- **`write-default`** — fills in the field's value for *any record written after the field was added*, when the writer doesn't supply a value. It starts equal to `initial-default` and *can be changed* through schema evolution.
+
+Key rules:
+
+- If neither default is set on an optional field, the default is `null` (for backward compat with older specs).
+- `unknown`, `variant`, `geometry`, `geography` columns must default to null; a non-null default on those is invalid.
+- On write, **all known fields must be written** to the data files — omitting a known field is never allowed. If a writer doesn't supply a field, it must use the write-default; if a required field has no write-default, the writer must fail.
+- Nested-struct defaults are shallow: a struct field's default is either `null` or a non-null struct with *no field values*, and the effective value is built by pulling each sub-field's own default. The example (a `point{x,y}` column) shows how `{}` vs `null` on the parent interacts with `x`/`y` defaults.
+- Validation during schema evolution (lines 389-397): `initial-default` set at add time and immutable; `write-default` set at add time and mutable; required fields get non-null defaults; optional fields may have null defaults; missing sub-field values in the parent's default fall back to that sub-field's own default.
+
+**Column projection** ties in (lines 399-410): when a field id isn't present in a data file, the reader resolves values in this order — (1) the partition value if there's an identity transform, (2) name-mapping, (3) the `initial-default`, (4) `null`. So the initial-default is the real "behavior for old rows"; it's what the reader materializes for rows that predate the column.
+
+Serialization: defaults are field attributes in the JSON schema (Appendix C), encoded using the JSON single-value serialization (Appendix D). The spec's v3 forward-compat note (lines 1929-1932) is telling: old readers read a `write-default`-only table by *failing* on the missing field, and read an `initial-default` table correctly only if the default is null for optional fields — otherwise they default to null (or fail on required fields).
+
+## Why it's designed that way
+
+The design is fundamentally a compromise on **"SQL default value behavior without rewriting data files"** (line 334), and every rule follows from Iceberg's immutable-files architecture.
+
+1. **Two defaults = correctness for two different populations of rows.** SQL's `ALTER TABLE ADD COLUMN ... DEFAULT x` semantics say existing rows all appear to have `x`. In Iceberg, you can't rewrite existing data files, and the schema (which carries defaults) isn't stored per-row. So `initial-default` makes the *reader* synthesize the value for old rows, giving SQL semantics without touching files. But a blanket "existing rows = x" would freeze the default forever: if you later change the default to `y`, you don't want old rows to start reading as `y`. Hence a separate, mutable `write-default` for new writes only. Two defaults let you change behavior for future rows independently of how past rows are interpreted.
+
+2. **`initial-default` immutable, `write-default` mutable** (lines 391-393) enforces that split. Changing the initial default would change the meaning of historical rows retroactively.
+
+3. **"All columns must be written" + write-default is a write-time-only rule** (line 334) keeps the data files self-contained and consistent. The spec repeatedly emphasizes writing all columns "provides a backup in case of corruption or bugs in the metadata layer" (line 184) — the same principle. Because the write-default affects only what gets physically written going forward, it's a forward-compatible change.
+
+4. **Required fields must have non-null defaults; optional default to null** preserves Iceberg's nullability contract. A required column can't silently be null, so there must be a concrete default; optional columns fall back to the pre-existing behavior (null), which is why old readers can still read them.
+
+5. **Shallow nested-struct defaults** (lines 338-347) avoid duplication and ID drift. Storing full nested default values at every level would duplicate state and risk divergence. Instead each field owns its own default, and the parent's default is just `null`/`{}` — the effective value is composed from sub-field defaults at read time. The table on lines 342-347 demonstrates this composition.
+
+6. **`unknown`/`variant`/geo types must default to null** (line 336) because those types have no meaningful or stable literal default.
+
+The overarching intent, stated plainly at line 334 and again in Appendix E, is: give users the ergonomics of SQL defaults (adding a column with a value visible to all existing rows) while preserving Iceberg's zero-rewrite, immutable-file model. The `initial-default` handles the historical rows at read time, the `write-default` handles forward rows at write time, and the strictness about writing all columns keeps the metadata layer from becoming the sole source of truth for data.

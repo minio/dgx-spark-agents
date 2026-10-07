@@ -1,0 +1,47 @@
+I've traced the Spark and Flink integrations. A key finding: **the query engines themselves contain almost no encryption logic** — they inherit it from core via the `Table.encryption()` manager, which is wrapped into the `FileIO`. Here's how it works, with citations.
+
+## The central mechanism: `EncryptingFileIO` (in `api/`)
+
+Encryption is injected into engine I/O at the `FileIO` boundary, not into engine row code. `EncryptingFileIO.combine(io, em)` (api/.../encryption/EncryptingFileIO.java:44-61) wraps the engine's plain `FileIO` with the table's `EncryptionManager`. Its three template decryption methods flow the per-file `key_metadata` into the manager:
+- `bulkDecrypt(...)` EncryptingFileIO.java:71-90 — batches all referenced files, wraps each file that has `keyMetadata()` (else passes it through as plaintext), and calls `em.decrypt(...)` in one batch to cut KMS round-trips.
+- `newDecryptingInputFile(path, length, buffer)` EncryptingFileIO.java:147-149 — single-file decrypt; used for data/delete files by `newInputFile(ContentFile)` EncryptingFileIO.java:116-122 and for manifests EncryptingFileIO.java:125-131.
+- `newInputFile(ManifestListFile)` EncryptingFileIO.java:134-141 — this is where the spec's snapshot `key-id` is used: if `manifestList.encryptionKeyID() != null` it calls `manifestList.decryptKeyMetadata(em)` (unwraps via KMS), then decrypts the list.
+- Write side: `newEncryptingOutputFile(path)` EncryptingFileIO.java:156-159 delegates to `em.encrypt(...)`.
+
+The decryption path itself (the `em.decrypt` → `Ciphers.AesGcmDecryptor` → `AEADBadTagException` handling) is all in core, shared by every engine (see the previous answer).
+
+## Spark
+
+Spark's readers pick this up at construction. In `BaseReader` (spark/.../source/BaseReader.java):
+- The constructor builds `this.fileIO = EncryptingFileIO.combine(fileIO, table().encryption())` at line 94 — so every Spark reader's I/O is encryption-aware from the start.
+- Actual file materialization is deferred and batched: `inputFiles()` calls `fileIO.bulkDecrypt(...)` at lines 184-192, so a task group's data + delete files are decrypted in one batched KMS operation (same batching design as the earlier `InputFilesDecryptor`).
+- The `SparkDeleteFilter` (lines 203-258) reads delete files through `getInputFile` (line 220-222) → `BaseReader.this.getInputFile` → the decrypted `inputFiles()` map, so encrypted delete files decrypt through the same path.
+
+Other Spark touchpoints that rely on the same manager:
+- `SparkPositionDeltaWrite.java:528-532` — builds an `EncryptingFileIO.combine(table.io(), table.encryption())` to read encrypted delete files during delete loading.
+- `RewriteManifestsSparkAction.java:593-597` — writes rewritten manifests through `table.encryption().encrypt(rawOutputFile)`, so manifest rewrites of encrypted tables stay encrypted (this is exactly what the `TestTableEncryption` test exercises).
+
+End-to-end in tests, `spark/.../sql/TestTableEncryption.java`:
+- A table is created as v3 with `'encryption.key-id'=<kms key>` and the catalog's KMS impl set to `UnitestKMS` (lines 49, 64-70).
+- Data is inserted (line 72) and `SparkActions.rewriteManifests(table)` is run (line 88). The test asserts the rewritten manifests are still readable (lines 90+), i.e. that Spark's engine actions decrypt/encrypt through the manager correctly.
+- This confirms the engine's role: it supplies a KMS-backed catalog config and runs normal SQL/actions, and encryption is transparently handled by the `Table.encryption()`/`EncryptingFileIO` plumbing — no engine row-level crypto.
+
+## Flink
+
+Flink reads use the same pattern but instantiate the decryptor directly:
+- `FlinkInputFormat` holds an `EncryptionManager encryption` (FlinkInputFormat.java:47) passed in by the table source, and inside `open(split)` builds `new DataIterator<>(rowDataReader, split.getTask(), io, encryption)` (FlinkInputFormat.java:117).
+- `DataIterator` wires it into `new InputFilesDecryptor(task, io, encryption)` (DataIterator.java:52-59) — the same core batched-decryptor class I covered earlier. Then `DataTaskReader.open(task, inputFilesDecryptor)` (DataTaskReader.java:40-44) reads rows from the already-decrypted inputs. So Flink sources decrypt via the shared core `InputFilesDecryptor` for every Flink version.
+- The maintenance/rewrite paths also pass `table.encryption()` through, e.g. `DataFileRewriteRunner.java:219-221` and `RewriteDataFilesAction.java:56-58` (construction via `RowDataRewriter` with `encryptionManager()`), and Flink's `DataFileRewriteRunner` even constructs an `InputFilesDecryptor` from `table.io()` + `table.encryption()` directly.
+- Flink has no equivalent of the `TestTableEncryption` Spark test surfaced in the search; it relies on the same `InputFilesDecryptor`/`EncryptionManager` core.
+
+## Serialization / distribution to executors
+
+Because a table reference travels to executors/TaskManagers, the `EncryptionManager` must be serializable. `SerializableTable` (core/.../SerializableTable.java:42-45) documents that the embedded `FileIO`, `EncryptionManager`, and `LocationProvider` must be serializable (e.g. Kryo/Java serialization), which is what lets the driver's KMS-configured manager reach Spark executors and Flink task managers so decryption happens where files are read.
+
+## Summary of the split of responsibility
+
+- Core (`EncryptionManager` hierarchy, `AesGcm*`, `Ciphers`, `KeyManagementClient`, `TableMetadata`/snapshot `key-id` handling, `EncryptedKeyParser`) does all crypto and key management.
+- `EncryptingFileIO` (api/) is the single integration seam — both engines funnel every file through it.
+- The engine code (Spark `BaseReader`, `RewriteManifestsSparkAction`, `SparkPositionDeltaWrite`; Flink `FlinkInputFormat`/`DataIterator`/`InputFilesDecryptor`) only ever calls `table.encryption()` / `table.io()` and the generic `EncryptingFileIO`/`InputFilesDecryptor` entry points. Neither Spark nor Flink implements any cipher or key logic itself — consistent with the spec + core putting the whole scheme behind the `EncryptionManager` interface, which the engines just consume.
+
+One gap worth noting: the encryption integration is genuinely shared core machinery, but the only end-to-end engine-level test exercising it is the Spark `TestTableEncryption` (and per its line-45 TODO, a fuller `TestCTASEncryption` from the v4 Spark line hasn't been ported to v3.5 yet) — Flink relies on the same core classes without a dedicated engine-level encryption test in this tree.

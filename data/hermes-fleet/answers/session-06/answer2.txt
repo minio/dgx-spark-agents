@@ -1,0 +1,55 @@
+I've now read the full `BaseTransaction.java` plus its key collaborators: `TableOperations` (the SPI contract), `BaseMetastoreTableOperations`/`BaseMetastoreOperations` (the actual atomic commit / CAS), `SnapshotProducer` (the per-operation commit+retry), and `Tasks` (the retry engine). Here's how the implementation maps onto the spec.
+
+## The two-layer design
+
+Iceberg separates two commit levels, and each maps to a different part of the spec:
+
+1. Individual operations (append, overwrite, delete, schema change) commit their own metadata versions via `SnapshotProducer` / `PendingUpdate` against `TransactionTableOperations`.
+2. The transaction groups many such operations so they atomically commit together in one final CAS (`commitSimpleTransaction`, `commitTransaction`).
+
+## Layer 1: optimistic CAS on a single metadata pointer
+
+The spec ([spec.md:95](format/spec.md#optimistic-concurrency)) says a writer creates metadata "optimistically ... once a writer has created an update, it commits by swapping the table's metadata file pointer from the base version to the new version," and if the base is stale it must retry.
+
+- The SPI contract is `TableOperations.commit(base, metadata)` ([TableOperations.java:64](core/src/main/java/org/apache/iceberg/TableOperations.java#L64)). Its Javadoc requires implementations to "check that the base metadata is current to avoid overwriting updates," i.e. the check-and-put from [spec.md:1342](format/spec.md#metastore-tables).
+- The metastore implementation enforces that check at [BaseMetastoreTableOperations.java:109-119](core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java#L109): if `base != current()` it throws `CommitFailedException` ("stale table metadata") — never overwriting a concurrent commit. This is exactly the "if the swap fails, another writer has already created V+1" path from the spec.
+- The `doCommit` [BaseMetastoreTableOperations.java:137](core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java#L137) is where a concrete catalog (Hive, Glue, etc.) performs the atomic check-and-put of the new metadata pointer.
+
+## Layer 2: retry loop with validation (the "defined conditions" for retry)
+
+The spec ([spec.md:97](format/spec.md#optimistic-concurrency) and [spec.md:1314-1319](format/spec.md#commit-conflict-resolution-and-retry)) says the failed commit "can be applied to the new current version and retried" under defined conditions — appends always, replaces must verify files still present, deletes must verify files still present, schema/partition changes must validate the schema hasn't changed.
+
+- The retry engine is `Tasks.foreach(ops).retry(...).exponentialBackoff(...).onlyRetryOn(CommitFailedException.class)` — visible in `SnapshotProducer.commit()` ([SnapshotProducer.java:489-496](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L489)), and in `BaseTransaction` for simple/replace commits ([BaseTransaction.java:301-311](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L301), [:359-366](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L359)).
+- `onlyRetryOn(CommitFailedException.class)` enforces that only a genuine conflict triggers retry — not any error. The retry mechanics (max attempts, exponential backoff, total time) live in [Tasks.java:406-480](core/src/main/java/org/apache/iceberg/util/Tasks.java#L406), with the conflict-check at [:440-451](core/src/main/java/org/apache/iceberg/util/Tasks.java#L440).
+- Per-operation validations before commit implement the spec's "defined conditions." `SnapshotProducer` runs `runValidations()` before applying ([SnapshotProducer.java:302, 375-387](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L375)), and subclasses override `validate()` — e.g. delete/overwrite operations verify the files to remove are still in the table, mirroring the spec's rule that "Replace operations must verify that the files that will be deleted are still in the table" ([spec.md:1317](format/spec.md#commit-conflict-resolution-and-retry)).
+
+## How BaseTransaction ties multi-operation updates into one atomic commit
+
+The spec's "serializable isolation ... removing and adding files in a single operation and are never partially visible" ([spec.md:71](format/spec.md#goals)) is what `BaseTransaction` exists to provide across many separate update calls.
+
+- Each operation is created wrapped in `TransactionTableOperations` (lines 153-247), not the live `ops`. All operations stage their updates against a shared in-memory `current` metadata (the constructor sets `this.current = start`, line 93) — none of them touch the real table pointer yet.
+- `TransactionTableOperations.commit` ([BaseTransaction.java:482-494](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L482)) is an in-memory CAS: if `underlyingBase != current` it throws `CommitFailedException` ("Table metadata refresh is required"); otherwise it advances the transaction's `current` and marks the operation committed. No external commit happens here — this is where the spec's per-operation "snapshot" isolation is maintained inside the transaction.
+- `commitSimpleTransaction()` ([BaseTransaction.java:350-413](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L350)) is the actual atomic publish. It runs in the retry loop: `applyUpdates()` ([BaseTransaction.java:438-454](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L438)) first refreshes the real ops; if the table changed underneath (base stale), it re-applies the whole update chain against the new base (each `update.commit()` re-runs), then one `underlyingOps.commit(base, current)` does the single atomic pointer swap ([BaseTransaction.java:371](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L371)). This is precisely the spec's "re-applying metadata changes and committing" and "an atomic swap of one table metadata file for another provides the basis for serializable isolation" ([spec.md:93](format/spec.md#optimistic-concurrency)).
+
+## Failure cleanup / no partial visibility
+
+The spec ([spec.md:93](format/spec.md#optimistic-concurrency)) and the design note that immutable files mean an aborted writer leaves garbage but never a torn table. `BaseTransaction` implements this:
+
+- Deleted/added files from individual operations are tracked in `deletedFiles` ([BaseTransaction.java:70-72](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L70)), wired into each `SnapshotUpdate` via `deleteWith(enqueueDelete)` ([BaseTransaction.java:127](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L127)).
+- On failed commit, cleanup only deletes files that were NOT committed — it computes committed manifest files from the new snapshots and filters them out ([BaseTransaction.java:390-413](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L390)), so a successful-but-uncertain commit never has its files deleted.
+
+## Correct handling of the "unknown commit state" case
+
+The `TableOperations.commit` contract ([TableOperations.java:53-59](core/src/main/java/org/apache/iceberg/TableOperations.java#L53)) says implementations must throw `CommitStateUnknownException` when they can't tell if a commit succeeded (e.g. a lost network acknowledgement), because cleanup is not safe. Both `SnapshotProducer.commit` ([SnapshotProducer.java:536-537](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L536)) and every `BaseTransaction` commit path ([BaseTransaction.java:279, 331-333, 374-376](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L279)) re-throw that exception without any file cleanup, exactly honoring the contract. The status resolution logic (`checkCommitStatus`) is in [BaseMetastoreOperations.java:63-151](core/src/main/java/org/apache/iceberg/BaseMetastoreOperations.java#L63).
+
+## Summary
+
+Everything maps to the spec directly:
+
+- Atomic single-pointer CAS commit = `TransactionTableOperations.commit` / `BaseMetastoreTableOperations.commit` (spec's "atomic swap").
+- Conflicts detected not prevented = `CommitFailedException` + `onlyRetryOn` (spec's optimistic concurrency).
+- Defined retry conditions = per-operation `validate()` before `apply()` (spec's "under well-defined conditions" list).
+- All-or-nothing multi-op commit = `commitSimpleTransaction` re-applying the chain then one swap.
+- No partial visibility on failure = committed-files-aware cleanup; `CommitStateUnknownException` bypasses cleanup.
+
+The one place the Java file deviates slightly in tone is precisely what I flagged from the spec itself: the file-system-table atomic-rename commit path ([spec.md:1323-1333](format/spec.md#file-system-tables)) is deprecated in the spec and is not handled in these core classes — they all assume a metastore-style check-and-put, which is the safe path the spec endorses.

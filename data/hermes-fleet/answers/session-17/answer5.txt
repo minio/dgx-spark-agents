@@ -1,0 +1,23 @@
+REST catalog summary for a new contributor — read these first, in order.
+
+1. What a REST catalog is and why: it's a thin pointer-store over the table format's self-describing metadata tree; the heavy lifting (scanning, file layout) happens client-side. See the config/bootstrap flow, which shows everything is negotiated from server config: core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:199-307.
+
+2. The HTTP surface: every endpoint is a (method, path) pair mirroring the OpenAPI spec, e.g. load = GET /v1/{prefix}/namespaces/{ns}/tables/{table}. All paths live here: core/src/main/java/org/apache/iceberg/rest/ResourcePaths.java:30-56.
+
+3. Endpoint capability negotiation: the server advertises which endpoints it supports; the client throws UnsupportedOperationException (or a typed exception) if a required one is missing, and falls back for optional ones. See the check logic and its callers: core/src/main/java/org/apache/iceberg/rest/Endpoint.java:143-163.
+
+4. How a table is loaded once and used: loadTable does one GET returning TableMetadata, then wraps it in a table whose reads go straight to storage through FileIO. Trace the load path: core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:446-614.
+
+5. The commit model — the heart of it: a commit never writes a metadata file client-side; it POSTs serializable, kebab-case MetadataUpdate deltas plus UpdateRequirements to the server, which validates and atomically swaps the pointer. This is the table spec's "metastore tables" pattern: core/src/main/java/org/apache/iceberg/rest/RESTTableOperations.java:178-241.
+
+6. Optimistic concurrency and unknown-commit recovery: stale bases are rejected via requirements → CommitFailedException, and a dropped response after a server-side apply is reconciled by refreshing and checking the snapshot. See RESTTableOperations.java:228-265.
+
+7. Staleness avoidance: metadata is cached per session with ETag/If-None-Match revalidation, and mutations invalidate the cache. Entry point: core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:738-740 and core/src/main/java/org/apache/iceberg/rest/RESTTableCache.java:42-103.
+
+8. Consistency invariant: refreshed metadata must keep the same table UUID, or the client throws — the table-uuid field from the spec. See core/src/main/java/org/apache/iceberg/rest/RESTTableOperations.java:321-332.
+
+9. How engines consume it: `RESTCatalog` adapts `RESTSessionCatalog` to the plain Catalog/ViewCatalog/SupportsNamespaces interface the engines bind against: core/src/main/java/org/apache/iceberg/rest/RESTCatalog.java:48-92. Engines just call that API; Spark/Flink don't touch REST specifics except Spark's purge branch (SparkCatalog.java:385-405).
+
+10. Error translation: typed exceptions (NoSuchTable, CommitFailed, etc.) come from a per-endpoint error handler that maps HTTP status codes; it's what lets commits propagate as retryable failures. See core/src/main/java/org/apache/iceberg/rest/ErrorHandlers.java (e.g. 122-131, 226-233), and the HTTP/retry layer that backs it: core/src/main/java/org/apache/iceberg/rest/HTTPClient.java.
+
+Mental model: REST catalog = naming + config negotiation + atomic-commit pointer swap over HTTP; all data-path I/O stays on the client's FileIO against object storage. Start with bullet 4 and 5 — they explain 90% of the code.

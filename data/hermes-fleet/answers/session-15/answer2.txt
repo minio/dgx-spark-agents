@@ -1,0 +1,44 @@
+I read `PuffinWriter.java` in full plus the code it calls for statistics files: `PuffinFormat`, `FileMetadata`, `FileMetadataParser`, `BlobMetadata`, `Blob`, `PuffinCompressionCodec`, the `Puffin` builder, and the table-metadata side (`StatisticsFileParser`, `GenericStatisticsFile`, `GenericBlobMetadata`) that consumes writer output. Here's how it follows the spec.
+
+## How the on-disk layout matches spec.md
+
+**Magic + header.** The spec's Puffin format opens a file with the four-byte magic `PFA1`. `PuffinFormat.getMagic()` returns `{0x50, 0x46, 0x41, 0x31}` (PuffinFormat.java:88-90), and `writeHeaderIfNeeded()` writes it once at the start of the stream (PuffinWriter.java:129-136). `PuffinWriter.MAGIC` is taken directly from there (PuffinWriter.java:45).
+
+**Blob writing, offset/length per spec.** The spec's statistics descriptor records each blob's `offset` and `length`. `PuffinWriter.write(Blob)` captures `long fileOffset = outputStream.getPos()` before writing the payload (PuffinWriter.java:89), compresses, writes the bytes, and records the resulting `offset` and `length` in a `BlobMetadata` (PuffinWriter.java:95-105). These are exactly the `offset`/`length` fields the Puffin JSON footer carries and which the consumer needs to fetch the blob.
+
+**Footer structure.** The spec's footer is: start magic (4), JSON payload (variable), payload length (4, little-endian), flags (4), end magic (4). `writeFooter()` does this in order: it serializes the metadata to JSON, writes `MAGIC`, writes the (possibly compressed) payload, writes the payload length as a little-endian int, writes the 4 flag bytes, then writes `MAGIC` again (PuffinWriter.java:152-164). The little-endian length write is `PuffinFormat.writeIntegerLittleEndian` (PuffinFormat.java:92-97), and the struct offsets are defined as constants (PuffinFormat.java:75-84).
+
+**Footer vs. file size — the spec's two descriptor fields.** spec.md distinguishes `file-size-in-bytes` (whole file) from `file-footer-size-in-bytes` (only the footer). The writer computes these separately: `footerSize` is the bytes between `footerOffset` and the end of the footer (PuffinWriter.java:142-144), and `fileSize` is `outputStream.storedLength()` after close (PuffinWriter.java:148). Both are exposed via `footerSize()` (PuffinWriter.java:178-180) and `fileSize()` (PuffinWriter.java:182-184) — the values that become `file-size-in-bytes` and `file-footer-size-in-bytes` in table metadata.
+
+## How the metadata JSON follows serializer conventions
+
+spec.md's Puffin blob JSON fields map 1:1 onto `FileMetadataParser` keys (FileMetadataParser.java:35-44): `blobs`, `properties`, and per blob `type`, `fields`, `snapshot-id`, `sequence-number`, `offset`, `length`, `compression-codec`. These match the spec's required blob fields.
+
+**Optional-only-when-present.** Per AGENTS.md serialization rules, optional fields are only written when present. The writer omits `compression-codec` when null (FileMetadataParser.java:105-107) and omits `properties` when empty (FileMetadataParser.java:67-69, 109-111). The standard read side (`blobMetadataFromJson`) treats `properties` as absent-defaulting to `ImmutableMap.of()` (FileMetadataParser.java:124-128), consistent with the spec listing blob `properties` as optional.
+
+**Custom parser, no Jackson annotations.** `FileMetadata` is serialized through `FileMetadataParser.toJson/fromJson` using `JsonUtil`, not Jackson annotations (FileMetadata.java, FileMetadataParser.java:46-52), following the project's standard.
+
+## How spec's blob descriptor maps to the writer's metadata
+
+The spec's `blob-metadata` descriptor (snapshot-id, sequence-number, fields, type) is carried by the writer's `BlobMetadata`:
+- `type` -> `BlobMetadata.type()` (BlobMetadata.java:60-62)
+- `fields` -> `inputFields` (BlobMetadata.java:64-66)
+- `snapshot-id` -> `snapshotId()` with Javadoc "ID of the Iceberg table's snapshot the blob was computed from" (BlobMetadata.java:68-71)
+- `sequence-number` -> `sequenceNumber()` (BlobMetadata.java:73-76)
+- plus offset/length/codec for locating the payload
+
+Each `Blob` also carries those snapshot/sequence/fields from the caller (Blob.java:46-66). `GenericBlobMetadata.from(puffin.BlobMetadata)` drops the file-level offset/length/codec and keeps exactly the four fields the table-metadata `blob-metadata` struct requires (GenericBlobMetadata.java:32-39). `StatisticsFileParser` then writes those as `type`, `snapshot-id`, `sequence-number`, `fields`, plus optional `properties` (StatisticsFileParser.java:86-102) — mirroring spec.md's blob metadata table.
+
+## How "informational, many per snapshot" is reflected
+
+spec.md says statistics are informational and a table can hold many statistics files. On the consumer side, `StatisticsFileParser.fromJson` parses a list of descriptors (StatisticsFileParser.java:68-84), and the builder indexes statistics **by snapshot-id into a map** (`indexStatistics`, TableMetadata.java:1905-1907), so multiple files per snapshot and per-snapshot association are both supported. These are opened via `Puffin.read(...)` with required footer offset/length checks (PuffinReader.java:65) — the reader never forces stats usage, consistent with them being optional for correctness.
+
+## Compression follows the spec's per-blob model
+
+`PuffinCompressionCodec` defines `NONE`/`LZ4`/`ZSTD` (PuffinCompressionCodec.java:29-38). Per blob, `write()` resolves the codec as `blob.requestedCompression()` falling back to the writer's default (PuffinWriter.java:90-91), compresses via `PuffinFormat.compress` (PuffinWriter.java:92), and records the codec name in the blob metadata (PuffinWriter.java:103). The footer has its own fixed codec, `FOOTER_COMPRESSION_CODEC = LZ4` (PuffinFormat.java:86), applied in `writeFooter()` (PuffinWriter.java:157).
+
+## One nuance worth flagging
+
+The blob compression codec enum (PuffinCompressionCodec.java) declares LZ4, and `PuffinFormat.compress`/`decompress` have an LZ4 case, but both fall through to `break` with a TODO referencing an airlift LZ4-frame compressor that isn't wired up (PuffinFormat.java:110-113, 132-135), so only `NONE` and `ZSTD` actually work. This is a known implementation gap in this snapshot — not a spec deviation, since the format definition itself is driven entirely by the per-blob codec metadata (`PuffinCompressionCodec` enum values at PuffinCompressionCodec.java:29-38 and codec name serialized in `FileMetadataParser`).
+
+**Net:** the writer produces exactly the Puffin file the spec describes — magic-delimited blobs with recorded offset/length, a structured JSON footer (start magic, payload, little-endian length, flags, end magic) serialized by a custom parser — and exposes the file/footer sizes and blob metadata that the table-metadata `statistics` descriptors (`StatisticsFileParser`) require, all while treating stats as optional, multi-file-per-snapshot, forward-compatible enrichment.

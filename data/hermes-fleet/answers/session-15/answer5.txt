@@ -1,0 +1,21 @@
+Ten bullets to get a new contributor oriented, each with the first thing to read:
+
+1. Puffin is a general-purpose container file (magic `PFA1`, blobs, JSON footer). Read the format first — `format/puffin-spec.md`, and in spec.md the Table Statistics section at `spec.md:1207`.
+
+2. Statistics are *informational*: a reader may ignore them, they're not needed to read a table correctly, and a table can hold many per-snapshot statistics files. See `spec.md:1207-1211`.
+
+3. Table metadata registers each statistics file under `statistics` with snapshot-id, path, file size, footer size, and per-blob `blob-metadata` (type, snapshot, sequence-number, fields, properties). See `spec.md:1215-1234` and the parser `StatisticsFileParser.java:53-66`.
+
+4. The writer lays out the file: header magic, each blob with recorded offset/length, then the footer (start magic, JSON payload, little-endian payload length, flags, end magic). See `PuffinWriter.java:138-164` and `PuffinFormat.java:75-90`.
+
+5. Blob metadata on disk, and footer JSON, mirror the spec's blob fields 1:1 using custom (non-annotation) parsers. See `PuffinWriter.java:95-105`, `FileMetadataParser.java:93-114`, and `BlobMetadata.java:28-36`.
+
+6. `PuffinWriter.fileSize()` and `footerSize()` become the descriptor's `file-size-in-bytes` and `file-footer-size-in-bytes`. See `PuffinWriter.java:178-184` and how the consumer packs them at `GenericStatisticsFile.java:34-47`.
+
+7. Spark is the main engine integration — it *writes* NDV Theta-sketch blobs via the `compute_stats` action. See `ComputeTableStatsSparkAction.java:111-126` and `NDVSketchUtil.java:63-74` (type `apache-datasketches-theta-v1`).
+
+8. Spark *reads* the NDV back at scan time for CBO, but only from blob metadata (`ndv` property), never by decoding the sketch file. See `SparkScan.java:204-241`.
+
+9. Flink does not consume statistics for planning — it only garbage-collects the files (and writes Puffin DVs, a separate blob type). See `FlinkCatalog.java:1072-1074` and `ListMetadataFiles.java:79`.
+
+10. Failure modes fail loudly on structure (magic, payload arithmetic, flags, JSON required fields) but one gap: LZ4 is declared yet not wired — only NONE and ZSTD actually work. See `PuffinReader.java:63-97` and `PuffinFormat.java:110-118`.

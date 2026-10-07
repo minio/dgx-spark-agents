@@ -1,0 +1,67 @@
+I've traced the full call chain. Here are the edge cases and failure modes, what the code does (or doesn't do) about each, with citations.
+
+## Correctness/purity of the input range
+
+1. Non-append snapshots in range (REPLACE/OVERWRITE/DELETE).
+   A user can ask for a range that contains destructive or mixed-operator snapshots, which would break the "delta is a pure union" assumption.
+   Guard: `appendsBetween` keeps only snapshots whose `operation()` equals `DataOperations.APPEND` (BaseIncrementalAppendScan.java:111), and `DataOperations.APPEND` is documented as "no data is removed or deleted" (api/.../DataOperations.java:31-36). So those snapshots are skipped, matching spec:969-976. Caveat: this is *silent* skipping — deleted/overwritten rows are simply absent from results, not reported. There's a stricter sibling in `BaseIncrementalChangelogScan` that throws on `REPLACE` (BaseIncrementalChangelogScan.java:107), but the append scan doesn't; that's a deliberate semantic, not a bug, worth knowing as a footgun.
+
+2. Start snapshot not an ancestor of the end snapshot.
+   `fromSnapshotIdExclusive` validates with `SnapshotUtil.isAncestorOf` (inclusive) and `isParentAncestorOf` (exclusive) and throws `IllegalArgumentException` via `Preconditions` (BaseIncrementalScan.java:167-184). Guarded.
+
+3. End snapshot missing / table has no current snapshot.
+   `toSnapshotIdInclusive` requires an explicit `toSnapshotId` or a non-null current/branch snapshot, else throws (BaseIncrementalScan.java:153-154). `toSnapshot(...)` also validates the id exists (BaseIncrementalScan.java:73-74).
+
+4. Empty table (no current snapshot) with no explicit bounds.
+   `planFiles` short-circuits to an empty iterable (BaseIncrementalScan.java:97-101) before doing any range work.
+
+5. from-snapshot == to-snapshot.
+   `SnapshotUtil.ancestorsBetween` returns an empty list when the two IDs are equal (SnapshotUtil.java:213-215), so `doPlanFiles` gets an empty snapshot set and returns empty (BaseIncrementalAppendScan.java:52-54). No error, correct semantics.
+
+6. Inclusive start whose snapshot has no parent (the oldest snapshot).
+   `fromSnapshotIdExclusive` returns `fromSnapshotId.parentId()`, which is null (BaseIncrementalScan.java:175); null oldest bound makes `ancestorsBetween` walk all ancestors from the beginning (SnapshotUtil.java:220-222). Handled.
+
+## Double-counting / reuse — the subtle one
+
+7. Manifests reused across snapshots (fast append keeps prior manifests, spec:87, 978-983).
+   Without a guard, a manifest kept from an older snapshot would be rescan()'ed for every in-range snapshot that references it, and its files would reappear.
+   Guard: two complementary filters. Manifests are kept only if `manifestFile.snapshotId()` is in the in-range set (BaseIncrementalAppendScan.java:73); entries are kept only if `entry.snapshotId()` is in the set AND `status() == ADDED` (BaseIncrementalAppendScan.java:82-84). A reused manifest carries its *original* `snapshotId` (the id where it was added, spec:692), so in a later snapshot it appears as EXISTING with an out-of-range snapshotId and is excluded. Each file is counted exactly once, via its single ADDED entry. This is the core guard that keeps the delta a genuine union.
+
+8. Manifest entry status filtering inside `ManifestGroup`.
+   `ignoreDeleted()` sets the flag (BaseIncrementalAppendScan.java:87; ManifestGroup.java:132-135), which makes the reader use `liveEntries()` and skip manifests with no added/existing files (ManifestGroup.java:353-357, 311-320). Combined with the predicate, only ADDED, in-range entries survive. This also implements the spec's "deleted entries are not used in a scan" (spec:1055).
+
+## Expiration / lineage gaps — a real, only-partially-guarded class
+
+9. Intermediate snapshot expired/removed from the snapshots list.
+   `SnapshotUtil.ancestorsOf` walks `parentId()` and calls the lookup; when `lookup.apply(parentId)` returns null (snapshot no longer present), the iterator just stops (`hasNext` returns false, SnapshotUtil.java:248-254). So if a snapshot mid-range has been expired, the scan silently truncates rather than erroring — results are incomplete with no signal.
+   Partial guard: both explicit endpoints are validated as present (`fromSnapshotInclusive` at BaseIncrementalScan.java:47-50; `toSnapshot` at :73-74), so the *boundaries* can't silently vanish. But `fromSnapshotExclusive` deliberately skips the existence check because the excluded parent is often already expired (comment at BaseIncrementalScan.java:64-66), and the *interior* of the range is simply not validated. This is the honest limitation: the code cannot fully defend against aggressive snapshot expiration mid-range. The design intent is snapshots are retained (spec:1120-1132 retention), so this is an environmental assumption, not a bug.
+
+## Input validation / API misuse
+
+10. Wrong ref type passed by name.
+    `fromSnapshotInclusive(String)`, `toSnapshot(String)` require a `tag` (BaseIncrementalScan.java:38-43, 80-85), `useBranch(String)` requires a `branch` (:88-93), and unknown refs throw via `Preconditions` (:40, :90). Guarded by eager checks.
+
+11. End snapshot not actually on the selected branch.
+    `toSnapshotIdInclusive` checks `isAncestorOf` between the branch's current snapshot and the requested end (BaseIncrementalScan.java:136-142), throwing if the end isn't on the branch. Guarded.
+
+## Metadata-quality assumptions the code counts on
+
+12. Missing added/existing counts in the manifest list.
+    The skip logic relies on `hasAddedFiles()`, but that treats a null count as "has files, must scan" (api/.../ManifestFile.java:149-151) — the same convention the spec encodes ("when null, assumed to be non-zero," spec:1021). So a missing count degrades to scanning the manifest rather than wrong pruning. This is conservative-don't-skip, which is safe for correctness (only a perf cost).
+
+13. File/metrics pruning correctness relies on accurate manifest stats.
+    `ManifestGroup` uses inclusive projection for partition predicates and an `Evaluator` over file bounds (ManifestGroup.java:286-292, 294-299) — inclusive projection never discards a file that could match (spec:1061-1063), so pruning errors only over-include. Perf-sensitivity, not correctness.
+
+## Not guarded — writer-malformed input
+
+14. Duplicate ADDED entries for the same file in-range.
+    The spec requires content-file uniqueness within a snapshot (spec:680-682, and undefined behavior if violated, spec:1071-1072). The scan never dedupes: if two snapshots in range both carry an ADDED entry for the same file (or a file is illegally re-added), both appear in the output as separate scan tasks (`createFileScanTasks` transforms each entry, ManifestGroup.java:393-405). Correctness is delegated entirely to the writer; the reader assumes uniqueness, exactly as the spec says behavior is undefined in that case.
+
+## Resource management
+
+15. Iterables must be closed.
+    `planFiles`/`planTasks` return `CloseableIterable`s and the concrete plan is composed via `CloseableIterable.concat`/`ParallelIterable` (BaseIncrementalScan.java:126; BaseIncrementalAppendScan.java:56, 61-66; ManifestGroup.java:216-220). If the caller (engine) doesn't close them, manifest readers leak — but that's an ownership contract the spec also states (manifest readers hold open resources), not a silent corruption.
+
+## Summary
+
+The well-guarded cases are: non-append snapshots (operation filter), wrong start/end ordering and ancestry (Preconditions), empty table, from==to, inclusive-of-oldest, ref-type misuse, and above all manifest/entry double-counting via the `snapshotId`-in-range + ADDED filter. The genuinely unguarded risks are (a) silently truncating when an intermediate snapshot has been expired and (b) duplicate ADDED entries breaking uniqueness — both of which are delegated to assumptions (retention policy, writer correctness) that the spec itself treats as preconditions rather than something the reader must enforce.

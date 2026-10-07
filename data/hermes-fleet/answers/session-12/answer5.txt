@@ -1,0 +1,23 @@
+Metadata tables for a new contributor — ten points, each with the best first read.
+
+1. What they are: read-only Tables that expose the spec's on-disk metadata (manifests, entries, snapshots, refs, logs) as queryable rows. Start at the factory that maps a name to one of 16 concrete tables: core/src/main/java/org/apache/iceberg/MetadataTableUtils.java:56-95.
+
+2. The name-to-type mapping: a trailing `.files`/`$entries`/etc. suffix is recognized via an enum, and the factory throws on unknown types. Read core/src/main/java/org/apache/iceberg/MetadataTableType.java:23-47.
+
+3. The base class does almost all the work: it's a read-only, snapshot-consistent Table that delegates snapshot/ref/history access to the underlying base table. Read core/src/main/java/org/apache/iceberg/BaseMetadataTable.java:43-67.
+
+4. Time-travel: only single-snapshot tables (files, entries, manifests, partitions, position_deletes) support it; the all-* tables across all snapshots reject it. See the gating set in BaseMetadataTable.java:44-52 and the throw in BaseAllMetadataTableScan.java:48-60.
+
+5. Schema per table is a static Schema that mirrors a spec struct — e.g. files table = the data_file struct, with the partition field dropped for unpartitioned tables. Read core/src/main/java/org/apache/iceberg/BaseFilesTable.java:47-57.
+
+6. Scan planning reuses the spec's rules: per-manifest partition-spec filters, manifest skipping via partition summaries, and residual evaluation. Read the key planner in BaseFilesTable.java:59-87 (entries variant: BaseEntriesTable.java:65-98).
+
+7. Filter rewrite: predicates on the `partition` column are rewritten into partition predicates via an identity transform (inclusive projection). Read BaseMetadataTable.java:83-99.
+
+8. All-* tables walk every reachable snapshot in parallel and return duplicates by design. Read BaseAllMetadataTableScan.java:74-86.
+
+9. Static tables (history, snapshots, refs, metadata_log_entries) build a DataTask over in-memory data instead of reading manifests. Read StaticTableScan.java:46-54, and see the pattern in SnapshotsTable.java:60-67.
+
+10. How engines consume it: they materialize it as a normal Table and run Spark/Flink operators over it — e.g. Spark loads it as a SparkTable/Dataset (spark/v4.1/.../SparkTableUtil.java:689-701) and Flink builds readers over it (flink/v2.3/.../TableReader.java:79-91). A richer walkthrough of the engine side is in the previous answer.
+
+Tightest single-file orientation for a new contributor: read MetadataTableUtils.java (the switch), then BaseMetadataTable.java (the contract), then one concrete leaf like FilesTable.java for the pattern.

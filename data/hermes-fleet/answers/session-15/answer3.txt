@@ -1,0 +1,43 @@
+I now have the full picture across the writer, reader, and table-metadata consumers. Here are the failure modes and edge cases for Puffin statistics files, and where the code guards each.
+
+## File-structure / corruption failures
+
+**1. Truncated or empty file (footer can't fit).** A Puffin file smaller than the fixed footer tail (start magic + payload length + flags + end magic) can't contain a valid footer. Reader: `footerSize()` requires `fileSize >= FOOTER_STRUCT_LENGTH` and throws with a message including the actual length (PuffinReader.java:163-167).
+
+**2. Corrupted end magic.** The footer tail must end in the `PFA1` magic. If filesystem/object-store corruption hits it, `footerSize()` calls `checkMagic(footerStruct, FOOTER_STRUCT_MAGIC_OFFSET)` which throws on mismatch (PuffinReader.java:171, 151-159).
+
+**3. Corrupted start magic.** Both the file header magic and the footer's leading magic are validated — `checkMagic(footer, FOOTER_START_MAGIC_OFFSET)` in `fileMetadata()` (PuffinReader.java:68) — so a file that silently lost its leading bytes is rejected, not misparsed.
+
+**4. Garbage/mismatched payload length.** The footer embedded `payload-size` must equal the implied size `footerSize - startMagic(4) - structLength`. If a truncated/corrupt file records a payload length that doesn't line up, `Preconditions.checkState` throws (PuffinReader.java:86-93). Because the payload length is 4 bytes little-endian, a corrupted value could be huge or negative — the checkState catches the mismatch before any allocation happens (the buffer is allocated from `footerPayloadSize` only after the check passes).
+
+**5. Unknown flags set.** The footer's 4 flag bytes are reserved; only `FOOTER_PAYLOAD_COMPRESSED` is defined. A future/corrupt flag triggers `decodeFlags` -> `Preconditions.checkState` "Unknown flag byte ... set" (PuffinReader.java:112-113). This is the forward-compatibility envelope: an unknown-on-write flag fails loudly rather than silently misreading. Unknown *bytes within a flag byte* are also rejected per bit (PuffinReader.java:109-118).
+
+**6. Invalid footer payload size passed by caller (out-of-range).** The reader accepts an externally supplied footer size (e.g. from table metadata `file-footer-size-in-bytes`). It validates `0 < footerSize <= fileSize - MAGIC.length` up front (PuffinReader.java:55-58), preventing a malicious/buggy descriptor from triggering an out-of-bounds read.
+
+**7. Malformed or incomplete footer JSON.** The footer is parsed as a Puffin JSON document via `FileMetadataParser.fromJson` (PuffinReader.java:195-198). Its `blobs` field is required and must be an array — otherwise `Preconditions.checkArgument("Cannot parse blobs from non-array")` fails (FileMetadataParser.java:78-79). Per-blob required fields (`type`, `snapshot-id`, `sequence-number`, `offset`, `length`, `fields`) are read with `JsonUtil.get*`, which throws if absent (FileMetadataParser.java:117-122).
+
+## Metadata / descriptor drift failures
+
+**8. Compression mismatch (blob codec unreadable).** Each blob is compressed independently and tagged with its codec name. On read, `PuffinCompressionCodec.forName(codecName)` rejects unknown codec strings with `Preconditions.checkArgument("Unknown codec name")` (PuffinCompressionCodec.java:62-65, used at PuffinReader.java:141), and `PuffinFormat.decompress` throws `UnsupportedOperationException` for unhandled codecs (PuffinFormat.java:127-142). So a blob written with a codec this build can't decode fails loudly rather than returning garbage.
+
+**9. Table-metadata blob descriptor drifts from the actual file.** `statistics` descriptor `blob-metadata` (parser at StatisticsFileParser.java:86-102) is written by `GenericBlobMetadata.from(puffin.BlobMetadata)` at commit time (GenericBlobMetadata.java:32-39). If someone edits the metadata JSON or the Puffin file is replaced, the registered `file-size-in-bytes` / `file-footer-size-in-bytes` could no longer match. The reader protects itself by not trusting the descriptor blindly: the footer's own embedded payload size is validated against the actual structure (PuffinReader.java:86-93), and offset/length reads are bounded by the real file via `readFully`.
+
+**10. Offset/length out of range on blob read.** `readAll` seeks to `blobMetadata.offset()` and reads `length()` bytes (PuffinReader.java:136-138). If a blob's recorded offset+length exceeds the file, `seek`/`readFully` throw `IOException` (wrapped in `UncheckedIOException`) or fail to read fully (PuffinReader.java:144-146). There is a TODO noting reads aren't coalesced (PuffinReader.java:128), but each region is still sized from the authoritative metadata.
+
+## Integrity / consistency failures
+
+**11. Writer v1/v2 negative `snapshot-id` or `sequence-number` ambiguity.** The blob always carries `snapshot-id` and `sequence-number` (Blob.java:76-82; serialized at FileMetadataParser.java:99-100). The spec's `blob-metadata` reproduces them. Code doesn't nil-check these — they're `long` primitives — so a caller forgetting to set them writes 0, which the spec read-side then records as the snapshot the stats were "computed from." This is a **soft** failure (mislabeled stats), not a crash, and the code offers no guard: the values are taken verbatim from the caller's `Blob`. Worth flagging as the one place the writer trusts its input without validation.
+
+**12. Writer misuse (add after finish / null blob).** `write(blob)` rejects a null blob (`checkNotNull`, PuffinWriter.java:85) and any write after finishing via `checkNotFinished()` (PuffinWriter.java:86, 199-201). `finish()` itself guards against double-finish via `checkNotFinished` and `checkState(!footerSize.isPresent())` (PuffinWriter.java:138-141). This prevents an inconsistent half-written file from being registered.
+
+## Design-level guarantees (the biggest guard)
+
+**13. Statistics can never break reads — the whole point of "informational".** The most important guard is architectural. spec.md marks statistics optional and ignorable; accordingly the metadata build indexes them by snapshot-id (TableMetadata.java:1905-1907) and the reader treats each file as self-contained. No blob decode, JSON parse, or codec issue can corrupt a scan, because stats are never required for correctness — the failure modes above all throw or produce ignorable results rather than wrong query answers.
+
+## Gaps / what is NOT well guarded
+
+- **LZ4 is declared but non-functional** — `PuffinFormat.compress`/`decompress` LZ4 cases fall through to `break` and throw `UnsupportedOperationException` (PuffinFormat.java:110-118, 132-135). A statistics file written claiming LZ4 (or coming from another implementation) will fail to read here. It fails loudly, so it's safe, but it is an interoperability gap.
+- **No bounds/coalescing optimization and no per-blob CRC** — the reader validates structure but Puffin (unlike some formats) has no per-blob checksum in the reader path; data integrity relies on the storage layer.
+- **Unvalidated `snapshot-id`/`sequence-number` from the caller** (mode 11) — if the producer miscalculates them, there's no sanity check.
+
+**Net:** the code's guards cluster around *structure* (magic, payload-length arithmetic, flags, JSON required fields, descriptor bounds) and fail loudly — which is exactly what you want for an optional, correctness-independent statistics file. The two real soft spots are the non-functional LZ4 path and unvalidated snapshot/sequence provenance from the writer's caller.

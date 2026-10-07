@@ -1,0 +1,18 @@
+{
+ "label": "nomemkv",
+ "wall_s": 94.2,
+ "server": {
+  "prompt_tokens_total": 280314.0,
+  "generation_tokens_total": 2428.0,
+  "prefix_cache_hits_total": 185600.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 44.1,
+  "time_to_first_token_seconds_count": 3.0,
+  "request_prefill_time_seconds_sum": 43.5,
+  "request_decode_time_seconds_sum": 47.9
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "ndex.baseReferencedDeletes`/`apply` \u2014 it computes, per data file, the deletes/DVs that must be merged during the scan.\n- `DeleteFilter` (the abstract class in data/ that subclasses like the Spark/Flink readers use) holds the position index and the equality set and applies them row-by-row while reading each data file.\n\n## What compaction does with them\n\nCompaction is the `ReplaceFiles` / `RewriteFiles` operation \u2014 `BaseRewriteFiles` extends `MergingSnapshotProducer` and reports operation `DataOperations.REPLACE` (core/.../BaseRewriteFiles.java:26, 44). It rewrites a set of data files into new, merged data files and atomically removes the old ones, producing a new snapshot.\n\nThe key behavior: since the rewritten data is physically written without the deleted rows, the delete files no longer apply to the new data files and must be removed from the table at the same time. `RewriteFiles` takes both data files to delete and delete files/DVs to delete (`DeleteFile`s), so compaction removes the position/equality delete files and DVs that covered the rewritten files. The new data files get a fresh (higher) data sequence number, so under the seq-number rules above, old deletes (lower seq) would not apply to them anyway \u2014 but the deletes are still explicitly dropped so they stop accruing.\n\nTwo important alignment points with the spec rules for who can rewrite deletes:\n- Position deletes / equality deletes that span multiple data files, or that cover files being kept, cannot simply be dropped \u2014 a compaction that rewrites only some files keeps the deletes that target the untouched files.\n- Per v3, when rewriting a file that has position deletes, the writer must merge the position deletes into a new DV for the rewritten file (spec.md:1395, 1953\u20131954), and rewrite any position delete files that cover several data files until all are replaced by DVs (spec.md:1956).\n\nAlso note the `REPLACE` summary invariant enforced at commit: `added-records` must not exceed `replaced-records` (SnapshotProducer.java:345\u2013357), meaning a compaction can't fabricate rows \u2014 it preserves the table's logical content.\n\nNet effect: compaction is how a table reclaims the space/logic of deletes \u2014 it materializes \"current rows\" into fresh data files, clears the delete files/DVs that referred to the old files, and leaves only truly-live rows, so future scans pay less (fewer deletes to merge) and readers see the same logical table.\n\n## Citations\n\n- Spec: version support spec.md:33\u201358, 1356\u20131364; position deletes 1391\u20131416; equality deletes 1418\u20131469 (equality_ids 739\u2013740); deletion vectors 1375\u20131388, 985\u2013987; content field 720; scan-planning apply rules 1053\u20131098; sequence-number rules 928\u2013939.\n- Code: Deletes.java:130\u2013166 (position/DV index), 226 (equality set); BaseRewriteFiles.java:26, 44 (REPLACE/compaction); SnapshotProducer.java:345\u2013357 (REPLACE invariant); `DeleteFileIndex` (per-file seq+partition delete scoping) and `DeleteFilter` (row-level application) as the reader-side machinery.\n",
+ "stderr": ""
+}

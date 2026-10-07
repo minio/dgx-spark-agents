@@ -1,0 +1,61 @@
+Here's how `DeleteFileIndex` (core/src/main/java/org/apache/iceberg/DeleteFileIndex.java) and its helpers implement the spec. The class is exactly the "index of delete files by sequence number" the javadoc at line 63-69 describes — the in-memory structure that answers, for a given data file, which deletes apply.
+
+## 1. Delete manifests are scanned separately from data manifests
+
+The spec says delete manifests are separate, tracked by `content`, and that DELETED entries aren't used in a scan.
+
+- Built from an explicit set of delete manifests: `builderFor(FileIO, Iterable<ManifestFile>)` (DeleteFileIndex.java:397-399). It only accepts manifests whose content is `DELETES` — the reader asserts `manifest.content() == ManifestContent.DELETES` (ManifestFiles.java:298-301) and consults only `manifest.content() == ManifestContent.DELETES && hasAddedFiles/hasExistingFiles` (DeleteFileIndex.java:651-652).
+- DELETED entries are dropped via `liveEntries()` → `filterLiveEntries` → `entry.status() != DELETED` (ManifestReader.java:354-365). This implements spec "Deleted entries ... are not used in a scan."
+
+## 2. The `content` field discriminates delete-file types
+
+The spec's `data_file.content` field (0=data, 1=position deletes, 2=equality deletes) is the routing key. In `build()` the index switches on `file.content()` (DeleteFileIndex.java:542-555):
+
+- `POSITION_DELETES` → either a deletion vector (Puffin) or a position-delete file.
+- `EQUALITY_DELETES` → equality delete bucket.
+- anything else → `UnsupportedOperationException` (line 554).
+
+Whether a position-delete entry is a DV is decided by file format: `ContentFileUtil.isDV` returns `file.format() == FileFormat.PUFFIN` (ContentFileUtil.java:142-144). This mirrors the spec where DVs are stored in Puffin files while v2 position delete files are normal data-format files.
+
+## 3. Deletes are indexed by partition (spec ID + partition tuple)
+
+The spec's core rule — a delete applies only to data files in the same partition (same spec and partition values) — is what the index is built around. It uses `PartitionMap`, keyed by `(specId, partition)` (DeleteFileIndex.java:186, 195; PartitionMap.java:82-100, 107-110).
+
+- Position deletes not scoped to one file go in `posDeletesByPartition` (DeleteFileIndex.java:588-590).
+- Equality deletes go in `eqDeletesByPartition` keyed the same way (line 608-610).
+- At lookup, `findPosPartitionDeletes` (181-188) and `findEqPartitionDeletes` (190-197) fetch by `dataFile.specId()` and `dataFile.partition()`.
+- `validatePartitionMatch` (234-255) hard-checks that spec IDs are equal and the partition tuples compare equal, else it declares the metadata corrupted. The partition comparator is built per spec ID from `specsById` (DeleteFileIndex.java:95-99), matching the spec's requirement that partition field IDs map to the union partition type.
+
+## 4. Deletes are ordered by sequence number (relative age)
+
+The spec's other rule — a delete applies to data files whose data sequence number is ≤ the delete's (strictly `<` for equality deletes) — is implemented with sorted arrays:
+
+- `PositionDeletes` sorts by `dataSequenceNumber()` (DeleteFileIndex.java:709-712, 767-771).
+- `EqualityDeletes` sorts by `applySequenceNumber`, which is computed as `dataSequenceNumber() - 1` (DeleteFileIndex.java:881). That `-1` is the direct encoding of the spec's "data sequence number is strictly less than the delete's" for equality deletes — an equality delete applies to any data file with seq strictly below it, so it's stored as seq-1 so the same `>=` search works.
+- `findStartIndex` (687-703) does a binary search to find the first applicable sequence, and `filter(seq)` returns the suffix `files[start..]` (DeleteFileIndex.java:726-743, 808-827), i.e. all deletes with seq ≥ the data file's data sequence number.
+
+## 5. File-scoped deletes and DVs are indexed by referenced data file path
+
+The spec lets position deletes and DVs target a specific data file via `referenced_data_file`, and requires at most one DV per data file.
+
+- `posDeletesByPath` and `dvByPath` are keyed by the data file location (DeleteFileIndex.java:538-539, 582-594, 568-576). Lookup is `findPathDeletes` by `dataFile.location()` (199-215) and `findDV` by location (217-232).
+- `referencedDataFileLocation` (and `referencedDataFile`) recovers the referenced path from the delete file's `file_path` lower/upper bound metadata when they're equal (ContentFileUtil.java:63-89, 133-136). This is how the spec's single-file position-delete optimization and DV `referenced_data_file` are represented.
+- Enforcing "at most one DV per data file": `add(dvByPath, ...)` rejects a second DV for the same path with a `ValidationException` (DeleteFileIndex.java:568-576). `findDV` also verifies the DV's data sequence number is ≥ the data file's (224-228), the spec's "DV applies when data seq ≤ vector seq."
+
+## 6. Global equality deletes for unpartitioned specs
+
+The spec's one exception — "Equality delete files stored with an unpartitioned spec are applied as global deletes" — is `EqualityDeletes globalDeletes` (DeleteFileIndex.java:73, 603-605: `if (spec.isUnpartitioned()) deletes = globalDeletes;`), and it's consulted first in `forDataFile` via `findGlobalDeletes` (163, 177-179).
+
+## 7. Metrics-based pruning for equality deletes
+
+The spec says column metrics/bounds can determine whether a delete file's rows overlap a data file (and Scan Planning note 2's `id=9` example). `canContainEqDeletesForFile` (258-320) implements exactly that: it uses null-count/value-count comparisons and lower/upper-bound range overlap to skip delete files that can't match the data file, converting the binary-serialized bounds with `Conversions.fromByteBuffer` and comparing with `Comparators` (322-342). Conversely, missing stats or nested types conservatively assume the delete may match (276-277, 298-301, 308-311) — matching the spec's "metrics may be omitted" handling.
+
+## 8. Manifest-level pruning mirrors scan planning
+
+Before opening delete manifests, `deleteManifestReaders` (616-669) applies the spec's inclusive projection and manifest summaries to skip manifests: `Projections.inclusive(spec, ...)` (626) plus `ManifestEvaluator.forPartitionFilter` (636-639), only opening manifests that evaluate to true (653). This corresponds to the spec's partition-predicate pruning and "manifests that contain no matching files ... may be skipped." The `minSequenceNumber` (`afterSequenceNumber`, 432-435) filters delete files by sequence in `filterDeleteFiles`/`loadDeleteFiles` (488-520).
+
+## Design note on efficiency
+
+The index intentionally does no per-file I/O at lookup: it loads delete manifests once (in parallel via `Tasks.foreach`, 496-519), buckets files into per-partition/per-path groups each pre-sorted by sequence number, then answers `forDataFile(sequenceNumber, file)` with binary search + map lookups in O(log k) — no remote calls. That's the implementation of the spec's core design goal (O(1)-ish planning, deletes matched by cheap partition + age rules rather than a lookup table), with boundary checks (`validatePartitionMatch`, the DV-seq check) guarding against corrupted metadata as the spec requires.
+
+I read DeleteFileIndex.java in full plus the helpers it delegates to: ContentFileUtil.java (referenced-path/DV detection, 63-149), PartitionMap.java (spec-id + partition keying, 82-182), ManifestReader.java (entry/partition/row filtering and live entries, 238-365), and ManifestFiles.readDeleteManifest (296-306).

@@ -1,0 +1,7 @@
+# The config vLLM's MemKV plugin reads (MEMKV_CONFIG). The servers are listed by
+# their addresses on the ConnectX-7 cable between the two DGX Sparks.
+servers: [192.168.100.1:9900, 192.168.100.2:9900]
+rdma_devices: [rocep1s0f0, roceP2p1s0f0]
+transport: rdma
+auth_key: <the shared key>
+license: /memkv/memkv.license

@@ -1,0 +1,51 @@
+I have everything needed. Here's how query engines in this repo rely on partition evolution, split into the two things engines actually do: execute DDL to evolve the spec, and correctly read tables that have multiple concurrent specs.
+
+## 1. Engines trigger evolution through the same `updateSpec()` path
+
+The `ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD` DDL all land on `BaseUpdatePartitionSpec`:
+
+- **Add:** `AddPartitionFieldExec` (`spark/v3.5/.../AddPartitionFieldExec.scala:42-45`) calls `iceberg.table.updateSpec().addField(name, Spark3Util.toIcebergTerm(transform)).commit()`.
+- **Drop:** `DropPartitionFieldExec.scala` calls `.updateSpec().removeField(...).commit()`.
+- **Replace** (drop + re-add with a new transform): `ReplacePartitionFieldExec.scala:42-62` — and notably it special-cases the case where the `from` transform's name isn't a column, removing by partition-name (`:47-54`) vs. by term (`:59`).
+
+These are wrappers — all the guardrails analyzed earlier (field-ID reuse, v1 `void` replacement, compatibility checks in `checkCompatibility`/`addPartitionSpecInternal`) apply. So Spark's write side of evolution depends on the exact same spec-consistency machinery.
+
+## 2. Engines read tables with multiple concurrent specs via per-manifest specs
+
+This is where the spec's core promise — old files stay under their old spec, reads use each manifest's spec — shows up in the engine read path.
+
+### Predicate projection is per-spec, done in core `ManifestGroup`
+`ManifestGroup` reads each manifest's own `partitionSpecId` and projects the scan filter with *that* manifest's spec:
+- `ManifestGroup.java:211-212` — reads `manifest.partitionSpecId()` and fetches that spec from `specsById`.
+- `ManifestGroup.java:284-290` — for each spec id, `Projections.inclusive(spec, caseSensitive).project(dataFilter)` builds a partition predicate from the data filter using that manifest's spec. This is the spec's inclusive projection (spec.md #1061), applied per-spec so old and new partition schemes are both pruned correctly.
+- `ManifestGroup.java:185-188` — residual evaluation is also cached per spec id, so the row-level residual uses the right spec.
+
+Because the projection is derived from the data predicate rather than hand-written partition predicates, a query written against the table "just works" across any mix of specs — exactly the "storage separation" goal (spec.md #76, #561).
+
+### Spark batches all read tasks across specs
+`SparkPartitioningAwareScan.specs()` (`spark/v3.5/.../SparkPartitioningAwareScan.java:169-177`) collects the *distinct* spec IDs actually present in the planned tasks: `tasks().stream().mapToInt(task -> task.spec().specId()).distinct()`, then resolves them to `table().specs().get(id)`. Those `specs()` feed:
+- `computeGroupingKeyType()` → `Partitioning.groupingKeyType(expectedSchema(), specs())` (`:137-139`), and
+- `groupingKeyTransforms()` → `indexFieldsById(specs())` (`:141-155`).
+
+So Spark derives its output partitioning / grouping key from the union of specs found in live files, not from just `table.spec()`.
+
+### The grouping key is the *unified* partition type across all specs
+`Partitioning.groupingKeyType(schema, specs)` (`core/.../Partitioning.java:225-227` → `buildPartitionProjectionType`) builds a struct that is the "union of all known partition fields" across the passed specs — this mirrors `partitionType(table)` ("unified partition type considering all specs in a table", `:230-244`, and the spec's partition-statistics unified type, spec.md #1278-1291). Critically:
+- It sorts specs by ID descending (`:283-286`) "to pick up the most recent field names," and
+- It errors on unknown transforms (`:271-276`) because their output type isn't known.
+
+This is how `KeyGroupedPartitioning` and the grouping keys in `SparkBatch`/`SparkInputPartition` are computed — the engine can schedule tasks grouped consistently even though different files live under different specs.
+
+### Writing position deletes across evolved specs
+`SparkPositionDeltaWrite` maps deletes by `specId` to the right `StructProjection` (`SparkPositionDeltaWrite.java:472, 598, 688`), and `SparkPositionDeletesRewrite`/`DeleteFileIndex` are per-spec (e.g. `SparkPositionDeletesRewrite.java:309` `table.specs().get(specId)`), so delete application is scoped to the same spec+partition as spec.md #1083 requires.
+
+## 3. Additional engine-side reliance
+
+- **Stats / pruning:** `SparkScan.java:250` checks `table.spec().isUnpartitioned()` to decide whether to use snapshot-summary stats; the "any spec is partitioned" check is `Partitioning.isPartitioned` (`Partitioning.java:263-265`), which looks across `table.specs().values()`. `SparkScanBuilder.java:199` likewise scans all specs.
+- **Scan-side delete filtering:** `SparkTable.java:397` builds a per-spec `Projections.strict(spec).project(deleteExpr)` for delete-pruning, and `SparkBatchQueryScan.java:135` uses inclusive projection with the runtime filter — again honoring the manifest's spec.
+- **Rewrite/add files by matching a spec:** `SparkTableUtil.partitionSpecsByName(...)` (`SparkTableUtil.java:1176-1201`) iterates `icebergTable.specs().values()` to "find a partition spec that shares the same names and ordering," and `RewriteManifestsSparkAction` validates its `specId` against `table.specs()` (`RewriteManifestsSparkAction.java:152-153`). This is how tooling lands files under a *compatible existing* spec rather than minting duplicates — matching spec.md #565's "search for a compatible spec first."
+- **Write config:** `SparkWriteConf.java:160` checks `table.specs().containsKey(outputSpecId)` before writing to a chosen spec.
+
+## Summary
+
+Engines consume partition evolution in three concrete ways: (1) they *drive* it by funneling `ALTER TABLE ... PARTITION` DDL through `updateSpec()` into the guarded `BaseUpdatePartitionSpec`; (2) on read, the core `ManifestGroup` projects predicates and residuals **per-manifest spec** (`ManifestGroup.java:211-212, 284-290`), which is what makes old+new partitions coexist transparently; and (3) Spark builds a **unified grouping/partition type across all live specs** (`SparkPartitioningAwareScan.java:169-177`, `Partitioning.java:225-227, 240-244`) so scheduling, grouping, deletes, and file placement all stay correct while a table is mid-evolution. Every one of these relies on the invariant that each manifest records its own spec and that field IDs are stable across specs — the two things the spec mandates and `BaseUpdatePartitionSpec` guarantees.

@@ -1,0 +1,7 @@
+# The part of ~/.hermes/config.yaml that points Hermes Agent at vLLM on the
+# DGX Sparks. Put the vLLM API key in ~/.hermes/.env as SPARK_VLLM_API_KEY.
+model:
+  default: dsv4flash
+  provider: custom
+  base_url: http://192.0.2.10:8000/v1  # replace with the first DGX Spark's address
+  key_env: SPARK_VLLM_API_KEY

@@ -1,0 +1,41 @@
+I now have the full picture. Here's how query engines in this repo consume table properties.
+
+## The core mechanism: table properties as the low-priority layer in config resolution
+
+Both Spark and Flink funnel read/write behavior through a shared "conf parser" that resolves a setting from several layers, with table properties being one fallback tier below query options/session config and above hard-coded defaults.
+
+Spark — `SparkConfParser.parse` (spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkConfParser.java:267-300):
+  1. per-query options (line 268-278, also camelCase aliases),
+  2. Spark session config (line 280-290),
+  3. the table property from the persisted map (line 292-297, `properties.get(tablePropertyName)`),
+  4. the `_DEFAULT` constant (line 299).
+
+Flink uses the same layered `.option(...).flinkConfig(...).tableProperty(...).defaultValue(...)` builder pattern (FlinkReadConf.java:97-113, FlinkWriteConf.java:72-110).
+
+So the "properties control read/write behavior" spec rule (format/spec.md Table Metadata section) is realized as: engine per-query and session settings win; otherwise the stored table property decides; otherwise the built-in default. The stored map is exactly the one the TableMetadata layer persists (TableMetadataParser writes it back as `properties`, TableMetadataParser.java:220).
+
+## Read-side examples (Spark)
+
+- Split/task size: `SparkReadConf.splitSize()` (spark/.../SparkReadConf.java:202-210) resolves `read.split.target-size` (`TableProperties.SPLIT_SIZE`) with default `SPLIT_SIZE_DEFAULT` — a query option or session conf overrides it, then the table property, then the default. `SparkScanBuilder` then applies the resolved value onto the scan (spark/.../source/SparkScanBuilder.java:728-731).
+- Split lookback: same pattern, `read.split.planning-lookback` (SparkReadConf.java:216-223).
+
+## Write-side examples (Spark)
+
+- Target file size: `SparkWriteConf.targetDataFileSize()` (spark/.../SparkWriteConf.java:209-216) resolves `write.target-file-size-bytes` (`TableProperties.WRITE_TARGET_FILE_SIZE_BYTES`) from options → table property → default. This is what sizes the data files the engine produces on a write.
+- Row-level op modes, formats, distribution: Spark `TestDelete`/`TestMerge` (tests) read `DELETE_MODE`, `MERGE_MODE`, `WRITE_DISTRIBUTION_MODE`, etc., and the JMH benchmarks set `DELETE_MODE`, `MERGE_MODE`, `MERGE_DISTRIBUTION_MODE`, `FORMAT_VERSION` via `ALTER TABLE ... SET TBLPROPERTIES` (spark/v3.5/spark-extensions/src/jmh/.../MergeCardinalityCheckBenchmark.java:130-133), confirming that engine write/merge semantics are plumbed through table properties.
+
+## Read-side examples (Flink)
+
+- `FlinkReadConf` resolves `read.split.target-size`, `read.split.planning-lookback`, `read.split.open-file-cost` from the table property (flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/FlinkReadConf.java:97-124).
+- Name mapping for column resolution: `nameMapping()` reads `schema.name-mapping.default` (`TableProperties.DEFAULT_NAME_MAPPING`, FlinkReadConf.java:165-167) — the spec's own column-projection fallback property.
+
+## Write-side examples (Flink)
+
+- `FlinkWriteConf` resolves upsert mode (`write.upsert.enabled`), file format (`write.format.default`), target file size (`write.target-file-size-bytes`), and Parquet compression (`write.parquet.compression-codec`) from table properties with defaults (FlinkWriteConf.java:72-110, 209-216).
+- Flink's catalog also reads the table's comment property back when returning table descriptors: `FlinkCatalog` puts `TableProperties.COMMENT` into the returned properties map (flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/FlinkCatalog.java:594-597).
+
+## Linking back to the spec
+
+The engine usage is the practical payoff of the spec's design. Because the spec defines `properties` as an engine-agnostic string→string config map persisted in table metadata — and deliberately does not enumerate the keys, leaving the long tail to implementations — Spark and Flink each define their own read/write option constants in `TableProperties` (the `write.*`, `read.*`, `commit.*` set) and map them to engine decisions through this layered parser. The `format-version` reserved property even drives behavior: the benchmarks and Flink tests set it at CREATE time via TBLPROPERTIES to select the metadata format version (spark .../JMH benchmarks, flink .../TestRewriteDataFilesAction.java:122-131), and core strips it from persistence (TableMetadata.java:93-106) while still honoring it.
+
+So the answer to "how do query engines use table properties": they read the persisted table-property map at planning time as the lowest-priority configuration layer — above built-in defaults, below per-query/session settings — and translate a small, well-known set of `write.*`/`read.*` keys into concrete scan, write, and merge decisions.

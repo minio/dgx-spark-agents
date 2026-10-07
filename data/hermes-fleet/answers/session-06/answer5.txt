@@ -1,0 +1,19 @@
+1. Transactions = one atomic, retryable commit for multiple metadata updates. Entry point `BaseTable.newTransaction()` → `Transactions.newTransaction` → `new BaseTransaction(..., SIMPLE, ...)`. Start here: core/src/main/java/org/apache/iceberg/BaseTable.java:269
+
+2. A transaction is one all-or-nothing commit of a single metadata pointer. Each staged update advances in-memory `current`; one final CAS publishes everything. Read the core class: core/src/main/java/org/apache/iceberg/BaseTransaction.java:250 (the `commitTransaction` switch on type)
+
+3. Tables used inside a transaction are wrapped so no operation commits externally. `TransactionTableOperations.commit` is the in-memory CAS that throws `CommitFailedException` on a stale base instead of committing. core/src/main/java/org/apache/iceberg/BaseTransaction.java:483
+
+4. The real atomic publish is `commitSimpleTransaction`: refresh the live ops, re-apply the whole update chain if the base moved, then one `ops.commit(base, current)`. core/src/main/java/org/apache/iceberg/BaseTransaction.java:350
+
+5. Conflicts are detected, not prevented (the spec's optimistic concurrency). Compatibility is checked by the catalog: `base != current()` → `CommitFailedException`. core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java:109
+
+6. Retry is restricted to genuine conflicts via `onlyRetryOn(CommitFailedException.class)`, with exponential backoff. `Tasks` is the retry engine. core/src/main/java/org/apache/iceberg/BaseTransaction.java:366 and core/src/main/java/org/apache/iceberg/util/Tasks.java:406
+
+7. Re-applying a transaction on retry is safe because operations validate their preconditions first (e.g. files still present), per the spec's "defined conditions." Hook: `SnapshotProducer.runValidations` → `validate()`. core/src/main/java/org/apache/iceberg/SnapshotProducer.java:375
+
+8. Failed commits must not delete committed data: the success path loads the new snapshots and filters their manifest files out of cleanup. core/src/main/java/org/apache/iceberg/BaseTransaction.java:390
+
+9. Unknown commit state (e.g. lost ack) must not clean up anything — `CommitStateUnknownException` is re-thrown untouched. Contract at TableOperations, handling at BaseTransaction.java:374. core/src/main/java/org/apache/iceberg/TableOperations.java:53
+
+10. Engines use transactions only for DDL (ALTER TABLE), never reads/DML, and snapshot management is done outside the transaction. Example: core/src/main/../spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java:866 (and flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/util/FlinkAlterTableUtil.java:45).

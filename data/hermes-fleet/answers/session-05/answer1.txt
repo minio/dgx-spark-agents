@@ -1,0 +1,39 @@
+I've read format/spec.md end to end (all 2,153 lines). Here's what it says about table metadata files and why they're designed the way they are.
+
+## What the spec says
+
+Table state is maintained in a **JSON metadata file**. Every change to table state creates a *new* metadata file, which is committed by an atomic swap over the previous one (Overview, and Table Metadata §). Because each version replaces the one it was based on, this produces a **linear history** of table versions.
+
+A metadata file contains the full description of the table:
+
+- Identity and version: `format-version`, `table-uuid`, `location`, `last-updated-ms`
+- Schema: `schemas` (a list) plus `current-schema-id` (v1 used a single `schema` field)
+- Partitioning: `partition-specs` plus `default-spec-id` and `last-partition-id` (v1 used single `partition-spec`)
+- Sorting: `sort-orders` plus `default-sort-order-id`
+- Snapshot state: `snapshots` (a list of valid snapshots, each pointing at a manifest list), `current-snapshot-id`, `snapshot-log`, `metadata-log`
+- References: `refs` (tags and branches)
+- Versioning/ID bookkeeping: `last-sequence-number`, `last-column-id`
+- Optional extras: `properties`, `statistics`, `partition-statistics`, `encryption-keys`, and (v3+) `next-row-id`
+- v4 makes `location` optional (relative paths, paths resolved against table location)
+
+The **snapshots are embedded in the table metadata JSON** — they are not separate files. Each snapshot entry is small and points to a **manifest list** file, which in turn lists **manifest** files, which list the individual **data/delete files**. So the metadata is a three-tier tree: table metadata → manifest list → manifests → files.
+
+The commit / atomic-swap step is deliberately *not* standardized — it depends on the catalog. Two schemes are shown: a file-system scheme using atomic rename (`v<V>.metadata.json`, now deprecated and flagged as unsafe in object stores), and a metastore scheme using a check-and-put pointer swap. Optimistic concurrency (§): a writer builds a new metadata file from the current snapshot, then tries to swap the pointer; if another writer won the race, it retries against the new base, re-validating only the conditions that must still hold.
+
+## Why it's designed this way
+
+The design is a direct answer to the Goals (§) — especially serializable isolation, speed (O(1) planning), and scale without a central metadata bottleneck:
+
+- **Immutability → isolation without locks.** Files are written in place, never modified; each committed change is a new metadata file. Readers load one metadata file and get a consistent snapshot state, so they need no locks. Writes are all-or-nothing via the atomic pointer swap, so a commit is never partially visible — that's the "serializable isolation" goal.
+
+- **All-or-nothing, conflict-detected commits.** An atomic swap means concurrent writers can't silently overwrite each other — a lost update is impossible because a stale base fails the compare-and-swap. That's what turns concurrent, distributed writes (no central store) into safe operations. The retry-and-validate model preserves the linear commit history (Commit Conflict Resolution §).
+
+- **O(1) planning and scale.** Snapshots are tiny and inlined, and files live in a tree beneath them. To plan a scan you read one metadata file (O(1)), then the current manifest list, and can use partition summaries / counts / column bounds to skip manifests before touching broad detail — this is the "O(1) remote calls, not O(n) with table size" goal, and it keeps clients doing the work rather than a central store.
+
+- **Cost-based optimization data lives nearby.** Metadata carries file-level metrics (bounds, counts), manifest-level partition summaries, and optional statistics files — all so cost-based planners and predicates can prune without scanning data.
+
+- **Evolution without rewriting.** Because the schema/spec history is stored as lists with a "current" id, tables can evolve schema and partitioning without rewriting prior data — readers always use the spec recorded in each manifest, not the current one. That's the "storage separation" and "evolution" goals. The deprecated v1 single-field forms exist purely for backward compatibility.
+
+- **Latest-version JSON is the source of truth.** Each new metadata file fully describes the table at that point, and the `metadata-log` records the chain of prior files — this linear, append-only history is what enables time travel, GC of old snapshots/files, and disaster recovery.
+
+In short: table metadata files are immutable, self-contained snapshot-points of table state, joined into a linear history by an atomic pointer swap, with the heavy file detail pushed down into manifest lists and manifests so scans stay O(1) and clients can plan in parallel without a central metadata bottleneck.

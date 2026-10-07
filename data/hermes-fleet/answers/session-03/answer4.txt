@@ -1,0 +1,39 @@
+Two distinct engine integrations exist. Here's how each relies on (and extends) the core expiration logic from RemoveSnapshots.java.
+
+## 1. Spark — a pull/one-shot model wrapped in a SQL procedure and an action
+
+Entry point is the `expire_snapshots` SQL procedure (`ExpireSnapshotsProcedure`). Users call something like `CALL system.expire_snapshots('db.tbl', TIMESTAMP '2020-01-01', 5)`. The procedure declares parameters for `older_than`, `retain_last`, `snapshot_ids`, `max_concurrent_deletes`, `stream_results`, and `clean_expired_metadata` (ExpireSnapshotsProcedure.java:48-72), parses their values from the call args (lines 115-123), and forwards them onto the Spark action (lines 133-170):
+- `expireOlderThan` ← `older_than` (line 136)
+- `retainLast` ← `retain_last` (line 140)
+- `expireSnapshotId` per ID ← `snapshot_ids` (lines 158-160)
+- `cleanExpiredMetadata` (line 169)
+
+These are exactly the fluent knobs on the core `ExpireSnapshots` interface (the ones RemoveSnapshots.java implements), so the procedure is a thin SQL veneer over the same retention-policy machinery described in the earlier answers.
+
+The real engine-specific work is in `ExpireSnapshotsSparkAction.execute()`/`expireFiles()` (ExpireSnapshotsSparkAction.java:149-188). The key design decision (javadoc at lines 50-64):
+- It does NOT let core do the physical deletion. It calls `table.expireSnapshots()` and chains the same options (lines 155-171), then commits with `cleanupLevel(CleanupLevel.NONE)` (line 173). Setting `CleanupLevel.NONE` is the switch that makes `RemoveSnapshots.commit()` skip file cleanup entirely (RemoveSnapshots.java:378-380, and FileCleanupStrategy reaches `NONE` guard at ReachableFileCleanup.java:57-60). So core only computes and commits which snapshots expire; it never touches files.
+- Spark then computes the file delta itself with `except(validFileDS)` (line 184): the union of all content files, manifests, manifest lists, and statistics files referenced by the now-expired snapshots (from pre-expiration metadata, `fileDS(originalMetadata, deletedSnapshotIds)`, lines 181, 240-246), minus the same set in the post-expiration state (`fileDS(updatedMetadata)`, line 177). `findExpiredSnapshotIds` (lines 248-256) computes expired ids by set-difference of snapshot lists — the same "expire everything not retained" outcome as `RemoveSnapshots.internalApply` (RemoveSnapshots.java:233-237), but read back from the committed metadata.
+- This replicates, in Spark's distributed Dataset layer, the reachability invariant that core implements in `ReachableFileCleanup`: delete only files present before and absent after (anti-join), so a file still reachable by a retained snapshot is never in the delete set (cf. ReachableFileCleanup.java:199-226). The javadoc explicitly notes "expiration will be fully committed before any deletes are issued" (lines 57-58), and deletion runs from the executors (doExecute, lines 224-230) with bulk-vs-`deleteWith` fallback (lines 258-273).
+- The procedure surfaces the result counts back as a row (`toOutputRows`, lines 178-188) — the same metrics the core `Result` carries.
+
+There are parallel copies of these same two files under `spark/v4.0`, `v4.1`, `v4.2`, so the integration is versioned, not single-sourced.
+
+## 2. Flink — an asynchronous, streaming/event-driven maintenance operator
+
+Flink's usage is fundamentally different in shape: instead of a user-invoked one-shot, expiration runs continuously inside a streaming job. `ExpireSnapshotsProcessor` is a `ProcessFunction<Trigger, TaskResult>` (ExpireSnapshotsProcessor.java:46) that reacts to a `Trigger` (e.g. every N commits or on an interval — see the config in the tests, TestExpireSnapshotsConfig.java:41-46).
+
+On each trigger (`processElement`, lines 84-125):
+- It refreshes the table and calls the same core API, configuring it from the streaming job's options: `expireOlderThan(ctx.timestamp() - maxSnapshotAgeMs)` (line 91), `retainLast(numSnapshots)` (line 95), `cleanExpiredMetadata` (line 99), and `planWith(plannerPool)` for parallel planning (line 104).
+- Critically, it converts core's deletion hook into a streaming side output: `deleteWith(file -> ctx.output(DELETE_STREAM, file))` (lines 105-109), with `cleanupLevel(CleanupLevel.ALL)` (line 110) and `.commit()` (line 111). This is the inversion of Spark's model — here Flink DOES let core drive deletion planning/physical deletion, but redirects each file path into a `DELETE_STREAM` side output (a distinct `OutputTag`, lines 48-49) instead of deleting immediately. A downstream operator consumes that stream to do the actual file removal, so expiration and deletion are decoupled into separate streaming stages.
+- It reports success/failure as a `TaskResult` on the main output (lines 118-124), which Flink's maintenance framework uses for retries/telemetry. The whole thing is wrapped so an exception on one trigger is captured and reported (`TaskResult` with the error list) rather than crashing the job (lines 120-124).
+- `table.refresh()` at line 88 re-reads current metadata, so each trigger operates on the freshest state — the same optimistic-refresh discipline as `RemoveSnapshots.internalApply` (RemoveSnapshots.java:197).
+
+Same pattern exists in `flink/v2.2` and `flink/v2.3`, plus a builder/config layer (`ExpireSnapshots.Builder` backed by `ExpireSnapshotsConfig` reading Flink `ConfigOptions`, FlinkWriteOptions.java:95) so the streaming options map onto the retention knobs.
+
+## Contrast worth calling out
+
+Both engines funnel through the exact same core `RemoveSnapshots` retention algorithm (retained-refs + branch ancestors + age/count floors + `main` never expires), but they split the delete half differently:
+- Spark: core computes expiry only (`CleanupLevel.NONE`), and Spark computes reachability itself as a distributed anti-join so it can delete in parallel from executors. It re-implements core's reachability invariant at the Dataset level.
+- Flink: core computes expiry AND plans the deletions (`CleanupLevel.ALL`), but Flink intercepts each planned delete via `deleteWith` and re-emits it as a stream for a downstream deleter — using core's reachability logic as the source of truth rather than recomputing it.
+
+That difference mirrors an architectural line in the spec/code: the core contract (RemoveSnapshots.java:196-276 deciding what expires) is engine-agnostic, while how and where files are physically removed is left to the engine. Spark chooses to own deletion (shuffle/parallelism priority), Flink chooses to delegate it into its stream topology (event-driven priority).

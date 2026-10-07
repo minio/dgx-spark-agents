@@ -1,0 +1,18 @@
+{
+ "label": "day1-2",
+ "wall_s": 94.9,
+ "server": {
+  "prompt_tokens_total": 914779.0,
+  "generation_tokens_total": 3997.0,
+  "prefix_cache_hits_total": 887296.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 17.0,
+  "time_to_first_token_seconds_count": 11.0,
+  "request_prefill_time_seconds_sum": 15.5,
+  "request_decode_time_seconds_sum": 75.1
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "umber from the refreshed base (line 299, `base.nextSequenceNumber()`), and re-derives the manifest list. Because the append operations are designed to be re-applicable (no conflict conditions on pure appends), the same data is simply layered on top of A's snapshot.\n- A fresh random snapshot id is assigned (`snapshotId()`, lines 697\u2013706; also used in `manifestListPath()` at 622\u2013633).\n- commit is retried. If B now wins this attempt, B's new snapshot has A's snapshot as parent and sequence = A's + 1. Both commits are preserved \u2014 serialized by the CAS rather than lost.\n\nThis is the heartbeat of Iceberg's optimistic concurrency: the losers rebase onto the winner and re-apply, so concurrent appends all eventually land without losing data, and no locks are taken by readers (matching the spec's \"Serializable isolation\" goal).\n\nKey failure-handling details worth knowing:\n- The retry only fires for `CommitFailedException` (line 496). Other runtime failures are not retried and are instead cleaned up: `commit()` suppresses exceptions and calls `cleanAll()` to remove uncommitted manifests unless strict cleanup demands otherwise (SnapshotProducer.java:538\u2013544; `cleanAll` at 610\u2013616).\n- After the loop succeeds, it refreshes to find the committed snapshot by id and cleans up the manifest lists written by *unsuccessful* earlier attempts (SnapshotProducer.java:546\u2013569). Because the retried `apply()` writes a distinct manifest list each time (distinct attempt counter in `manifestListPath()`), leftover ones from lost attempts are deleted.\n- A `CommitStateUnknownException` is carefully *not* swallowed (SnapshotProducer.java:536\u2013537) and not cleaned up: the spec/API says deletion is unsafe when commit state is unknown (TableOperations.java:52\u201359). The REST client even does a best-effort reconciliation to detect whether the snapshot actually landed (RESTTableOperations.java:228\u2013265).\n\n### Citations\n- SnapshotProducer.java:484 (commit), 489\u2013534 (retry loop + apply + atomic commit), 296\u2013299 (refresh/parent/seq), 496 (retry only CommitFailedException), 533 (catalog commit), 538\u2013544 & 610\u2013616 (cleanup), 622\u2013633 & 697\u2013706 (fresh list/snapshot id), 536\u2013537 (CommitStateUnknownException)\n- TableOperations.java:28, 44\u201364 (atomicity contract for commit)\n- BaseMetastoreTableOperations.java:109\u2013135 (stale-metadata guard), 86\u2013102 / 184\u2013216 (refresh reload)\n- HadoopTableOperations.java:131\u2013162 (filesystem commit), 368\u2013387 (rename CAS \u2192 CommitFailedException)\n- JdbcTableOperations.java:200\u2013209 (validate location), 146\u2013163 (0-row UPDATE \u2192 CommitFailedException); JdbcUtil.java:553\u2013562 (guarded UPDATE WHERE clause)\n- RESTTableOperations.java:178\u2013241 (requirements + POST), 228\u2013265 (unknown-state reconciliation)\n\nNote: the exact CAS mechanism differs per catalog, but every implementation honors the same contract \u2014 make the pointer swap atomic and throw `CommitFailedException` on a stale base \u2014 which is what lets the retry loop in SnapshotProducer turn a conflict into a successful rebase.\n",
+ "stderr": ""
+}

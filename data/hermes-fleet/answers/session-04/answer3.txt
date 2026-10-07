@@ -1,0 +1,67 @@
+I now have everything I need. Here are the edge cases and failure modes, how the code guards each, and — where the spec actually constrains the behavior — the spec link.
+
+## Edge cases and failure modes in manifest merging
+
+### 1. Merging different partition specs into one manifest
+A manifest's schema is derived from its partition spec (spec.md:660, 666), so merging manifests with different specs would produce a corrupt/illegal manifest.
+
+Guard: `mergeManifests` → `groupBySpec` groups every input manifest by `partitionSpecId` into per-spec buckets (ManifestMergeManager.java:88, 129-137). `mergeGroup` is then called once per spec id, and each merged output is written by a writer created for that single spec (`newManifestWriter(spec(specId))`, ManifestMergeManager.java:195; spec resolved in the subclass, MergingSnapshotProducer.java:1281-1283). Group keys are ordered by spec id via a reverse-ordered tree map (ManifestMergeManager.java:130-133) so output stays deterministic.
+
+Left deliberately alone: the spec groups only *within* a spec; it explicitly lets different specs coexist across manifests (spec.md:981).
+
+### 2. Merging would reorder manifests and break write-audit-publish / age-off
+Reordering manifests can cause files to be aged off (garbage-collected) in a different, less-predictable order, and can break WAP ordering guarantees.
+
+Guard: the packer uses a lookback of 1, and the comment documents the intent — "use a lookback of 1 to avoid reordering the manifests" and "pack from the end so that the manifest that gets under-filled is the first one, which will be merged the next time" (ManifestMergeManager.java:140-146). Bins are processed in parallel but results are placed into a fixed array indexed by bin position, and concatenated in that order, explicitly "to preserve the order of manifests and contents" and "avoid random deletes when data files are eventually aged off" (ManifestMergeManager.java:148-152, 184).
+
+### 3. A just-appended (in-memory) manifest being merged too aggressively
+The freshly written manifest holds data that hasn't been durably aged; merging it into a tiny combined manifest is wasted work and can prevent larger older groups from being merged.
+
+Guard: `mergeGroup` checks `bin.contains(first) && bin.size() < minCountToMerge` and, if so, passes all of those manifests through untouched instead of merging (ManifestMergeManager.java:175-177). The comment says this is "applied only to bins with an in-memory manifest so that large manifests don't prevent merging older groups" (ManifestMergeManager.java:170-174). The "first" manifest is the appended/new manifest (ManifestMergeManager.java:85). `minCountToMerge` and `targetSizeBytes` are read from table properties with defaults (MergingSnapshotProducer.java:120-129).
+
+### 4. Rewriting a manifest that only needs one file (waste, no merge needed)
+Rewriting a bin of size 1 would create a duplicate manifest for no benefit.
+
+Guard: `if (bin.size() == 1) { outputManifests.add(bin.get(0)); return; }` — single-manifest bins are returned untouched, no rewrite (ManifestMergeManager.java:164-168). This is the direct read side of spec.md:87 reusing manifests "to avoid rewriting metadata that is slow-changing."
+
+### 5. Merging would suppress deletes from a previous snapshot
+A DELETED entry from an *older* snapshot must not be carried into the merged manifest; only the current snapshot's logical deletes belong in the new snapshot.
+
+Guard: in `createManifest`, DELETED entries are written only `if (entry.snapshotId() == snapshotId())`, otherwise they are dropped (ManifestMergeManager.java:203-208) — matching spec.md:691 (deletes are "informational only and not used in scans") and spec.md:692 (entry status/snapshot records where the file was added or deleted). Golden-path handling of the three statuses: DELETED-by-this-snapshot → `writer.delete`, ADDED-by-this-snapshot → `writer.add`, everything else → `writer.existing` (ManifestMergeManager.java:202-215). A wrong check here is precisely the kind of bug that would resurrect logically deleted files.
+
+### 6. Wrong reclassification of entries on merge (ADDED vs EXISTING)
+A file added in a *current* snapshot that flows into the merged manifest must stay ADDED; any file added in a prior snapshot must become EXISTING, otherwise sequence-number inheritance and clarity about which snapshot added the file break (spec.md:699-700).
+
+Guard: the else-branch rewrites all non-current-snapshot entries (older ADDED and EXISTING) as `existing`, while entries ADDED by this snapshot are kept as `add` (ManifestMergeManager.java:209-215). `writer.existing`/`add` preserve the entry's data/file sequence numbers correctly (ManifestWriter.java:165-192).
+
+### 7. Sequence-number corruption or loss when rewriting existing files
+The spec: existing files written into a new manifest "must be non-null and set to the original values that were either inherited or provided at the commit time" (spec.md:935), and data sequence number "must never change after a file is added" (spec.md:704).
+
+Guard: the merge routes old entries through `writer.existing(entry)` → `wrapExisting` (ManifestWriter.java:190-192, 184-188), which preserves the entry's data and file sequence numbers rather than re-inheriting them. Only genuinely new adds in this snapshot go through `writer.add`/`addEntry` with the (unassigned) sequence number to inherit (ManifestWriter.java:165-167). See the deeper discussion of this exact conformance in my previous answer (point 5).
+
+### 8. Uncommitted / orphaned merged manifests leaking (failed or retried commit)
+If a commit fails, newly written merged manifests must not be left on disk or referenced, and merged results should be reusable on retry rather than rewritten.
+
+Guard: results are cached keyed by the input bin so a retry reuses the same merged file (`mergedManifests.containsKey(bin)` → reuse, ManifestMergeManager.java:188-193; `mergedManifests.put(bin, manifest)`, ManifestMergeManager.java:230). `cleanUncommitted` deletes any merged manifest not in the committed set and decrements the replaced-count accordingly (ManifestMergeManager.java:108-127); the producer calls it for all four managers on commit failure (MergingSnapshotProducer.java:1112-1118). This matches spec.md:91-99 (optimistic concurrency, retry-apply) and spec.md:107/937 (write once, reuse on retry).
+
+### 9. The merged summary/`replace` accounting going stale
+The snapshot summary must reflect how many manifests were created/kept/replaced (spec.md:2116-2118), and an inaccurate count is a metadata-quality bug.
+
+Guard: `replacedManifestsCount` is tracked as an atomic counter, incremented in `createManifest` for each replaced *previous-snapshot* manifest (ManifestMergeManager.java:230-236), exposed via `replacedManifestsCount()` (ManifestMergeManager.java:104-106), and the producer merges data- and delete-manager counts into the `buildManifestCountSummary` summary (MergingSnapshotProducer.java:1080-1081). In-memory manifests are deliberately not counted as replaced (ManifestMergeManager.java:231-233) — matching the "kept vs replaced" distinction in the spec.
+
+### 10. New data/delete manifests being re-written or cached incorrectly (cache invalidation)
+`newDataFilesAsManifests` / `newDeleteFilesAsManifests` cache the freshly written manifests and delete the previous cache when new files arrive, so a stale cached manifest must not be reused. This is upstream state feeding the merge, not the merge itself, but it is a real failure mode on the same path.
+
+Guard: before regenerating, the cached manifests are deleted from disk and cleared (`hasNewDataFiles && !cached.isEmpty()` → delete+clear, MergingSnapshotProducer.java:1148-1165 for data; 1175-1207 for deletes). The delete cache also clears the `addedDeleteFilesSummary` because a new DV could require a merge and the summary "cannot be generated until after merging is complete" (MergingSnapshotProducer.java:1180-1187). There's a known inefficiency acknowledged in code ("triggers a rewrite of all delete manifests even if there is only one new delete file", MergingSnapshotProducer.java:1180-1182).
+
+### 11. Multiple deletion vectors for one data file
+Not a manifest-merge failure per se, but it's on the delete-merge path: the spec requires at most one DV per data file and that writers merge new deletes into existing vectors (spec.md:1366), and that a DV for a file must replace prior position-delete files (spec.md:1387).
+
+Guard: `mergeDVs` groups DVs by referenced data file and, if more than one exists, warns "Merging N duplicate DVs for data file ..." and calls `DVUtil.mergeAndWriteDVsIfRequired` to coalesce them (MergingSnapshotProducer.java:1209-1235). The warning itself confirms the edge case exists and is detected rather than silently mishandled.
+
+### 12. Concurrency: another writer/commit running during our merge
+Concurrent commits are the spec's central correctness concern (optimistic concurrency, spec.md:91-99). The merge runs on worker threads from a pool (`executeWith(workerPoolSupplier.get())`, ManifestMergeManager.java:157; wired to `MergingSnapshotProducer.this::workerPool`, MergingSnapshotProducer.java:1272), and the merged results are cached for retry (ManifestMergeManager.java:188-193, 230). The `stopOnFailure().throwFailureWhenFinished()` (ManifestMergeManager.java:155-156) ensures a worker failure aborts the batch rather than silently committing a partial merge; the retry/cleanup paths (edge case 8) then handle the aborted commit.
+
+## Summary of the guard pattern
+
+Most guards live in `ManifestMergeManager` itself (grouping by spec, lookback-1 ordering, single-manifest pass-through, snapshot-scoped delete/add/existing reclassification, sequence-number-preserving writes, merge caching + cleanup), with the tuning knobs (`targetSizeBytes`, `minCountToMerge`, `mergeEnabled`) supplied by `MergingSnapshotProducer` from table properties (MergingSnapshotProducer.java:120-134). The one thing deliberately *not* guarded here is the merge *policy* itself — packing threshold, lookback, `minCountToMerge` — which the spec intentionally leaves to implementations (spec.md only requires the single-spec, immutable, correct-status, sequence-number-conserving properties that the guards preserve). Every guard above is either directly required by the spec or a faithful implementation choice that upholds it; cases most strongly anchored to spec text are 1, 2, 3, 5, 7, and 9.

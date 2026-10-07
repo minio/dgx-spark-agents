@@ -1,0 +1,44 @@
+I read format/spec.md in full (all 2,153 lines, three chunks). Here's what it says about row deltas — the "row-level deletes" feature — and the reasoning behind it.
+
+## The core problem
+
+Iceberg's data files are immutable: once written, a data file is never modified (that's the "in-place write" requirement under File System Operations). Row-level deletes are the mechanism that lets you logically delete or update individual rows inside those immutable files without rewriting them. Version 1 had no way to do this; Version 2 introduced it, and v3/v4 refined it. The spec is explicit: "This version can be used to delete or replace individual rows in immutable data files without rewriting the files."
+
+## The three delete encodings
+
+The spec describes two (really three) ways to mark rows as deleted, all stored in "delete files":
+
+1. Position deletes (V2) — mark a row deleted by data file path + row position. Stored in a position delete file.
+2. Deletion vectors (V3+) — a bitmap of deleted row positions for a single referenced data file, stored in a Puffin file. The DV is the replacement for position delete files.
+3. Equality deletes (V2/V3) — mark a row deleted by column values (e.g. `id = 5`). Prohibited in v4.
+
+## Why the design is the way it is
+
+There's a clear trajectory across versions, and each step is a reaction to the inefficiency of what came before:
+
+**Position deletes (v2).** Mark rows by (file, position). Simple and exact — no need to read data to know what's deleted. But they're a separate file that must be fetched and consulted during every scan, row by row, which is expensive at runtime. This is why the spec moves away from them.
+
+**Deletion vectors (v3) replace position delete files.** A DV is a Roaring bitmap of deleted positions for exactly one data file. The spec calls it "more efficient at execution time than position delete files," and there can be at most one DV per data file. The big win: the DV bitmap is stored as a blob in a Puffin file, addressed by (containing file location, `content_offset`, `content_size_in_bytes`), so readers can fetch just the relevant blob directly instead of a whole delete file. Notably, writers may no longer add new position delete files to v3 tables — existing ones are valid, but they must be merged into DVs. The DV is the evolution that makes row-level deletes practical at scale.
+
+**Equality deletes — rejected over time.** The spec describes them (writing `id = 5` style matches, with multiple columns forming an AND, null matching null), but they're progressively eliminated: still writable in v2/v3, fully prohibited in v4. The reason is evident from the design: applying an equality delete requires actually reading data rows and comparing values, which is far more expensive than the bitmap/position approaches, and they can't express row lineage (the spec notes lineage isn't tracked for equality-delete updates because the engine can't know the original row ID).
+
+## The machinery that makes deletes correct
+
+This is where the deepest design reasoning lives — delete application is governed by ordering, not just matching:
+
+**Sequence numbers are the backbone.** Every commit gets a monotonically increasing sequence number. Deletes only apply to older data. The spec's scan-planning rules encode exactly this:
+- A position delete (file or vector) applies when the data file's sequence number is **less than or equal to** the delete's sequence number — so same-commit deletes apply.
+- An equality delete applies when the data file's sequence number is **strictly less than** the delete's — because equality deletes must precede the data they delete (you can't delete rows added in the same commit you don't know about).
+- Data and delete files are written with `null` sequence numbers and "inherit" them from manifest metadata at read time. This is a deliberate design choice: because the sequence number isn't known until commit succeeds, writing `null` and inheriting lets a manifest be written once and reused across commit retries — only the manifest list must be rewritten.
+
+**Deletes are scoped to partition and file.** Position deletes are per-file (matching `file_path`), equality deletes apply within a partition (a delete with an unpartitioned spec is the sole exception — it becomes a "global delete"). This partitioning keeps delete application local and parallelizable.
+
+**Metrics filter deletes too.** Manifest entries store bounds/counts for delete files just like data files, describing the *deleted* values. This lets scan planning skip delete files that can't affect the query (the spec's example: a delete for rows 1–4 can be ignored for a scan of `id = 9`).
+
+**Row lineage (v3) extends deletes to track rows.** `_row_id` (unique per row) and `_last_updated_sequence_number` are assigned via inheritance, again because the starting row ID and sequence number aren't known until commit. This mirrors the sequence-number inheritance trick, and it's what makes row-level *updates* (delete + insert) auditable.
+
+## Why the versions move the way they do
+
+The throughline: v2 proves the concept with position and equality delete files; v3 replaces position files with DVs to make deletes cheap at read time and adds lineage; v4 drops equality deletes entirely because they're the expensive outlier. In every case the design is governed by the immutability constraint — the only way to "change" data is to add metadata describing what old rows are gone, ordered against the data by sequence number, so that a scan can reconstruct a consistent, correct view without locks and without rewriting files.
+
+One caveat worth flagging: the full answer to "why row deltas" sits at the spec level (the mechanics), but the *rationale* is only partially written down in the spec itself — things like "more efficient at execution time" appear tersely. If you want the deeper architectural argument, the v2 and v3 design proposals in the repo's PRs/issues carry more of that reasoning than the spec file does.

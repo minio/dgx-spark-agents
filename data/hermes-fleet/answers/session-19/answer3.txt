@@ -1,0 +1,68 @@
+Here are the concrete failure modes and edge cases, each with the guard and its location. I'm grouping them by theme.
+
+Hash stability under schema/type promotion
+------------------------------------------
+These are the highest-stakes failures because they silently change partition values, corrupting scan pruning (files land in the "wrong" bucket).
+
+- int→long promotion must not re-bucket. Spec requires int and long hash identically (Appendix B note 1). Guard: both `BucketUtil.hash(int)` and `hash(long)` funnel through `MURMUR3.hashLong(value)` (BucketUtil.java:38-44), so widening an int to a long produces the identical hash. `Bucket` routes both INTEGER and LONG to `BucketLong`/`BucketInteger` depending on dispatch (Bucket.java:58-65).
+- float→double promotion must not re-bucket. Guard: `hash(float)` casts to double then hashes `doubleToLongBits` — identical to `hash(double)` (BucketUtil.java:58-64). This is the spec's note 5.
+- nanosecond→microsecond timestamps must not re-bucket. Guard: `BucketTimestampNano` converts nanos to micros before hashing (Bucket.java:235-247), so micro and nano timestamps hash the same.
+- decimal scale must not affect bucketing. Guard: `hash(BigDecimal)` hashes only `unscaledValue().toByteArray()` (BucketUtil.java:101-103); scale is dropped. Spec note 2.
+- date→timestamp promotion IS unsafe and the spec forbids it for partition source columns (format/spec.md:395). This is *not* guarded in the transforms package — the hash would change. It's gated in schema-evolution (PartitionSpec/SchemaUtil), which the transforms code can't see. Worth calling out as an inherent gap if you were expecting self-protection here.
+
+Negative values and modular arithmetic
+--------------------------------------
+- Java's `%` is negative for negative operands, which would break `truncate` (e.g. `truncate[10](-1)`). Guard: TruncateUtil uses the positive-remainder formula `value - (((value % width) + width) % width)` (TruncateUtil.java:55-60, 47-53), exactly the spec's corrective note 1 (format/spec.md:618). `truncateDecimal` applies the same normalization (TruncateUtil.java:63-74).
+- bucket would go negative or break `%` on the sign bit. Guard: `(hash(value) & Integer.MAX_VALUE) % numBuckets` (Bucket.java:116) discards the sign bit exactly as the spec's pseudo-code (format/spec.md:597).
+
+Invalid parameters
+------------------
+- Zero/negative bucket count or truncate width would divide-by-zero or misbehave. Guard: `Preconditions.checkArgument(numBuckets > 0, ...)` (Bucket.java:41-42, 55-56) and `Preconditions.checkArgument(width > 0, ...)` (Truncate.java:42, 52).
+
+Unsupported source types
+------------------------
+- Applying bucket to a non-bucketable type (e.g. boolean/float) or truncate to an unsupported one would produce garbage. Guard: `canTransform` checks the type id sets (Bucket.java:120-136; Truncate.java:94-104), and `bind` throws via `Preconditions.checkArgument(canTransform(type), ...)` (Bucket.java:93-96; Truncate.java:88-91). Identity rejects GEOMETRY/GEOGRAPHY/VARIANT via `UNSUPPORTED_TYPES` (Identity.java:34-35, 100-106), matching the spec's exclusions.
+
+Unknown transforms
+------------------
+- A reader that doesn't know a transform must not filter on it (could drop matching files). Guard: `UnknownTransform.project`/`projectStrict` return null (UnknownTransform.java:70-77), which the scan planner treats as "no constraint" (inclusive/true), per spec (format/spec.md:563, 1065).
+- A writer must not be able to apply an unknown transform. Guard: `bind`/`apply` throw UnsupportedOperationException (UnknownTransform.java:46-55).
+
+Predicate-projection soundness
+------------------------------
+The invariant the whole design depends on: inclusive projection must never drop a file that could match. Failure = incorrect query results.
+
+- Bucket can't project ranges (a comparison can't be mapped exactly onto a hash). Guard: `Bucket.project` handles only EQ and IN; comparisons return null (Bucket.java:168-181), which forces the scan to be fully inclusive rather than risk under-filtering.
+- Strict projection (used for residual predicates) must never over-claim. Guard: EQ returns null in strict projection for truncate because adjacent values map to the same partition (ProjectionUtil.java:77-80, 100-103, 218-221) — the correct response is "can't say for sure," not a wrong answer.
+- The inclusive bound-adjustment logic (`x < B` → `truncate(x) <= truncate(B-1)`, `ProjectionUtil.java:44-61`) exists precisely to keep the projection inclusive at the boundary.
+
+Historical correctness bug
+--------------------------
+- Pre-0.10.0 Iceberg transformed negative date/timestamps one value too large. Guard: `fixInclusiveTimeProjection` / `fixStrictTimeProjection` (ProjectionUtil.java:275-412) adjust projections for negative partition values so current code still reads data written by the buggy version. This is a classic forward-compat edge case baked into the projection layer.
+
+String/binary truncation boundaries
+-----------------------------------
+- Truncating a UTF-16 string by character can split a surrogate pair, producing a non-UTF8 value — a data-corruption failure. Guard: `UnicodeUtil.truncateString` truncates by code points via `codePointCount`/`offsetByCodePoints` (UnicodeUtil.java:41-55), and `incrementCodePoint` explicitly rejects surrogate code points as ill-formed (UnicodeUtil.java:120-136).
+- Finding a strict upper bound can overflow past the max code point / max byte. Guard: `truncateStringMax`/`internalTruncateMax` return null on overflow (UnicodeUtil.java:94-116); `truncateBinaryMax` returns null when all bytes overflow (BinaryUtil.java:104-126). Callers treat null as "no bound."
+
+Float edge cases in hashing
+---------------------------
+- `-0.0` and `0.0` must hash the same (they're equal per IEEE 754). Guard: `doubleToLongBits` canonicalizes `Long.MIN_VALUE` (the `-0.0` bit pattern) to `0L` (BucketUtil.java:46-56). NaN canonicalization is also spec-mandated (Buckets don't currently accept float/double, but the utility implements the spec's fallback table).
+
+Day transform result encoding
+-----------------------------
+- The `day` transform stores an int (days since epoch) but is typed as a date. Wrong reader handling = off-by-one partition lookups. Guard: the enum `Apply` returns int days (Timestamps.java:60-96, Dates.java:47-63), and `getResultType` reports `DateType` only for DAY (Days.java:45-48, Dates.java:101-106) — with the ordering path treating it consistently. This matches the spec's "readers must also accept int values" (format/spec.md:588).
+
+Ordering guarantees
+-------------------
+- Claiming a transform preserves/satisfies order incorrectly breaks sort-driven optimizations (e.g. treating day-sorted as month-sorted). Guard: `preservesOrder()` is overridden to true only where it truly holds (Identity.java:131-134, Truncate.java:123-126, TimeTransform.java:55-57, Dates.java:112-115, Timestamps.java:145-148), and `satisfiesOrderOf` compares actual granularities (TimeTransform.java:60-75) and truncate widths (Truncate.java:128-140). Bucket deliberately does not claim to preserve order (default false, Transform.java:87-89).
+
+Serialization/dedup
+-------------------
+- Identity across two spec fields must compare equal (else partition specs never dedup, and `dedupName` collisions would mislabel). Guard: `Identity.equals` treats all instances as equal, `hashCode` returns constant 0 (Identity.java:165-179); Bucket/Truncate compare by parameter only (Bucket.java:138-153, Truncate.java:142-157); `dedupName` returns `"time"` for all time transforms (TimeTransform.java:102-105) so year/month/day/hour on the same column collide correctly.
+
+Null input passthrough
+----------------------
+- A null value must map to a null partition value, never a computed bucket/truncate (which would co-locate all nulls with a real value or NPE). Guard: every `apply` short-circuits on `value == null` before computing (Bucket.java:112-117, Truncate.java:181-186 and each inner class, VoidTransform.java:44-47, Identity.java:88-90, Dates.java:48-63, Timestamps.java:60-96).
+
+The one failure class with no in-package guard is date→timestamp promotion (and anything else whose transform output changes under promotion) — that protection lives in the schema-evolution layer (SchemaUtil/PartitionSpec), not in `Transforms`. Everything else is defended at the transform/utility boundary itself.

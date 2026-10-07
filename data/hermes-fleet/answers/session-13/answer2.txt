@@ -1,0 +1,95 @@
+I now have the complete scan-planning implementation path. Here's how the code follows the spec, walking the call chain from `DataTableScan.doPlanFiles()` with file:line citations.
+
+## The call chain
+
+```
+DataTableScan.doPlanFiles()                          [DataTableScan.java:64-92]
+  -> BaseTableScan.planFiles()  (from SnapshotScan)
+  -> ManifestGroup.planFiles()                       [ManifestGroup.java:177-179]
+       -> plan()                                     [ManifestGroup.java:181-221]
+            -> entries()                             [ManifestGroup.java:276-391]
+                 -> ManifestEvaluator (manifest-level skip)
+                 -> ManifestFiles.read().liveEntries()
+                      -> ManifestReader.entries()     [ManifestReader.java:267-294]
+                           -> InclusiveMetricsEvaluator (file-level skip)
+            -> DeleteFileIndex (delete application)  [DeleteFileIndex.java]
+            -> createFileScanTasks()                  [ManifestGroup.java:393-405]
+```
+
+## 1. Start from the snapshot's manifest list
+
+`doPlanFiles()` reads `snapshot.dataManifests(io)` and `deleteManifests(io)` (DataTableScan.java:68-69). Those are lazily loaded from the manifest list (BaseSnapshot.java:183-189 reads `ManifestLists.read(...)`), then split by `content` into data vs. delete manifests (BaseSnapshot.java:191-200). This is the spec's "scans are planned by reading the manifest files for the current snapshot" (spec:1055) and the two-level data/delete split.
+
+## 2. Manifest-group configuration mirrors the spec's planning knobs
+
+`doPlanFiles()` wires the group (DataTableScan.java:72-91): `.filterData(filter())`, `.schemasById`/`.specsById`, `.ignoreDeleted()`, `.scanMetrics()`. Two points of note:
+
+- **`.ignoreDeleted()`** (DataTableScan.java:80) corresponds to "Deleted entries ... are not used in a scan" (spec:1055-1056). It's applied below in two layers.
+- **Parallel planning** is gated on "dataManifests.size() > 1 || deleteManifests.size() > 1" (DataTableScan.java:87), which is exactly the spec's rationale "Large tables can be split across multiple manifests so that implementations can parallelize job planning" (spec:982).
+
+## 3. Manifest-level skip using partition summaries
+
+`ManifestGroup.entries()` builds a per-spec cache of `ManifestEvaluator` (ManifestGroup.java:279-292). The evaluator projects the data filter to a partition filter per spec and evaluates each manifest's `partitions()` summary:
+
+```
+PartitionSpec spec = specsById.get(specId);
+projected = Projections.inclusive(spec, caseSensitive).project(dataFilter)
+```
+
+Then manifests are filtered with `evalCache.get(manifest.partitionSpecId()).eval(manifest)` (ManifestGroup.java:303-309). This is the spec's "Manifests that contain no matching files, determined using ... partition summaries, may be skipped" (spec:1057), evaluated against the `field_summary` (`contains_null`, `contains_nan`, `lower_bound`, `upper_bound`) stored in the manifest list (spec:1031-1043). `ManifestEvaluator.eval` (ManifestEvaluator.java:75-77) returns false only when the manifest definitely cannot match (e.g. `lt` fails when the partition's lower bound is already >= the literal, ManifestEvaluator.java:173-188, and `in` when no literal falls in `[lower, upper]`, ManifestEvaluator.java:301-308).
+
+When `ignoreDeleted` is set, manifests with no live (added/existing) entries are additionally dropped via `hasAddedFiles() || hasExistingFiles()` (ManifestGroup.java:311-320) — the spec's DELETED-ignoring filter.
+
+## 4. Per-spec inclusive projection — the core of "Storage separation"
+
+The projection at ManifestGroup.java:286-291 is the spec's central mechanism. `Projections.inclusive(spec, caseSensitive).project(dataFilter)` (Projections.java:90-92, 144-152) transforms a row predicate into a partition predicate. The Javadoc states the exact spec guarantee: "if the original expression matches a row, then the projected expression will match that row's partition" (Projections.java:37-38 vs. spec:1061-1062). In `InclusiveProjection.predicate` each partition field projects via `Transform.project` (Projections.java:218-222), converting e.g. `ts > X` to `ts_day >= day(X)` (the spec's worked example, spec:1063).
+
+Crucially, this happens **per manifest's own spec** — the evaluator is keyed on `manifest.partitionSpecId()` and built from `specsById.get(specId)` (ManifestGroup.java:284-291). That's the spec's "the partition spec that was used to write the manifest regardless of the current partition spec" (spec:1059). The same mechanism is reused independently for delete manifests in `DeleteFileIndex.Builder` (DeleteFileIndex.java:620-640). `Projections` also keeps the *strict* projection (Projections.java:110-133) used not for planning but for residual predicates.
+
+## 5. Reading each matching manifest and filtering live entries
+
+For each surviving manifest, `ManifestGroup.entries()` opens a reader via `ManifestFiles.read(manifest, io, specsById)` and calls `.liveEntries()` (ManifestGroup.java:344-357). `liveEntries()` → `entries(true)` (ManifestReader.java:354-356), which filters out DELETED status entries (`filterLiveEntries`, ManifestReader.java:358-365) — spec:1055-1056.
+
+## 6. File-level filters use column stats
+
+Inside `ManifestReader.entries()` (ManifestReader.java:267-294), when a row or partition filter exists, it applies three predicates per entry (ManifestReader.java:284-288):
+
+```
+evaluator.eval(entry.file().partition())   // partition-predicate eval
+&& metricsEvaluator.eval(entry.file())      // column-stats eval
+&& inPartitionSet(entry.file())
+```
+
+`metricsEvaluator` is an `InclusiveMetricsEvaluator` (ManifestReader.java:400-406) that evaluates the row filter against per-file column metrics — `value_counts`, `null_value_counts`, `nan_value_counts`, `lower_bounds`, `upper_bounds` (InclusiveMetricsEvaluator.java:90-96, and the metric lookups at 100-166). This is the spec's "Scan predicates are also used to filter data and delete files using column bounds and counts that are stored by field id" (spec:1067) — the doc explicitly notes the same evaluator is used for both data and delete files (InclusiveMetricsEvaluator.java:36-41, matching spec:1067). The reader even forces the stats columns into its projection when needed (`withStatsColumns`, ManifestReader.java:408-438) and only drops stats when safe (`dropStats`).
+
+## 7. Delete application follows the spec's scope rules
+
+`DeleteFileIndex` is built once from all delete manifests (ManifestGroup.java:191) and applied per data file via `ctx.deletes().forEntry(entry)` (ManifestGroup.java:400), producing the delete set attached to each `FileScanTask` (ManifestGroup.java:398-404).
+
+The implementation encodes the spec's sequence-number and partition-scope rules (spec:1073-1092):
+
+- **Equality deletes** are indexed by whether the spec is unpartitioned (`spec.isUnpartitioned()` → `globalDeletes`, else by partition, DeleteFileIndex.java:601-614) — matcing "equality delete files stored with an unpartitioned spec are applied as global deletes" (spec:1090). The `applySequenceNumber` is `dataSequenceNumber - 1` (DeleteFileIndex.java:881), implementing the spec's *strictly less than* rule for equality deletes (spec:1085, 1091). And it prunes equality deletes against data-file bounds via `canContainEqDeletesForFile` (DeleteFileIndex.java:258-320), the spec's "metrics can be used to determine whether a delete file's rows overlap" (spec:119).
+- **Position deletes / DVs** are keyed by referenced file path (`posDeletesByPath`/`dvByPath`, DeleteFileIndex.java:538-539, 200-232), satisfying the spec's `file_path == referenced_data_file` condition (spec:1076, 1080). Sequence filtering uses a binary-search "find start index" (DeleteFileIndex.java:687-703) so only deletes with `data seq <= delete seq` apply (spec:1077, 1081); a DV's `dataSequenceNumber()` must be >= the data file's (check at DeleteFileIndex.java:224-228). If both a DV and other deletes apply, the DV wins alone unless there are global/equality deletes (DeleteFileIndex.java:166-174) — the spec's rule that a DV makes position delete files ignorable (spec:1083).
+- **Partition equality** between delete and data file is validated (`validatePartitionMatch`, DeleteFileIndex.java:234-255), matching spec:1078/1082/1086 including spec/id checks.
+
+The delete index also parallel-loads and filters delete manifests with the same ManifestEvaluator/partition projection as data (DeleteFileIndex.java:616-668), so delete-file planning follows the same skip-by-partition-summary path as data.
+
+## 8. Parallelism and Output
+
+`plan()` wraps the per-manifest task iterables in `ParallelIterable` when an executor is set (ManifestGroup.java:216-217), matching the spec's parallelizable-job-planning goal (spec:982). `createFileScanTasks` defensively copies each data file and attaches deletes + residual evaluator to a `BaseFileScanTask` (ManifestGroup.java:393-405). Note the residual evaluator is built from `dataFilter` unless `ignoreResiduals` (ManifestGroup.java:182-189) — that's the *strict*-projection-derived residual that the spec pairs with the inclusive plan-time projection (spec:1095).
+
+## Summary of the mapping
+
+| Spec | Implementation |
+|---|---|
+| Plan from snapshot manifest list (1055) | BaseSnapshot.java:183-200 |
+| Skip manifests by partition summaries (1057) | ManifestGroup.java:303-309, ManifestEvaluator |
+| Per-manifest spec for projection (1059) | ManifestGroup.java:284-291 (keyed by specId) |
+| Inclusive projection guarantee (1061-1062) | Projections.InclusiveProjection, Projections.java:37-38 |
+| DELETED entries not used (1055-1056) | ignoreDeleted → liveEntries, ManifestReader.java:358-365 |
+| File filters via column stats (1067) | InclusiveMetricsEvaluator, ManifestReader.java:284-288 |
+| Equality delete seq strictly less; unpartitioned = global (1085, 1090) | DeleteFileIndex.java:881, 601-614 |
+| Position/DV by path + seq + partition (1076-1083) | DeleteFileIndex.java:200-232, 234-255 |
+| Parallelize planning across manifests (982) | ManifestGroup.java:87, 216-217 |
+
+The implementation is a faithful, layer-by-layer encoding of the spec: a two-level partition-summary skip, inclusive per-spec projection to decouple queries from layout, per-file column-metrics filtering, and sequence-number/partition-gated delete application — all metadata-only so planning cost scales with matching data, not table size.

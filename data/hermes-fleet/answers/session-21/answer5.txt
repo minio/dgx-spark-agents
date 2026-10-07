@@ -1,0 +1,21 @@
+1. Definition & intent — properties are a string→string config map in table metadata, for read/write behavior, not arbitrary metadata. Read: format/spec.md:1160 (v1-v3) / 1188 (v4).
+
+2. All the well-known keys & their defaults — the `write.*`, `read.*`, `commit.*`, `history.*` constants and `_DEFAULT` companions live here. Read: core/.../TableProperties.java:25 (scan the class, e.g. COMMIT_NUM_RETRIES at :89).
+
+3. Where they're stored & read back — `TableMetadata` holds the map and offers typed getters. Read: core/.../TableMetadata.java:504 (properties()) and :508-526 (property/propertyAsInt/Long).
+
+4. Serialization on disk — written and parsed as the `properties` JSON object in the metadata file. Read: core/.../TableMetadataParser.java:220 (write) and :468-474 (parse).
+
+5. Reserved keywords are stripped, not persisted — `format-version`, `uuid`, `current-snapshot-id`, etc. are never stored. Read: core/.../TableProperties.java:74-84 (RESERVED_PROPERTIES) and TableMetadata.java:93-106 (persistedProperties).
+
+6. Reserved keys are rejected at create — creating a table with a reserved property throws. Read: core/.../TableMetadata.java:115-118.
+
+7. How updates flow — `replaceProperties` computes removed/updated keys and rewrites metadata (immutable, atomic commit). Read: core/.../TableMetadata.java:627-649.
+
+8. Precedence when an engine reads a setting — query options and session config beat the table property, which beats the default. Read: spark/.../SparkConfParser.java:267-300 (the .tableProperty() tier at :292-297).
+
+9. A real read-path consumer — split size is resolved options → table property → default and applied to the scan. Read: spark/.../SparkReadConf.java:202-210 and SparkScanBuilder.java:728-731.
+
+10. A real write-path consumer — target data-file size resolved from `write.target-file-size-bytes` with default. Read: spark/.../SparkWriteConf.java:209-216.
+
+(Same layered pattern on Flink: FlinkReadConf.java:97-124 and FlinkWriteConf.java:72-110.)

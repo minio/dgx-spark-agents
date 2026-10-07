@@ -1,0 +1,41 @@
+I've read the entire spec (all 2,153 lines, in three consecutive chunks). Here's what it says about overwrite operations.
+
+## What "overwrite" means in the spec
+
+The word appears explicitly only once, in the snapshot `operation` field (line 973):
+
+> `overwrite` -- Data and delete files were added and removed in a logical overwrite operation.
+
+So overwrite is a label on a snapshot in the summary map, one of four possible operations alongside `append`, `replace`, and `delete`. That one line, however, sits on top of a lot of mechanics in the rest of the spec that define what an overwrite actually does and why it's structured the way it is.
+
+## The mechanics that make overwrite work
+
+An overwrite is fundamentally a single-commit atomic swap: it adds data and/or delete files (the new contents) and removes data files (the old contents being replaced) in one table-metadata commit. Everything about how that's possible is defined elsewhere in the spec:
+
+- **Single atomic commit.** The basis is the optimistic-concurrency model (lines 91-99) and serializable isolation goal (line 71): a writer builds a new table metadata file, then atomically swaps the table's metadata pointer from the base version to the new version. Both the removals and the additions land atomically — nothing is ever partially visible. The files are tracked in manifests via manifest entries, so "removing" a file is just marking its entry with `status = DELETED` (line 691) and "adding" is `status = ADDED`. The check on the swap (whether the base is still current) is the conflict-resolution mechanism in "Commit Conflict Resolution and Retry" (lines 1312-1319), which is precisely where overwrite-type operations are distinguished from appends.
+
+- **Lineage through snapshots.** An overwrite doesn't physically delete files at commit time. Removed files become DELETED entries; the physical files aren't deleted from the file system until the snapshots that reference them are garbage-collected via the retention policy (lines 1118-1132). The manifest entry notes the snapshot in which the file was deleted (line 701-702). This is why overwrite is safe against concurrency — old readers keep reading the old snapshot, unaffected until they refresh.
+
+- **Overwrite vs. the other operations.** The contrast the spec draws is useful for understanding the design:
+  - `append` adds only, removes nothing (line 971) — it has no retry requirements at all and can always be applied to a new version (line 1316).
+  - `replace` adds and removes but "without changing table data" — i.e., compaction, format conversion, or relocating files (line 972). The data content is preserved.
+  - `overwrite` adds and removes in a *logical* overwrite — the content genuinely changes.
+  - `delete` removes data/delete files (line 974).
+
+- **Retry semantics.** The critical design point (lines 97, 1316-1319): an overwrite is a change that removes specific files, so to retry it on a new current version the writer must re-validate that the files it intends to delete are still in the table. This is the same validation as replace/compaction. By contrast, an expression-based delete (`DELETE WHERE timestamp < X`) rewrites to whatever the current version is. This distinction exists because a logical overwrite is based on the identity of the files being replaced — if those files changed underneath your commit, re-applying could clobber concurrent work.
+
+- **Row-level-delete interplay.** An overwrite can also add delete files (that's why the spec's definition says "data and delete files were added and removed"). Version 2+ row-level deletes (lines 109-119, 1356-1473) let you express overwrite-like semantics — log an overwrite as remove-and-add of data files, or as new delete files that logically remove rows without rewriting files. The snapshot summary metrics (Appendix F, lines 2082-2119) record added/deleted data files, delete files, records, etc., so an overwrite is observable and auditable.
+
+## Why it's designed this way
+
+The design falls directly out of Iceberg's core goals (lines 69-77):
+
+1. **Serializable isolation without locks** — one goal. An overwrite is one metadata swap, so readers never see a half-written table and never acquire locks. The cost is that you can't modify files in place; you write new ones and swap the manifest state.
+
+2. **Write-in-place, delete-later immutability** — Iceberg requires only in-place writes, seekable reads, and deletes (lines 121-131). Data files are immutable. So an overwrite can't edit a file; it must write replacement files and mark the originals deleted. Physical deletion is deferred to garbage collection, which keeps the commit cheap and the operation safe for concurrent readers.
+
+3. **Optimistic concurrency + retry** — the "why this way" for the file-identity validation. The spec is explicit that the conditions a write validates determine its isolation level (line 99). An overwrite that replaces known files must verify those files are still present before re-applying; otherwise a stale overwrite could silently erase someone else's commit. This is a deliberate isolation guarantee, trading the cost of revalidation for the safety of not losing concurrent writes.
+
+4. **Logical vs. physical separation** — the spec separates logical table state (snapshots, manifests) from physical storage. That's what lets "overwrite" be a cheap metadata operation with O(1) process rather than O(n) rewrite, and what lets old data files linger until GC without corrupting current reads.
+
+So: the one explicit mention of `overwrite` is just the snapshot-operation label, but the meaningful content is the surrounding design — a logical, atomic, immutable-data model built on optimistic commit + deferred deletion, where an overwrite is a validated remove-and-add that can always be retried as long as its target files are still present.

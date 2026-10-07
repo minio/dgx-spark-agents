@@ -1,0 +1,43 @@
+I have what I need. Here are the edge cases and failure modes of equality deletes, and how the code guards against each.
+
+1. Not really a delete (writing equality ids on a non-equality writer)
+The equality field ids are the whole point; using them wrongly produces a delete file that is either meaningless or silently detached from its ids.
+Guard: `FileWriterBuilderImpl.equalityFieldIds(int...)` throws if the content isn't EQUALITY_DELETES (FileWriterBuilderImpl.java:160-163), and `validate()` additionally requires non-null ids exactly when content is EQUALITY_DELETES (FileWriterBuilderImpl.java:206-208). The builder also records them into the file's own metadata (FileWriterBuilderImpl.java:260-263) so the mapping survives.
+
+2. Delete file in an unsupported table version
+The spec caps equality deletes to v2/v3 (v4 prohibits writing new ones; v1 has no deletes at all). Writing one into the wrong version either breaks readers or silently mis-applies.
+Guard: `MergingSnapshotProducer.validateDeleteFileForVersion` rejects deletes in v1 ("Deletes are supported in V2 and above", MergingSnapshotProducer.java:297-298) and, for v2, permits equality deletes while forbidding DVs (MergingSnapshotProducer.java:299-304). The commit-path validation runs before the file is added (MergingSnapshotProducer.java:271-273).
+
+3. Delete file applied before it should be (same-commit / future rows erroneously deleted)
+The spec's correctness rule is that an equality delete only applies to data strictly older than itself. Getting this wrong deletes rows written after the delete, i.e. data loss under concurrency.
+Guard: `EqualityDeleteFile.applySequenceNumber = dataSequenceNumber() - 1` (DeleteFileIndex.java:881) and `findStartIndex` (DeleteFileIndex.java:687-703, 811, 819) only consider deletes with applySeq >= the data file's seq — i.e. data seq strictly less than the delete seq. Position deletes use their own dataSequenceNumber with `<=` semantics (DeleteFileIndex.java:711-712), preserving the spec's intentionally different rule for them. Also, new equality deletes can be added to a snapshot with an explicit data sequence number via `MergingSnapshotProducer.add(file, dataSequenceNumber)` (MergingSnapshotProducer.java:267-269), so a delete destined for older data isn't stamped with the current commit's seq.
+
+4. Delete applied to the wrong partition
+A value-based delete must only reach data in its own partition (or all files if its spec is unpartitioned/global).
+Guard: `DeleteFileIndex.add` routes an unpartitioned-spec delete to `globalDeletes` and any other to `(specId, partition)`-keyed buckets (DeleteFileIndex.java:603-610), and only the matching bucket is consulted when filtering a data file. This enforces the spec's same-partition + global-delete special case.
+
+5. Data file with no matching values is spuriously filtered/applied
+Applying deletes broadly is expensive; applying them where they can't match is wrong (and, at worst, over-deletes).
+Guard: `canContainEqDeletesForFile` (DeleteFileIndex.java:258-320) prunes using per-field null/value counts (lines 280-296) and lower/upper bound range overlap (lines 298-317), skipping the delete file when there is provably no overlap. Crucially it is conservative — whenever a bound or count is missing it assumes a match (`continue`, lines 298-301, 308-311) rather than risking a missed delete. Bounds are converted to typed values first (DeleteFileIndex.java:956-973).
+
+6. Equality id refers to a column that no longer resolves
+The spec says a delete column dropped from the schema must still be applied, and a column added later must be read via normal projection (defaulting to null).
+Guard: `EqualityDeleteFile.equalityFields()` resolves each stored equality id through `fieldLookup` and throws if the id is unknown ("Cannot find field for ID %s", DeleteFileIndex.java:897-900). That turns "a delete we can no longer interpret" into a loud failure instead of silently mis-deleting. The spec requires this id-based resolution, so ids are resolved against the schema rather than by name (field-by-id), which is what keeps deletes stable across column renames.
+
+7. Delete file that never got closed reporting itself as a result
+A half-written delete file must not be committed as a valid deletion.
+Guard: `EqualityDeleteWriter.toDeleteFile()` refuses with "Cannot create delete file from unclosed writer" unless `close()` already ran (EqualityDeleteWriter.java:96-99, flagged at 78-94); `result()` is built on top of that (EqualityDeleteWriter.java:101-104). Deletes are only materialized inside `close()`, so an uncommitted writer can't leak a bogus file.
+
+8. Columnar stats are unreliable for equality delete pruning
+Equality deletes rely on metrics of deleted values and equal-value matching (including null=null). If stats were stored in a way the pruning can't trust — e.g. nested types — pruning could wrongly skip a needed delete.
+Guard: `canContainEqDeletesForFile` bails out of pruning entirely for non-primitive equality fields ("stats are not kept for nested types. assume that the delete file may match", DeleteFileIndex.java:275-278), and the read side matches deleted rows by full struct key equality in `Deletes.toEqualitySet` / `filter` (Deletes.java:119-128, 61-70), where nulls compare equal (spec's `col IS NULL`), so value matching is exact regardless of how pruning was done.
+
+9. Avoided failure by design: using wrong sort order
+The spec lets equality deletes keep a sort order but forbids it for position deletes.
+Guard: `FileMetadata.build()` defaults an equality delete to the unsorted order if none is set (FileMetadata.java:283-286) while rejecting a sort order on position deletes (FileMetadata.java:280-282). This prevents an equality delete from accidentally being reordered/reinterpreted in a way that changes which rows match.
+
+Two honest remainders (limits, not bugs):
+- The validations run at plan/commit time and inside the builders; the `EqualityDeleteWriter` class itself is a thin, unvalidating shell — its safety comes entirely from the builder and the scan index that surround it.
+- The version gate in MergingSnapshotProducer.java:295-309 handles v2 vs v3/v4 position-delete substitution, but nothing in this path rejects adding a new equality delete to a v4 table, since that prohibition is a forward-compat/reader concern enforced elsewhere (spec Appendix E). If you rely on this class, the "no new equality deletes in v4" rule is not self-enforced here.
+
+The two sharpest, spec-driven failure modes are #3 (sequence boundary, guarded by the `-1` trick at DeleteFileIndex.java:881) and #6 (unresolvable delete column, guarded by DeleteFileIndex.java:897-900) — those are the ones that cause silent data loss or a panic, and both are defended at exactly the points the spec calls out.

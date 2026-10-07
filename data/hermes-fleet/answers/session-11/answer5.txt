@@ -1,0 +1,19 @@
+1. What time travel is: a snapshot is "the state of a table at some point in time, including the set of all data files" — `format/spec.md:147`. Every commit leaves a new immutable snapshot, which is what makes the past addressable.
+
+2. The spec rule for resolving "as of time T": use the snapshot-log, not parent lineage, and pick the most recent snapshot at-or-before T — `format/spec.md:2075-2080`.
+
+3. Why it works for free: table state lives in a metadata file swapped by an atomic commit, and files are immutable, so an old snapshot's manifest list stays valid until GC — `format/spec.md:85-93` and `:1162`.
+
+4. The core lookup to memorize: `SnapshotUtil.snapshotIdAsOfTime` scans `table.history()` (the snapshot-log) for the newest entry with `timestamp <= T` and throws if none — `core/src/main/java/org/apache/iceberg/util/SnapshotUtil.java:314-337`.
+
+5. Where the snapshot-log comes from: `Table.history()` → `BaseTable.history()` → `TableMetadata.snapshotLog()`, entries appended only when the main branch's current snapshot changes — `core/src/main/java/org/apache/iceberg/BaseTable.java:179-181` and `TableMetadata.java:1320-1345`.
+
+6. Resolving a missing/expired target: `TableMetadata.snapshot(long)` returns `null` for a gone snapshot, which the callers turn into "Cannot find snapshot" — `TableMetadata.java:528-533`.
+
+7. Getting the schema at that time: `SnapshotUtil.schemaFor(table, snapshotId)` uses the snapshot's `schemaId`, falling back to the current schema for pre-`schemaId` snapshots — `core/src/main/java/org/apache/iceberg/util/SnapshotUtil.java:349-367`.
+
+8. Spark surfaces it as Spark's built-in `VERSION AS OF` / `TIMESTAMP AS OF`, resolved at table load via `SnapshotUtil.snapshotIdAsOfTime`; writes on a time-traveled table are rejected — `spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/SparkTable.java:354-358` and `:186-199`.
+
+9. Flink resolves lazily inside the scan: `TableScan.asOfTime` → `useSnapshot(SnapshotUtil.snapshotIdAsOfTime(...))`, driven by the `as-of-timestamp` read option — `core/src/main/java/org/apache/iceberg/SnapshotScan.java:131-136` and `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/FlinkReadOptions.java:51-52`.
+
+10. The key caveat: expiration/retention bounds how far back you can go — snapshots expire per `min-snapshots-to-keep` / `max-snapshot-age-ms`, which is why time travel past the horizon fails with a "cannot find a snapshot older than" error — `format/spec.md:1118-1132`.

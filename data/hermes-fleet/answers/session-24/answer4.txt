@@ -1,0 +1,48 @@
+I now have all the pieces across both integrations. Here's how query engines — Spark and Flink in this repo — actually use row deltas, on both the read and write paths, with the spec connection each embodies.
+
+The important framing first: engines never touch delete semantics themselves. They call two core entry points — `RowDelta` (write) and `DeleteFilter`/`DeleteFileIndex` (read) — which are exactly the classes we traced through the spec earlier. The engine layers are thin adapters on top.
+
+## Reduce dimensionality
+
+The big twist is that engines largely reduce row deltas to a single operation: **position deletes**. Both engines funnel DELETE/UPDATE/MERGE through a "position delta" path where deleted rows are addressed by data-file path + row position — the `_pos`/`file_path` metadata columns from spec.md:447-453, matched by position per spec.md:1397. Equality deletes still exist in the read path (for tables that already have them), but new writes are position-based.
+
+## Spark — read path (applying deletes)
+
+Spark's DataFrameReader produces a `SparkBatchQueryScan` whose `ScanTaskGroup` carries each `FileScanTask` with its applicable delete files already resolved by core planning (`DeleteFileIndex` at scan time).
+
+- `RowDataReader.open(FileScanTask)` builds a `SparkDeleteFilter(filePath, task.deletes(), ...)` and wraps the row iterator so each row is tested (RowDataReader.java:95-109). `BaseReader.java:203-208` shows `SparkDeleteFilter extends DeleteFilter<InternalRow>` — the engine-specific subclass just defines how an `InternalRow` becomes a `StructLike` and how delete file input files are fetched.
+- The core `DeleteFilter.filter` applies equality deletes then position deletes (DeleteFilter.java:188-190).
+  - Position deletes: loads a `PositionDeleteIndex` (bitmap) keyed to this file's rows and drops any row whose `_pos` is set (DeleteFilter.java:257-273). This is the spec's position-delete match by file+position (spec.md:1397), and for DVs it's the bit-test from spec.md:1377-1383.
+  - Equality deletes: projects each row onto the delete's `equality_ids` columns and tests membership in the loaded delete set — `deleteSet.contains(...)` (DeleteFilter.java:192-225). This is spec.md:1424-1428 (a row is deleted if its values equal all delete columns).
+- To make those tests possible without over-reading, `fileProjection` augments the requested schema with exactly the columns the deletes need: `_pos` for position deletes and the `equality_field_ids` for equality deletes, plus `_deleted` when a change-tracking projection is wanted (DeleteFilter.java:282-333). Row position is read from the reserved `ROW_POSITION` metadata column (spec.md:449).
+
+## Spark — write path (producing deletes)
+
+Spark's `RowLevelOperation` builds a `SparkPositionDeltaWrite`, whose commit assembles a `RowDelta`:
+
+- `SparkPositionDeltaOperation#newWriteBuilder` returns a position-delta write builder (SparkPositionDeltaOperation.java:88-93). The commit driver loops over task results and calls `rowDelta.addRows(...)`, `rowDelta.addDeletes(...)`, `rowDelta.removeDeletes(...)` (SparkPositionDeltaWrite.java:211-238).
+- Crucially, Spark maps its engine-specific `delete(meta, id)` calls to *position* deletes: the metadata carries `specId`, `partition`, and the row ID carries `file_path` + `_pos`; it writes a `PositionDelete(file, position)` and, for v3+ tables (`useDVs()` == PUFFIN), routes through a `PartitioningDVWriter` to emit a deletion vector (SparkPositionDeltaWrite.java:593-604, 497-519, 859-861). That DV output is the spec's v3 mechanism (spec.md:1375-1383).
+- DML-specific concurrency validation is configured right before commit (SparkPositionDeltaWrite.java:242-261): `conflictDetectionFilter` from the scan's predicates, `validateDataFilesExist(referencedDataFiles)`, `validateFromSnapshot(scan.snapshotId())`, `validateDeletedFiles()` + `validateNoConflictingDeleteFiles()` for UPDATE/MERGE, and `validateNoConflictingDataFiles()` only under SERIALIZABLE. These map 1:1 onto the `BaseRowDelta.validate` guards we already traced (BaseRowDelta.java:132-174) and spec.md:1317-1319. Isolation level selects the guard set — exactly the spec's "writers can select what to validate" (spec.md:99).
+- WAP/branch staging is passed through as `operation.stageOnly()` / `toBranch(...)` (SparkPositionDeltaWrite.java:330-339).
+
+So on Spark, UPDATE/MERGE/DELETE are all rendered as "delete by position + insert new data" — most visible in `UnpartitionedDeltaWriter`/`PartitionedDeltaWriter.update()` which throw "Update must be represented as delete and insert" (SparkPositionDeltaWrite.java:743-744, 774-775). That is a direct embodiment of the design rationale we discussed: row deltas implement updates by delete+insert against immutable files, never an in-place rewrite.
+
+## Flink — read path
+
+Identical shape to Spark. `RowDataFileScanTaskReader.open(FileScanTask)` builds a `FlinkDeleteFilter` extending core `DeleteFilter<RowData>` (RowDataFileScanTaskReader.java:79-83, 132-146), applies it to the row iterable, then projects away the extra metadata columns (RowDataFileScanTaskReader.java:85-93). Again `DeleteFilter` does all the equality/position/DV work; Flink only supplies `asStructLike` and `getInputFile`.
+
+## Flink — write path
+
+Flink's sink converts a changelog stream into position and equality deletes via `BaseDeltaTaskWriter`:
+
+- Each `RowData` has an `INSERT/UPDATE_AFTER/UPDATE_BEFORE/DELETE` row kind. `write()` routes it: INSERT/UPDATE_AFTER write the row; UPDATE_BEFORE and DELETE issue a delete; under UPSERT it deletes by key instead (BaseDeltaTaskWriter.java:81-111).
+- Deletes are written by a `RowDataDeltaWriter` that extends core `BaseEqualityDeltaWriter` and takes a `PartitioningDVWriter`, again producing DVs on v3+ (BaseDeltaTaskWriter.java:74, 113-127).
+- The distinct Flink wrinkle: a row is first turned into equality deletes by its key columns — `deleteSchema = TypeUtil.select(schema, equalityFieldIds)` — which is spec.md:1424 (drop rows by matching column values). In non-upsert streams that key bucket is populated from the row's own key columns.
+
+Flink's maintenance operators also live here (e.g. `EqualityConvertCommitter`/`EqualityConvertDVWriter` rewriting equality deletes into DVs under `RewriteDataFiles`, and `DeleteFilesProcessor` removing dangling position deletes). Those are the engineering implementations of the spec's forward-looking rule that new row-level deletes should be DVs, not equality deletes (spec.md:1921-1925, 1944-1956).
+
+## The shared pattern to take away
+
+Every engine integration in this repo is the same small contract: on read, hand the core the (file path, its delete files, table schema) and let `DeleteFilter`/`DeleteFileIndex` reconstruct which rows survive; on write, collect data + position deletes (+ DVs) into a `RowDelta` and let `BaseRowDelta`/`MergingSnapshotProducer` handle ordering, versioning, and conflict validation. Engine code in this repo never re-implements delete application — the spec logic stays in core (`base-row-delta` → `DeleteFilter` → `DeleteFileIndex`), and the engines are thin, mostly mechanical adapters. That separation is itself a design consequence of the spec: row-level deletes are a core, engine-agnostic capability (spec.md:39-45), so each engine only needs ~read/write plumbing, not spec knowledge.
+
+If useful, I can trace one concrete query end-to-end — e.g. a Spark `MERGE` against a v3 table — from SQL plan down to which `RowDelta` validations fire and how the emitted DV is read back.

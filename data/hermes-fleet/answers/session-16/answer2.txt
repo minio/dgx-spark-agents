@@ -1,0 +1,63 @@
+I have everything needed. Here's how the implementation maps to the spec.
+
+## How ViewMetadata.java and its collaborators follow the spec
+
+### Metadata model (view-spec.md:54-65) — ViewMetadata.java
+ViewMetadata.java:50 declares the immutable interface whose accessors match the spec's required fields 1-for-1:
+- `uuid()` (:55) → `view-uuid` (view-spec.md:58)
+- `formatVersion()` (:57) → `format-version`, with `SUPPORTED_VIEW_FORMAT_VERSION = 1` and `DEFAULT_VIEW_FORMAT_VERSION = 1` (:52-53) matching "must be 1" (view-spec.md:59)
+- `location()` (:59) → `location` (:60)
+- `schemas()` (:74) → `schemas` (:61)
+- `currentVersionId()` (:76) → `current-version-id` (:62)
+- `versions()` (:78) → `versions` (:63)
+- `history()` (:80) → `version-log` (:64)
+- `properties()` (:82) → `properties` (:65)
+
+The round-trip is verified in ViewMetadataParser.java:66-98 (toJson) and :113-163 (fromJson), which write/read exactly these keys (VIEW_UUID, FORMAT_VERSION, LOCATION, SCHEMAS, CURRENT_VERSION_ID, VERSIONS, VERSION_LOG, PROPERTIES, defined at :47-54), matching the spec's JSON serialization (view-spec.md:191-236).
+
+Format-version gate: ViewMetadata.java:129-135 `check()` rejects any version outside (0, 1], enforcing view-spec.md:59 "must be 1", and mirrors the table spec's rule that readers must throw on an unsupported version.
+
+### Version fields (view-spec.md:72-86) — ViewVersion + ViewVersionParser
+ViewVersion.java maps to the spec's version struct:
+- `versionId()` (:35) → `version-id` (:78), the monotonic id
+- `timestampMillis()` (:44) → `timestamp-ms` (:80)
+- `schemaId()` (:72) → `schema-id` (:79)
+- `summary()` (:51) → `summary` (:81)
+- `representations()` (:60) → `representations` (:82)
+- `defaultCatalog()` (:76) → `default-catalog` (:83), `@Nullable` in BaseViewVersion.java:46-47
+- `defaultNamespace()` (:80) → `default-namespace` (:84)
+
+ViewVersionParser.java serializes all of these (:43-66), including the optional `default-catalog` written only "if not null" (:52-54) and the required `default-namespace` (:56-57) — matching the spec's "optional"/"required" distinction. `fromJson` (:77-110) parses them back, using `getStringOrNull` for the nullable default-catalog (:97).
+
+The `default-catalog` fallback rule from view-spec.md:86-87 (when unset, the catalog the view lives in is used) is not enforced inside the metadata object — it's a resolution concern left to the engine/ViewUtil-like callers; the parser simply preserves null vs. set.
+
+### Version log (view-spec.md:150-162) — ViewHistoryEntry + parser
+ViewHistoryEntry.java:27-33 exposes exactly `timestampMillis()` and `versionId()`, matching the log entry fields (:159-161). ViewHistoryEntryParser.java:38-44 writes `timestamp-ms` + `version-id` and :50-58 reads them. ViewMetadata.Parser appends to `history` at build (ViewMetadata.java:449-451).
+
+The spec's point that a version can appear in the log more than once (rollback, view-spec.md:154) is reflected in the Builder: `setCurrentVersionId` builds a new history entry on every current-version change and uses the version's own timestamp only if that version was added in this change, otherwise the current system time (ViewMetadata.java:252-264).
+
+### Representations (view-spec.md:97-148) — ViewRepresentation
+The design matches "representations are extensible, each has a `type`" (view-spec.md:105-109):
+- ViewRepresentation.java defines the `type` field with `Type.SQL = "sql"` (:26).
+- Every representable type is a subtype; the only implemented one is SQL, and SQLViewRepresentation.java:22-33 supplies `type()="sql"`, plus `sql()` and `dialect()`, matching the spec's SQL fields (:118-121).
+- SQLViewRepresentationParser.java:37-45 serializes `type`, `sql`, `dialect`; :51-62 parses them.
+- Forward compatibility for future representations: ViewRepresentationParser.fromJson returns an `UnknownViewRepresentation` for unrecognized types instead of failing (:65-66), so new representation types don't break old readers. (Serialization of unknown types throws, :41-44, since there's no canonical form.)
+
+The "only one SQL representation per dialect" rule (view-spec.md:115) is enforced in addVersionInternal, which tracks lowercase dialects in a Set and rejects duplicates (ViewMetadata.java:307-316). The alternative restriction is extended in build(): unless `replace.drop-dialect.allowed=true`, replacing a view must not drop any previously-present dialect (ViewMetadata.java:556-566), preserving cross-engine availability — the spec's core interoperability goal.
+
+### Immutability of versions + history retention (view-spec.md:99-103, 69)
+- Versions are value objects (immutable `@Value.Immutable` interfaces ViewVersion/ViewHistoryEntry), so "a version once created cannot be changed" (view-spec.md:103) holds structurally.
+- ViewMetadata.java:461-484 reads `version.history.num-entries` (ViewProperties.VERSION_HISTORY_SIZE, :23) to bound retained versions — the same property the spec names for how many versions to retain (view-spec.md:69). `expireVersions` keeps the highest-id versions plus the current one (:512-535), and `updateHistory` prunes the log, clearing history past a dropped version (:537-550).
+
+### Self-sufficient metadata + atomic swap (view-spec.md:35-43)
+BaseViewOperations.java mirrors the table commit model:
+- Every metadata file is self-contained: `writeNewMetadata` writes the full ViewMetadata as JSON via ViewMetadataParser.overwrite, naming it `<version>-<uuid>` under a `metadata/` folder (BaseViewOperations.java:135-175), exactly like the spec's example path `.../metadata/00001-(uuid).metadata.json` (view-spec.md:188-190).
+- Readers load the metadata location once and are unaffected until refresh — `current()` returns cached `currentMetadata`, only reloading when `shouldRefresh` (BaseViewOperations.java:77-83, 190-213), matching view-spec.md:41.
+- Atomic commit is delegated to the metastore: `commit()` (:107-133) rejects a stale base with CommitFailedException (:111) or an existing view with AlreadyExistsException (:115), then calls the abstract `doCommit` which subclasses implement via the catalog's check-and-swap. This is the exact optimistic-concurrency/retry model described in view-spec.md:43.
+- `parseVersion` (:222-236) reconstructs the file version number from the `<version>-<uuid>` name, and rollback simply writes a new metadata file pointing `current-version-id` at an older retained version — consistent with "each metadata file is self-sufficient and supports rollback" (view-spec.md:37).
+
+### One deliberate extension beyond the spec
+The `changes()`/Builder `changes` list (ViewMetadata.java:84, 145-224) accumulates `MetadataUpdate` objects (SetLocation, AssignUUID, AddSchema, AddViewVersion, SetCurrentViewVersion, SetProperties, etc.) that are replayed into the metastore's commit. The spec's metadata file has no "changes" concept (the parser builds with an empty list, ViewMetadataParser.java:161, and build() forbids mixing a metadata location with pending changes, ViewMetadata.java:445-447) — this is internal bookkeeping for serializable commit, not a serialized spec field, so it stays inside the implementation without violating the format.
+
+### Bottom line
+The implementation is a faithful, essentially 1:1 transcription of the view spec's data model: same required/optional fields, same JSON keys and kebab-case, same immutable-version and history-retention semantics, same gap-tolerant representation dispatch, and the same self-sufficient-metadata + atomic-swap commit model as tables. The only things it adds above the spec are commit-side bookkeeping (MetadataUpdates) and the dialect-drop guard, both invisible in the serialized format.

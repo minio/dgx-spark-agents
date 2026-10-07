@@ -1,0 +1,42 @@
+I've read the writer and the code it calls for equality deletes (the delete-file builder, plan-time index, and apply-time machinery). Here's how the implementation tracks the spec.
+
+WRITE SIDE: EqualityDeleteWriter.java
+- The writer is just a thin wrapper over a FileAppender. `write(T row)` (line 67-69) delegates to `appender.add(row)` — the delete file is encoded as a normal columnar data file, exactly as the spec requires ("row-level delete files are valid Iceberg data files").
+- The equality column ids come in as constructor varargs `int... equalityFieldIds` (line 55, 63). These are the spec's `equality_ids` — the field ids used to determine row equality, required when content=2.
+- `close()` (line 77-94) builds the DeleteFile metadata via `FileMetadata.deleteFileBuilder(spec)`:
+  - `.ofEqualityDeletes(equalityFieldIds)` (line 82) sets content = EQUALITY_DELETES and records the equality ids.
+  - `.withPartition(partition)` (line 85) and `withFormat`/`withPath` record the partition tuple and file format.
+  - `.withMetrics(appender.metrics())` (line 89) and `.withSplitOffsets(...)` (line 90) capture per-field metrics of the deleted rows — this is what the spec demands for delete-file stats ("metrics describe the values that were deleted").
+  - `.withSortOrder(sortOrder)` (line 91) — equality deletes may carry a sort order, unlike position deletes (see FileMetadata build() below).
+
+Actually writing a delete only happens when the file is closed; `toDeleteFile()`/`result()` (line 96-104) refuse to return before close (Preconditions), matching the immutability/lifecycle of delete files.
+
+METADATA BUILD: FileMetadata.java
+- `ofEqualityDeletes(int... fieldIds)` (line 129-133) sets `this.content = FileContent.EQUALITY_DELETES` and stores the field ids. So the builder conflates "this is an equality delete" with "these are its equality ids."
+- `build()` (line 257-316):
+  - `switch (content)` (line 278-290) enforces the spec's rule that position deletes must not carry a sort order (line 280-282), while equality deletes get `unsorted()` as a default sort order id (line 283-286). The spec's data_file note 3 says only data files and equality delete files should be written with a non-null sort order id — the code special-cases exactly that.
+  - It constructs `GenericDeleteFile` (line 292-315) passing `equalityFieldIds` (line 309), the metrics (line 299-308), partition (line 297), and spec id (line 293). The equality ids therefore live on the DeleteFile and are serialized into the manifest's `data_file.equality_ids` field.
+- `copy()` (line 94-121) carries `content` across copies but deliberately does not copy equalityFieldIds (line 100 only copies content) — preserved DeleteFile equality ids are re-derived from the copied file's own metadata.
+
+APPLY SIDE: DeleteFileIndex.java (plan-time scope + pruning)
+- In `build()` (line 530-566), equality delete files are routed by `case EQUALITY_DELETES` (line 550) into `add(globalDeletes, eqDeletesByPartition, file, fieldLookup)` (line 596-614). Inside, an **unpartitioned spec → global deletes** (line 604-605), otherwise grouped by `(specId, partition)` (line 606-610). This is exactly the spec's scan-planning rule: equality deletes apply to same-partition data files, and unpartitioned-spec delete files become global deletes.
+- The `EqualityDeleteFile` wrapper (line 870-974) applies the **strictly-less-than** rule: `applySequenceNumber = wrapped.dataSequenceNumber() - 1` (line 881). Because `findStartIndex` (line 687-703) returns the insertion point into the sorted sequence array, only delete files with `applySequenceNumber >= seq` are considered — i.e. a delete applies only to data files with data sequence number strictly less than the delete's, exactly the spec's `strictly less than` boundary (spec 1085). Position deletes, by contrast, sort by their own `dataSequenceNumber` (line 711-712) and use `<=`, matching the spec's different rule for them.
+- `canContainEqDeletesForFile` (line 258-320) is the **metrics-based pruning** the spec describes: it compares data-file and delete-file null counts (line 280-296) and lower/upper bounds ranges (line 298-317) per equality field, returning false (skip the delete file) when ranges provably don't overlap, and "continue" (assume match) whenever bounds are missing (line 298-301, 308-311). The `EqualityDeleteFile.equalityFields()` (line 892-908) resolves the stored equality ids back to schema fields via `fieldLookup` — the field-by-id matching the spec requires.
+- Bounds are converted from bytes to typed values (line 956-973), and per-field value/null counts are exposed (line 910-916), matching "metrics of the deleted rows" used for pruning.
+
+APPLY SIDE: Deletes.java (read-time row filter)
+- `toEqualitySet(CloseableIterable<StructLike> eqDeletes, StructType eqType)` (line 119-128) reads every row of the equality delete file into a `StructLikeSet`, the small in-memory table of deleted values.
+- `filter(rows, rowToDeleteKey, deleteSet)` (line 61-70) runs an `EqualitySetDeleteFilter` that keeps only rows whose extracted equality-key is NOT in the set — i.e. a row is deleted if its values equal (as a struct key) any deleted row, matching the spec: "a data row is deleted if its values are equal to all delete columns for any row in the equality delete file that apply." Because the key is a `StructLike` built from the delete columns, multiple columns form an AND of equalities, and nulls compare equal to nulls (the spec's `col IS NULL` behavior) — both fall out of `StructLikeSet` semantics.
+
+SCOPE TERMS FROM THE SPEC AND WHERE THEY LAND IN CODE
+- content=2 (EQUALITY_DELETES): FileMetadata.java:130
+- equality_ids required when content=2: FileMetadata.java:129-133, carried into GenericDeleteFile at :309
+- delete file is a valid data file: EqualityDeleteWriter.java:67-69
+- metrics describe deleted rows: FileMetadata.java:199-211 (withMetrics), used for pruning at DeleteFileIndex.java:258-320
+- strictly-less-than sequence boundary: DeleteFileIndex.java:881-882, 811, 819
+- unpartitioned spec ⇒ global deletes: DeleteFileIndex.java:604-605
+- same-spec/same-partition applies: DeleteFileIndex.java:606-610
+- value-equals matching incl. null: Deletes.java:61-70, 119-128
+- equality deletes may carry a sort order (position deletes may not): FileMetadata.java:283-286
+
+One nuance worth noting: the strict-< rule here is encoded by the `-1` trick (delete applies to any data file whose sequence number <= deleteSeq-1), which is exactly the spec's `strictly less than`. The spec's version-2 note that "equality delete files must not be added to v4 tables" is a reader concern, not this writer's — this writer is agnostic to table version and would still produce equality deletes if called.

@@ -1,0 +1,39 @@
+I read format/spec.md (all 2153 lines) and, since views aren't in it, format/view-spec.md (all 324 lines) to give you a complete answer.
+
+## One necessary correction to the premise
+
+Views are not described in format/spec.md. That document is entirely the *table* spec (metadata files, schemas, partitioning, manifests, snapshots, row-level deletes, serialization). The word "view" never appears as a defined concept. Views have their own companion spec, format/view-spec.md. So everything below comes from that file.
+
+## What the view spec says
+
+Motivation and framing
+- A view is a logical table holding no data — the stored query runs each time the view is referenced (view-spec.md:23-27).
+- The problem it solves is cross-engine interoperability: each engine (Trino, Spark) keeps view metadata in its own private format in its own metastore, so a view created in one engine can't be read or altered from another even when they share a metastore and storage. The goal is "a common metadata format for view metadata, similar to how Iceberg supports a common table format for tables" (view-spec.md:27-32).
+
+Metadata storage mirrors Iceberg tables
+- Each change writes a new view metadata JSON file and atomically swaps the metadata pointer, delegated to the metastore (view-spec.md:35, 41). Same optimistic concurrency model as tables: writers assume the location won't change; on conflict they reload and retry (view-spec.md:43).
+- Each metadata file is self-sufficient — it carries history, so a view can be rolled back (view-spec.md:37).
+
+Metadata fields (view-spec.md:54-65)
+- view-uuid, format-version (must be 1), location (base dir for metadata files), schemas, current-version-id, versions, version-log, and optional properties (for things like comment; not for arbitrary metadata).
+- Retained-version count is controlled by the version.history.num-entries property.
+
+Versioning
+- A version (view-spec.md:72-86) captures: version-id, schema-id, timestamp-ms, a summary map (engine-name/engine-version), representations, an optional default-catalog, and a required default-namespace. The defaults let an unqualified reference in the SELECT resolve — falling back to the catalog the view lives in when default-catalog isn't set.
+- View versions are immutable: if the definition changes or you want new representations, you create a new version; you can't edit an existing one (view-spec.md:103).
+- The version-log (view-spec.md:150-162) tracks every change to current-version-id with a timestamp, and is what enables point-in-time / rollback. A version can appear multiple times in the log (i.e. a rollback).
+
+Representations
+- A version can have many representations, all expressing the same definition; the engine picks one. Currently only one type exists: sql (view-spec.md:105-109).
+- The SQL representation (view-spec.md:111-121) stores the SELECT text plus a dialect (e.g. "trino" or "spark"). Multiple SQL representations across dialects are allowed, but at most one per dialect. Column aliases/names/comments declared before AS must be reflected in the version's schema (view-spec.md:146-148).
+
+## Why it's designed that way
+
+- Interoperability as the driving goal. The entire design funnels a proprietary per-engine artifact (a SQL string plus its dialect) into a single open, engine-neutral metadata format. Because each dialect's SQL is preserved verbatim, an engine that can't run another's dialect can still read the shared representation or store its own.
+- Reuse of the proven table commit model. Views reuse the same atomic-swap, self-contained-metadata, optimistic-concurrency pattern as tables, so catalogs, locking/retry behavior, and rollback semantics carry over without inventing a new mechanism.
+- No data, so no snapshots/files. A view has no files, so the heavyweight machinery (manifests, manifest lists, delete files, sequence numbers) is absent. The analog of a table snapshot is just an immutable "version" of the definition plus a log for history.
+- Immutability of versions for safe concurrency and history. Because versions are immutable and each metadata file is self-sufficient, readers get a consistent definition, writers can retry commits, and rollback/point-in-time are cheap — same reasoning behind immutable table snapshots.
+- Deliberate minimalism. The spec standardizes only the metadata container and the SQL representation, and marks further representation types as future work. It stops short of standardizing SQL dialects themselves, which would be a much larger and contentious problem.
+- Resolution defaults (default-catalog / default-namespace) exist because a view's SQL is stored text that must stay valid and resolvable when executed from another engine/catalog context.
+
+Note one asymmetry worth flagging: the table spec is versioned up to v4, but the view spec is fixed at format-version 1 and has only the single sql representation — it's a younger, less developed standard than the table format.

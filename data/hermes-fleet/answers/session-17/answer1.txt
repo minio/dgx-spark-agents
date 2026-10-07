@@ -1,0 +1,20 @@
+I read format/spec.md from line 1 to the end (2153 lines). Here's the honest headline before anything else:
+
+format/spec.md is the Iceberg TABLE format spec — it does not describe the REST catalog at all. The REST catalog has its own document in this repo at site/docs/rest-catalog-spec.md, which I have not read (you asked me to read the table spec). But that's fine, because the table spec's core design is exactly what makes the REST catalog the way it is. So let me tell you what the table spec actually says, and then why that design is precisely why the REST catalog is built as a thin service.
+
+What the table spec actually contains
+It defines the on-disk/object-store table format, not any catalog:
+- Table state lives in immutable JSON metadata files; every change writes a new metadata file and swaps a pointer to it (atomic commit). Readers grab one snapshot and see a consistent view; writers commit optimistically and retry on conflict.
+- A snapshot points to a manifest list, which lists manifests, which list individual data/delete files with their paths, partition values, and column metrics. Scans plan by reading manifests and using partition summaries and metrics to skip irrelevant files — O(1) remote calls, not O(n).
+- Versions: v1 (analytic tables), v2 (row-level deletes), v3 (extended types, deletion vectors, row lineage, defaults), v4 (under development: relative paths, equality deletes prohibited).
+- All the fine detail: partitioning/transforms, sorting, schema evolution, sequence numbers, snapshot references (branches/tags), retention, scans, and delete formats.
+
+Where the REST catalog fits (and why the spec makes it thin)
+The REST catalog is a protocol layer on top of this format. The table spec is deliberately engineered so that a catalog doesn't need to know about files, manifests, or scans:
+1. The catalog's only real job is bookkeeping: hold a pointer to the current table metadata, and atomically advance that pointer on commit (the "metastore tables" pattern in the spec). Everything about the data is self-contained in the metadata tree on object storage.
+2. Because readers and writers read the metadata file directly from storage (not through the catalog), the catalog is not in the scan path and not in the data path. A scan touches the catalog once, then reads manifests/files straight from the object store. That's the "Speed" and "Scale" goals from the spec's Goals section — no central bottleneck.
+3. Because commits are optimistic (write new metadata, then atomic swap with validation/retry), the catalog can be a stateless compare-and-swap service. Multiple writers contend on the pointer swap, retry on conflict, and the metadata itself stays authoritative.
+
+So the REST catalog is designed the way it is — a thin, mostly stateless HTTP interface over a pointer store, with clients doing the real work against object storage — because the table spec moves all complexity into immutable, self-describing metadata files that any client can read directly. The catalog's value is a uniform access/namespacing/commit API across engines (Spark, Flink, etc.) and a place to enforce that atomic swap; it deliberately does NOT need to understand query planning, partitioning, or the file layout.
+
+One correction to expectations: if you want the actual REST wire protocol (endpoints like POST /v1/{prefix}/namespaces, GET/POST/POST-commit on tables, config/credential endpoints, and its concurrency/retry semantics), that's the separate file — site/docs/rest-catalog-spec.md. I can read that one next if you want the protocol-level breakdown.

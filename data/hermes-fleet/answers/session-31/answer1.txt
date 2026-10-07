@@ -1,0 +1,39 @@
+I read the entire file (2,153 lines, in three chunks). Here's the honest summary, with a caveat up front.
+
+## The spec does not define a "JDBC catalog"
+
+format/spec.md is the Iceberg *table format* spec. It deliberately does **not** standardize any specific catalog implementation—JDBC, Hive, REST, Glue, etc. are all left to the Java (and other) implementations, not to the spec. The spec says this explicitly at the commit layer:
+
+> "The atomic operation used to commit metadata depends on how tables are tracked and is not standardized by this spec."
+
+So the JDBC catalog is really an `iceberg-jdbc` module in the codebase, not a section of format/spec.md. What the spec *does* describe—and what a JDBC catalog must conform to—is the general mechanism every catalog is built on, plus the two commit schemes it standardizes.
+
+## What the spec actually says about catalogs
+
+The whole design hinges on **metastore tables** (`Metastore Tables`, the section after File System Tables).
+
+The core idea: an Iceberg table's data lives in object storage and is versioned by a chain of immutable metadata JSON files. A catalog's only job is to hold one small, authoritative piece of state—a pointer to the *current* metadata file—and to swap it atomically. The data itself is never touched by the catalog; it's all in the files.
+
+The commit primitive the spec mandates is a **check-and-put**:
+
+> The atomic swap needed to commit new versions of table metadata can be implemented by storing a pointer in a metastore or database that is updated with a check-and-put operation. The check-and-put validates that the version of the table that a write is based on is still current and then makes the new metadata from the write the current version.
+
+Concretely (paraphrasing the numbered steps): a writer reads current metadata from the catalog, writes a new metadata file to storage (`<V+1>-<uuid>.metadata.json`), then asks the metastore to swap the table's pointer from `V` to `V+1`. If the swap succeeds, the commit won. If it fails, another writer committed first, and you retry from step 1.
+
+The spec also documents **File System Tables** (atomic-rename based) but explicitly marks that scheme **deprecated and unsafe** in object stores/local filesystems, and slated for removal in v4. The metaclass javadoc link for Metastore Tables (`BaseMetastoreTableOperations`) is the base class that JDBC, Hive, REST, and other catalogs all implement.
+
+## Why it's designed that way
+
+The design flows directly from the spec's stated goals at the top:
+
+- **Serializable isolation / optimistic concurrency.** Catalog commit is a compare-and-swap on a pointer, not a lock. Writers optimistically assume no one changed the pointer, and a failed swap means "retry against the new current version," giving serializable behavior without readers ever taking locks (the spec: "Readers will not acquire locks"). This is the "Optimistic Concurrency" section made real in the catalog.
+- **Scale / no central bottleneck.** The catalog stores only a tiny pointer. Job planning (reading manifests, pruning files) happens in the client against object storage—O(1) remote calls to the catalog—so the metastore/DB never becomes a planning hot spot. That's why relocation/`location` handling and relative paths matter (v4): the catalog is thin and storage is the real home of the data.
+- **Storage separation & atomicity.** Because the catalog only tracks a pointer and each metadata version is a new immutable file, the atomic rename of one pointer gives you all-or-nothing commits; there's no multi-key instrumentation to keep consistent.
+- **Engine- and vendor-agnostic.** By specifying only the *primitive* (check-and-put on a pointer) and not any catalog protocol, one table format works behind JDBC, Hive, REST, Glue, Nessie, etc. JDBC is just one way to satisfy that primitive: a relational DB table with a row per table holding the current metadata location, updated with a conditional UPDATE.
+
+## Bottom line
+
+- The spec says a catalog is: a place storing a per-table pointer to the current metadata file, updated via a **check-and-put atomic swap** (Metastore Tables). JDBC is one concrete implementation of that contract, not something the spec names.
+- It's designed that way to get optimistic, lock-free serializable commits, to keep per-scan catalog traffic O(1), to avoid a central metadata bottleneck, and to stay independent of which database/engine fronts the metadata pointer.
+
+If you want the JDBC catalog's *implementation* details (table schema, transactions/locks, retry policy, namespace handling), that lives in the code, not the spec — I can point you at `iceberg-jdbc`'s `JdbcCatalog`, `JdbcTableOperations`, and its SQL schema if that's what you're after.

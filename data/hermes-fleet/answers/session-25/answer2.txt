@@ -1,0 +1,36 @@
+I've read FastAppend.java in full and the code it calls: the SnapshotProducer base (manifest list writing, parallel manifest writing, commit/retry loop), and ManifestFiles (writeParallel, copyAppendManifest, the newWriter manifest writers). Here's how the implementation follows the spec.
+
+What the spec calls "fast append" (format/spec.md:978-983) is: on append, add a new manifest instead of rewriting an existing one, so write work is proportional to the new data, not the table size. FastAppend is precisely that path (its class comment, FastAppend.java:35: "Append implementation that adds new manifest files for writes.").
+
+1. New manifests, never a rewrite of existing ones
+
+The heart is apply() (FastAppend.java:147-172). It builds the new snapshot's manifest list as:
+- manifests written for the new data files (writeNewManifests, FastAppend.java:151),
+- any explicitly appended manifests (FastAppend.java:159-163),
+- and, critically, the parent snapshot's existing manifests copied in unchanged: `manifests.addAll(snapshot.allManifests(ops().io()))` (FastAppend.java:165-167).
+
+It never opens and rewrites the existing manifests to insert new entries — it only concatenates them. That is the spec's "rewriting and appending to an existing manifest" being explicitly avoided (format/spec.md:980). Because old manifests are immutable and reused across snapshots (format/spec.md:87), append cost is O(new files), independent of table size — the spec's "Speed" goal (format/spec.md:72).
+
+The new files are grouped and written in parallel through writeDataManifests -> ManifestFiles.writeParallel (SnapshotProducer.java:748-753, ManifestFiles.java:584-604), with a RollingManifestWriter (SnapshotProducer.java:771-786) that splits into multiple manifests if needed. The manifest schema is generated per format version and partition spec (ManifestFiles.java:264-286), matching the spec's rule that a manifest stores files for a single partition spec (format/spec.md:666).
+
+2. Sequence number / snapshot ID inheritance for cheap retries
+
+apply() happens inside the commit path (SnapshotProducer.java:500), which runs once per commit attempt and can retry on CommitFailedException (SnapshotProducer.java:484-534). For a fast append to be retried cheaply, the newly written manifests must be reusable across attempts — which is exactly what the spec's inheritance mechanism guarantees (format/spec.md:932-937: writes sequence numbers as null so a manifest "can be written once and reused in commit retries", only the manifest list must be rewritten).
+
+The manifest writer is created with the assignment-time snapshotId but null sequence numbers handled by inheritance: newWriter passes the snapshotId (SnapshotProducer.java:643-650 -> ManifestFiles.java:264-271), and `writeDataFileGroup` adds files via `closableWriter::add` with a null data sequence (SnapshotProducer.java:776-779), i.e. "inherit data seq" (SnapshotProducer.java:745). A new manifest list is written for each attempt with the optimistic sequence number (SnapshotProducer.java:299, 308-316). If the commit is retried, only the manifest list is rewritten — the data manifests are reused (writeNewManifests even cleans up and re-creates them between attempts, FastAppend.java:204-208, but keeps them across a failed apply within one attempt).
+
+The spec also notes the field `snapshot_id` is optional and inherited when null (format/spec.md:692, 703). That's the branch that decides whether an explicitly appended manifest can be reused as-is: `appendManifest` (FastAppend.java:109-130) validates the manifest has no existing/deleted files, that its snapshotId is unassigned (+-1/null), and its sequenceNumber is unset; if snapshot-ID inheritance is enabled the manifest is added to the list as-is, otherwise it's rewritten via copyManifest (FastAppend.java:132-144 -> ManifestFiles.copyAppendManifest, ManifestFiles.java:428-453) so it can carry this commit's snapshot ID.
+
+3. Append "can always be applied" on retry
+
+The spec's commit-conflict section (format/spec.md:1316): "Append operations have no requirements and can always be applied." Note that validate() is empty here (inherited default no-op, SnapshotProducer.java:283) — FastAppend adds no preconditions, exactly the "no requirements" the spec grants appends. Because existing manifests are untouched, re-applying the same new manifests on a retry against a newer base is always valid.
+
+4. Cleanup respects immutability
+
+cleanUncommitted (FastAppend.java:184-192) deletes the newly written manifests (newManifests, which FastAppend owns) and any rewrittenAppendManifests, but deliberately does not touch appendManifests (they're added to the manifest list and not compacted, FastAppend.java:190). And cleanupAfterCommit returns true only when there are rewritten manifests (FastAppend.java:199-202) — otherwise nothing committed by the append is deleted, consistent with appended manifests never being rewritten (the spec/summary field for that is `manifests-kept`, format/spec.md:2117).
+
+Summary-of-behavior match: the snapshot summary operation is APPEND (FastAppend.java:62-64 matches spec operation="append", format/spec.md:971), and the summary includes created/kept/replaced manifest counts (FastAppend.java:169, SnapshotProducer.java:723-742) matching the spec's optional snapshot summary fields (format/spec.md:2116-2118).
+
+So the implementation is a faithful realization of the spec's fast-append design: it adds a new immutable manifest per append, reuses prior manifests, and leans on sequence-number/snapshot-ID inheritance so the operation stays O(new data) and retryable without rewriting anything already written. The cost side — many small manifests accumulate, which the manifest list's summary metadata lets scanners skip (format/spec.md:1005, 1057) — is what compaction later cleans up.
+
+One nuance worth noting: this FastAppend is the engine-agnostic core implementation with snapshot-ID inheritance enabled at formatVersion > 1 (SnapshotProducer.java:151-155). The alternative writer path, MergingSnapshotProducer, is the "merge/compact manifests while writing" variant; FastAppend is the one that strictly follows the add-a-new-manifest fast-append model.

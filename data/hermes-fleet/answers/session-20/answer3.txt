@@ -1,0 +1,50 @@
+Here are the edge cases and failure modes of the bucket transform, and how the implementation guards each.
+
+## 1. Null input
+Failure mode: hashing `null` would NPE or scatter nulls into a non-deterministic bucket; the spec requires null → null.
+Guard: `Bucket.apply` returns null immediately before hashing (`Bucket.java:113-115`). Each concrete `hash()` in the subtypes is only reached with a non-null value because `apply` early-returns first.
+
+## 2. Non-positive bucket count (N ≤ 0)
+Failure mode: `bucket[0]` or `bucket[-5]` would divide by zero or produce garbage/negative partition values; the spec's `bucket[N]` requires a positive N.
+Guard: both factories run `Preconditions.checkArgument(numBuckets > 0, ...)` before constructing (`Bucket.java:41-42` and `:55-56`). By the time the formula runs, `numBuckets` is guaranteed positive.
+
+## 3. Unsupported source type
+Failure mode: the spec limits bucket sources to a fixed set; applying bucket to float/double/boolean/variant/etc. must be rejected, not silently hashed into an undefined bucket.
+Guard: `canTransform` returns true only for the spec's types (INTEGER, LONG, DATE, TIME, TIMESTAMP, TIMESTAMP_NANO, STRING, BINARY, FIXED, DECIMAL, UUID; `Bucket.java:120-136`). `bind` checks it first (`:93-95`) and the type-dispatch factory throws `IllegalArgumentException` for anything else (`:77-78`). Note `BucketUtil` does define float/double/boolean hashes, but they're unreachable through `Bucket` because `canTransform` gates them out.
+
+## 4. Negative hash → negative bucket
+Failure mode: Murmur3 returns a signed 32-bit `int`; a raw `% N` on a negative value yields a negative bucket, which would break partition-value equality and ordering across files.
+Guard: `(hash(value) & Integer.MAX_VALUE) % numBuckets` (`Bucket.java:116`) clears the sign bit first, exactly the spec's `& Integer.MAX_VALUE` step, so the bucket is always in `[0, N-1]`.
+
+## 5. int → long schema promotion changing buckets
+Failure mode: if an int bucketed column is promoted to long, the spec requires bucket values to stay identical (Appendix B note 1); a naive type-specific hash would break existing files.
+Guard: `hash(int)` and `hash(long)` both call `MURMUR3.hashLong(value)` (`BucketUtil.java:38-44`), so a value hashed either way produces the same result (`BucketInteger.java:217-219`, `BucketLong.java:230-232`). Spec's promotion rule only allows int→long for a bucket source because of this parity.
+
+## 6. Pre-1970 (negative) nanosecond timestamps
+Failure mode: naively dividing nanos→micros with truncation toward zero (`/`) would produce a different micro value than the correct floor, changing the bucket for negative timestamps relative to how microsecond timestamps are stored.
+Guard: `DateTimeUtil.nanosToMicros` uses `Math.floorDiv(nanos, 1000)` (`DateTimeUtil.java:104-106`), which rounds toward negative infinity — the same as the exact division of the stored microsecond value. The comment at `DateTimeUtil.java:98-101` calls this out explicitly.
+
+## 7. UUID byte order
+Failure mode: hashing a UUID with the wrong byte order would diverge from other engines (spec Appendix B note 4 requires big-endian encoding of the 16 bytes).
+Guard: `BucketUtil.hash(UUID)` writes each half reversed: `Long.reverseBytes(msb)` and `Long.reverseBytes(lsb)` (`BucketUtil.java:92-99`), producing the 16 big-endian bytes that the spec's test vector (`f79c3e09-...` → hashed as `F7 9C 3E 09 ...`) assumes.
+
+## 8. Decimal scale dependence
+Failure mode: hashing a decimal including its scale would change the bucket when the same numeric value is stored at a different scale or promoted — Appendix B note 2 requires the hash to be scale-independent.
+Guard: `hash(BigDecimal)` hashes only `value.unscaledValue().toByteArray()` (`BucketUtil.java:101-103`), the minimal two's-complement big-endian unscaled integer, with no scale bytes involved.
+
+## 9. ByteBuffer hashing wrong bytes or mutating the buffer
+Failure mode: (a) hashing the whole backing array would include bytes before the position or beyond the limit (stale data, wrong value); (b) reading a non-array-backed buffer advances its position as a side effect, corrupting later use.
+Guard: array-backed buffers are hashed via `arrayOffset() + position(), remaining()` so only the actual value bytes are used (`BucketUtil.java:74-78`); non-array-backed buffers are copied and the original position is restored in a `finally` block (`:79-89`), so the caller's buffer is untouched.
+
+## 10. Unsupported/legacy misuse of the base class
+Failure mode: calling `apply` on the raw base `Bucket` (e.g. from the deprecated `get(int)` without a type) has no type-specific hash and would produce a wrong/undefined value.
+Guard: the base `hash()` throws `UnsupportedOperationException` (`Bucket.java:98-101`), so misuse fails loudly instead of producing a wrong bucket. The correct path is `bind(Type)` (`:93-96`), which resolves to a concrete subtype. (`apply` itself is also `@Deprecated`, `:108-117`.)
+
+## 11. Float/double NaN and `-0.0` canonicalization
+Failure mode: `+0.0` and `-0.0` must hash identically (IEEE says they're equal), and NaN bit patterns must be canonicalized (Appendix B note 5).
+Guard: `BucketUtil.doubleToLongBits` maps `Long.MIN_VALUE` (`-0.0`) to `0L` (`BucketUtil.java:46-56`). Note this guard only canonicalizes `-0.0`; the NaN canonicalization the spec mentions also lives here but isn't performed — and it's moot for bucketing because float/double aren't valid bucket sources, so `Bucket` never reaches these methods.
+
+## 12. Hash collisions and skew (inherent, not guarded)
+Two distinct source values can hash to the same bucket, and small N won't be perfectly even. These aren't bugs — they're the design's point (bounded, roughly uniform buckets) — and the `& Integer.MAX_VALUE` does remove the sign skew. The code (correctly) does not attempt to eliminate collisions, since determinism across engines is what matters for correctness, not collision-freeness.
+
+The strongest takeaway: the guards fall into two groups — explicit validation that rejects invalid inputs early (bucket count, unsupported type), and byte-level canonicalization that makes the hashing deterministic and evolution-stable (sign masking, int/long parity, floor division, big-endian UUID, scale-free decimal, buffer-position safety). Collisions/skew are deliberately left unguarded because they're inherent to the transform.

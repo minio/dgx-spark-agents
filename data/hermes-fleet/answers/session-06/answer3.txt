@@ -1,0 +1,84 @@
+I've mapped the failure modes across the transaction code and its collaborators (`BaseTransaction`, `TableOperations`, `BaseMetastoreTableOperations`, `BaseMetastoreOperations`, `SnapshotProducer`, `Tasks`, and per-operation `validate()` overrides). Here are the edge cases, grouped by the phase where they bite, with the guard and citation for each.
+
+## 1. Commit conflicts (the core optimistic-concurrency case)
+
+What fails: two writers commit from the same base; only one can win. The spec's whole model is conflict-detected, not conflict-prevented ([spec.md:95-97](format/spec.md#optimistic-concurrency)).
+
+Guard: the atomic CAS rejects the stale writer, and only that specific failure triggers retry.
+- `BaseMetastoreTableOperations.commit` throws `CommitFailedException` when `base != current()` ([BaseMetastoreTableOperations.java:111-113](core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java#L111)).
+- Retry is limited to `CommitFailedException` via `onlyRetryOn(CommitFailedException.class)` in `SnapshotProducer.commit` ([SnapshotProducer.java:496](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L496)), `commitSimpleTransaction` ([BaseTransaction.java:366](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L366)), and `commitReplaceTransaction` ([BaseTransaction.java:311](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L311)).
+- The retry engine itself ([Tasks.java:440-451](core/src/main/java/org/apache/iceberg/util/Tasks.java#L440)) and backoff mechanics ([Tasks.java:462-477](core/src/main/java/org/apache/iceberg/util/Tasks.java#L462)).
+
+Residual risk: `Tasks` is also used with `shouldRetryPredicate`/`stopRetryOn` for other paths (e.g. metadata refresh [BaseMetastoreTableOperations.java:194-200](core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java#L194)); if a non-transient error ever slips through a commit retry predicate it could loop, but `onlyRetryOn` at the commit sites keeps this narrow.
+
+## 2. Retry must be safe — wrong re-application corrupts the table
+
+What fails: blindly re-running a failed commit against a newer base can lose a concurrent change (e.g. re-deleting a file another writer just re-added, or applying a schema update over a changed schema). The spec only allows retry "under well-defined conditions" ([spec.md:97](format/spec.md#optimistic-concurrency), [:1314-1319](format/spec.md#commit-conflict-resolution-and-retry)).
+
+Guard: per-operation validation before apply, plus re-applying the whole chain, not just the last step.
+- `SnapshotProducer.runValidations` → `validate()` runs before `apply()` each attempt ([SnapshotProducer.java:302, 375-387](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L375)); the abstract hook is at [SnapshotProducer.java:283](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L283).
+- Concretely: overwrite validates added files match the filter and that no conflicting data/delete files appeared since the base snapshot ([BaseOverwriteFiles.java:136-179](core/src/main/java/org/apache/iceberg/BaseOverwriteFiles.java#L136)); replace-partitions validates added files don't overwrite a changed partition and no conflicting deletes appeared ([BaseReplacePartitions.java:89-110](core/src/main/java/org/apache/iceberg/BaseReplacePartitions.java#L89)); rewrite/row-delta/streaming-delete have analogous hooks. These map to the spec's "files still in the table" precondition ([spec.md:1317](format/spec.md#commit-conflict-resolution-and-retry)).
+- Schema/partition-change updates carry required-change validations (e.g. `UpdateRequirement` checks, [UpdateRequirement.java:28-225](core/src/main/java/org/apache/iceberg/UpdateRequirement.java#L28)) so a metadata update won't apply over a base that no longer satisfies its precondition.
+- In a transaction, `applyUpdates()` re-base-lines: on a stale base it sets both `base` and `current` to the refreshed metadata and re-runs every pending update in order ([BaseTransaction.java:438-453](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L438)) rather than the last one only, then does one final `underlyingOps.commit(base, current)` ([BaseTransaction.java:371](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L371)).
+
+Residual: if a conflicting update cannot be re-applied, `PendingUpdateFailedException` breaks the retry loop and surfaces the wrapped `CommitFailedException` ([BaseTransaction.java:447-451](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L447)).
+
+## 3. Commit state unknown (can't tell success from failure)
+
+What fails: a network partition or lost acknowledgement after the pointer swap means the writer doesn't know if its commit landed. Cleaning up files here could delete files that were actually committed.
+
+Guard: `TableOperations.commit`'s contract requires `CommitStateUnknownException` for exactly this case ([TableOperations.java:53-59](core/src/main/java/org/apache/iceberg/TableOperations.java#L53)); it is re-thrown untouched, bypassing all file cleanup, in every commit path ([SnapshotProducer.java:536-537](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L536); [BaseTransaction.java:279-281, 331-333, 374-376](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L279)). Status resolution (`checkCommitStatus*` → `CommitStatus.{FAILURE,SUCCESS,UNKNOWN}`, never guessing) is at [BaseMetastoreOperations.java:41-151](core/src/main/java/org/apache/iceberg/BaseMetastoreOperations.java#L41).
+
+## 4. Leaving garbage / deleting too much on failure
+
+What fails: an aborted commit leaves orphaned manifests/manifest-lists, or cleanup deletes files that a partially-observed commit actually published.
+
+Guard: track what's uncommitted and only delete what wasn't committed.
+- Files deleted by operations are routed into `deletedFiles` via `deleteWith(enqueueDelete)` when the update is registered ([BaseTransaction.java:70-72, 123-128](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L70)).
+- On failure: `cleanAllUpdates` runs `SnapshotProducer.cleanAll()` for each update ([BaseTransaction.java:423-432](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L423)) and `deleteUncommittedFiles` removes the tracked set ([BaseTransaction.java:434-436](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L434)).
+- After a success it avoids deleting committed files: it loads the new snapshots, collects their manifest/manifest-list paths into `committedFiles`, and filters them out of the cleanup set ([BaseTransaction.java:390-413](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L390), helper [:457-466](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L457)). A manifest reused across retried commits is protected because the filter is against actually-committed snapshots, matching the spec's "all changes to table state create a new metadata file" design ([spec.md:85](format/spec.md#overview)).
+- `SnapshotProducer` cleans leftover manifest lists from earlier attempts after a successful commit, keeping only the committed one ([SnapshotProducer.java:553-564](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L553)).
+
+Residual: cleanup is deliberately skipped for `CommitStateUnknownException`, and the `catch (Throwable)` at the end of the success path means a failure during committed-metadata load merely logs and skips cleanup rather than risking wrong deletes ([SnapshotProducer.java:570-574](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L570)).
+
+## 5. Creating a table that already exists
+
+What fails: two writers both try create; one wins, the other must not clobber it.
+
+Guard: in `commitCreateTransaction`, `ops.commit(null, current)` (no retry — the comment at [BaseTransaction.java:273-275](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L273) states it "cannot retry because another process has created the same table"); `BaseMetastoreTableOperations.commit` throws `AlreadyExistsException` when `base == null` but the table now exists ([BaseMetastoreTableOperations.java:117](core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java#L117)).
+
+Residual: this falls under `RuntimeException`/`CommitStateUnknownException` handling — if the state is unknown the create does not delete files, consistent with rule 3.
+
+## 6. Replace-table vs. current state (retry semantics differ by type)
+
+What fails: `REPLACE_TABLE`/`CREATE_OR_REPLACE_TABLE` differ from `CREATE_TABLE`; a replace must tolerate the table changing under it, and know whether "not found" means it was never there or someone deleted it.
+
+Guard: `commitReplaceTransaction` retries with `onlyRetryOn(CommitFailedException)` ([BaseTransaction.java:301-311](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L301)); inside the loop it `refresh()`es and catches `NoSuchTableException`, rethrowing only when `orCreate` is false ([BaseTransaction.java:314-320](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L314)); because the metadata is fully replaced, non-create replaces are always re-appliable ([BaseTransaction.java:322-328](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L322)).
+
+## 7. Stale in-memory base while an operation runs
+
+What fails: an individual operation captured `ops.current()` in its constructor ([SnapshotProducer.java:133](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L133)); if the table changed before it commits, it must detect it.
+
+Guard: `SnapshotProducer.apply()` calls `refresh()` ([SnapshotProducer.java:296](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L296)); the CAS in `BaseMetastoreTableOperations.commit` compares against freshly-checked `current()` (a refresh happens when `shouldRefresh`) ([BaseMetastoreTableOperations.java:70-75, 109-113](core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java#L70)). Within a transaction, `TransactionTableOperations.commit` enforces ordering with its own in-memory CAS throw `CommitFailedException` ([BaseTransaction.java:482-494](core/src/main/java/org/apache/iceberg/BaseTransaction.java#L482)).
+
+## 8. Snapshot ID collision
+
+What fails: two commits pick the same snapshot ID, corrupting snapshot addressing.
+
+Guard: `snapshotId()` re-rolls until it doesn't collide with an existing snapshot, under a synchronized block ([SnapshotProducer.java:697-706](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L697)). Snapshot IDs themselves come from `TableOperations.newSnapshotId()` ([TableOperations.java:116-118](core/src/main/java/org/apache/iceberg/TableOperations.java#L116)), whose low-collision pseudo-random generation the spec's Appendix F recommends ([spec.md:2131-2137](format/spec.md#assignment-of-snapshot-ids-and-current-snapshot-id)).
+
+## 9. Readers under concurrency / time travel
+
+What fails: a reader holding a snapshot must not see later writes, and must stay consistent.
+
+Guard: reads are pinned to a loaded snapshot (the spec's non-locking isolation, [spec.md:93](format/spec.md#optimistic-concurrency)); there are no transaction-level read locks, so there's nothing to deadlock. Cleanup avoids under-deleting: `committedFiles` protects committed snapshots (rule 4), and `TableOperations.commit`'s UUID check rejects loading metadata that belongs to a different table ([BaseMetastoreTableOperations.java:202-209](core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java#L202)).
+
+Residual: eventual consistency (line 566-568 comment in [SnapshotProducer.java:565-569](core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L565)) can make a freshly committed snapshot temporarily unreadable right after commit; the code logs and skips cleanup in that case rather than failing.
+
+## 10. Interruption / operation-level breakage mid-commit
+
+What fails: a task interrupted mid-run could do real work for a caller that has gone away.
+
+Guard: `Tasks` refuses to retry interruption-caused failures (`causedByInterruption`, including thread-interrupt and `ClosedByInterruptException` but distinguishing socket timeouts) ([Tasks.java:420-425, 483-499](core/src/main/java/org/apache/iceberg/util/Tasks.java#L483)); retries stop on `UnrecoverableException` ([Tasks.java:84-85](core/src/main/java/org/apache/iceberg/util/Tasks.java#L84)).
+
+Net: the design's two real weaknesses are inherited directly from the spec's chosen trade-offs — (a) commit conflicts are detected and retried by the writer, not prevented, so under pathological contention a commit can exhaust retries and fail ([Tasks.java:428-433](core/src/main/java/org/apache/iceberg/util/Tasks.java#L428)); and (b) an "unknown state" commit can leave a duplicate/orphan metadata file behind because the code deliberately refuses to guess, prioritizing not deleting committed data over perfect garbage collection. Both are the price of a no-lock, object-store-friendly, conflict-detected model.

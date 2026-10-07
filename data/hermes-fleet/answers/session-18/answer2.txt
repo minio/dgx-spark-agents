@@ -1,0 +1,54 @@
+I read NameMapping.java and everything it calls: MappedField.java, MappedFields.java, MappingUtil.java, and NameMappingParser.java. Here's how the implementation maps to the spec.
+
+## Data model: the JSON shape becomes nested objects
+
+The spec (§ lines 412-427) defines each mapping object as `names` (required list), `field-id` (optional), `fields` (optional child mappings for structs/lists/maps).
+
+- **MappedField** = one mapping object. Its three fields mirror the spec exactly: `names` as an immutable `Set<String>` (MappedField.java:46, populated at :52), `id` as an `Integer` that may be null (:47, :50), and `nestedMapping` as `MappedFields` that may be null (:48, :53). This directly implements the spec's "optional field-id" (null id) and "optional fields" (null nestedMapping).
+- **MappedFields** = the ordered list of mapping objects, held as a `List<MappedField>` (MappedFields.java:39). `NameMapping` wraps the top-level `MappedFields` (NameMapping.java:49-57).
+- `MappedField.of(id, name)` / `of(id, names)` / `of(id, names, nested)` (:30-44) give the factories; names are stored as a set (an order-free bag), matching the spec's "list of names". The multiple `of` overloads reflect that `names`, `field-id`, and `fields` are independently optional.
+
+## `names` is the lookup key, `field-id` is what's used downstream
+
+The spec is explicit that names are just keys and multiple names can map to one id (spec :422). This asymmetry is embodied in MappedFields' indexes:
+
+- `indexIds` (MappedFields.java:61-75) builds `name -> id`: for each name, if the field has an id it records `name -> id`. This is the "names are only lookup keys" path — used to translate a name to the field id.
+- `indexFields` (:77-87) builds `id -> MappedField`. Only fields with non-null ids are indexed (:81-84), which is exactly the spec rule "Fields that exist in imported files but not in the Iceberg schema may omit `field-id`" (spec :424) — an id-less field simply can't appear in the id index.
+- Both indexes are built **lazily** (:93-105), matching Iceberg's lazy-over-eager convention.
+
+## Nested resolution and the literal-dot rule
+
+The spec says a `.` in a name is literal, not a nesting separator (spec :420-421), and that lookup must resolve nested fields. This is handled by IndexByName in MappingUtil:
+
+- `IndexByName.field` (MappingUtil.java:196-213) joins a child's full path to each parent name with `DOT` (a literal `.`, :40) to build fully-qualified names like `location.latitude` (:202-204), and also registers the parent's bare names (:208-210). Because the join uses the literal `.` and recursion is structural (through `nestedMapping`), a name that itself contains a `.` is still treated as one literal name — matching the spec's dot rule.
+- `NameMapping.find(String.../List/Iterable names)` (NameMapping.java:63-77) joins the path components with the same literal `DOT` and looks up, so callers pass the field path and get the nested MappedField — consistent with the spec's "child fields defined under `fields`" model (:421).
+
+## `fields` for structs, `element` for lists, `key`/`value` for maps
+
+The spec requires those exact sub-mappings (:425-427). `CreateMapping` in MappingUtil (built from a `Schema`) produces them:
+
+- `struct` builds a child `MappedField` per nested field using its id and name (MappingUtil.java:278-288).
+- `list` creates a `MappedField` named `"element"` (MappingUtil.java:296-298) — the spec's required element mapping.
+- `map` creates two `MappedField`s named `"key"` and `"value"` (MappingUtil.java:301-305) — the spec's required key/value mappings.
+- `variant` and `primitive` return null because they have no nested fields (:308-315), matching the spec's rule that `fields` only exists for structs, lists, and maps.
+
+## Serialization: custom parser, kebab-case keys, optional fields only when present
+
+The spec mandates custom `XxxParser.toJson/fromJson`, kebab-case keys, and that optional fields are only written when present (AGENTS.md; spec Appendix C lines 1805-1823). `NameMappingParser` does exactly this with plain Jackson `JsonNode`/`JsonGenerator` — no annotations:
+
+- Keys `field-id`, `names`, `fields` (NameMappingParser.java:47-49) match the kebab-case spec keys (:1809-1813).
+- `toJson(MappedField, ...)` (:69-83) writes `field-id` as a number and `names` as a string array; `fields` is only written when `nested != null` (:76-80) — "optional fields only written when present".
+- `fieldFromJson` (:102-125) reads `field-id` as nullable int (:108), defaults missing `names` to an empty set (:111-115 — the spec's "0 or more names" / empty-`names` case at :423), and parses `fields` only if present (:117-122).
+- The Javadoc example (:35-41) is literally the spec Appendix C example (:1816-1823): `id`/`record_id`, `data`, and nested `location` with `latitude`/`lat` and `longitude`/`long`.
+
+## Lookup entry points and uniqueness
+
+`NameMapping.find(int id)` and `find(names...)` (NameMapping.java:59-77) expose both directions — name→mapped field and id→mapped field — which is what projection needs: you look up by the file's names to recover the Iceberg field id.
+
+One correctness detail worth noting: `IndexById.field` (MappingUtil.java:233-239) enforces that a field id is unique across the mapping via `Preconditions.checkState` (:235-236). The spec (§ schema evolution) requires field ids to be unique in the table schema, so the implementation rejects a name mapping that would assign the same id twice — the "names may be many, ids must be unique" invariant.
+
+## One gap against the spec
+
+The spec (:423) says "Fields which exist only in the Iceberg schema and not in imported data files may use an empty `names` list." The parser supports empty `names` (NameMappingParser.java:111-115), and `CreateMapping` produces id-only mappings. But note that a field with empty names is unreachable by name lookup (MappedFields.java:70 denies entries with null id, and IndexByName only registers names that exist) — it's only discoverable via the id index. That's consistent with the spec intent: such a field is never found by a file's name, which is correct because it doesn't appear in imported files. So it's id-lookup-only by design, not a bug.
+
+Net: the implementation is a faithful, literal translation of the spec's data model, resolution rules, and serialization constraints — nested `MappedField`/`MappedFields` mirror the JSON, name-indexing handles the alias and literal-dot rules, struct/list/map children use the mandated names, and the parser is a custom kebab-case JSON codec with optional fields written only when present.

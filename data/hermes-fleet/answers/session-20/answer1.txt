@@ -1,0 +1,52 @@
+I've read format/spec.md in full, from line 1 through the last line (2153). Here's what the spec says about the bucket transform and why it's built the way it is.
+
+## What the spec says
+
+Definition (Partition Transforms table, and "Bucket Transform Details")
+- bucket[N] is a transform whose result type is always `int`. It's valid on a fixed set of primitives: int, long, decimal, date, time, timestamp, timestamptz, timestamp_ns, timestamptz_ns, string, uuid, fixed, binary.
+- It computes a 32-bit hash of the source value, then maps it into a bucket. The exact recipe is pinned in pseudo-code:
+      bucket_N(x) = (murmur3_x86_32_hash(x) & Integer.MAX_VALUE) % N
+- The hash is the 32-bit Murmur3 hash, x86 variant, seeded with 0.
+- `& Integer.MAX_VALUE` discards the sign bit so the value is non-negative, and `% N` then yields a bucket in [0, N-1].
+- All transforms (including bucket) must return `null` for a null input — so nulls don't get hashed; they fall into the table's null partition.
+
+Per-type hash encoding (Appendix B)
+The spec doesn't just name a hash function; it fixes exactly which bit pattern is hashed for each type:
+- int: hashed as a long (`hashLong(long(v))`), with the explicit requirement that int and long hash results be identical.
+- long: `hashBytes` over little-endian bytes.
+- decimal: `hashBytes` over the minimal two's-complement big-endian unscaled value — the hash is independent of scale.
+- date/time/timestamp/timestamptz: hashed from the epoch value (days from 1970, micros from midnight, micros from epoch).
+- timestamp_ns / timestamptz_ns: truncated to microseconds, so nanosecond timestamps hash identically to microsecond ones.
+- string: `hashBytes` over UTF-8 bytes.
+- uuid: `hashBytes` over 16 big-endian bytes.
+- fixed / binary: `hashBytes` over the raw bytes.
+- float/double/etc. are currently not valid bucket sources (a hash is defined for them in case that changes, but they aren't allowed by the transform's source-type list).
+
+## Why it's designed that way
+
+1. A bounded, predictable number of partitions.
+   Unlike identity or truncate (whose distinct values follow the data), bucket[N] can emit at most N distinct partition values no matter how high-cardinality the source is. Bucketing on a high-cardinality column lets a writer target a chosen number of files / parallelism and keep file sizes balanced without letting partitioning explode with the data's cardinality. Note 1 explicitly says you can change N later by evolving the partition spec as the table grows.
+
+2. Uniform distribution.
+   A good hash (Murmur3) spreads the source values roughly uniformly across the N buckets, so each bucket gets a fair share of rows. This is what makes bucketing useful for balancing writes and achieving a target file count. The sign-bit discard + positive mod guarantees clean 0..N-1 indexing rather than negative buckets.
+
+3. Determinism across engines.
+   The spec pins not just the hash function but the exact bytes hashed per type. That's the load-bearing property: partition values are stored in manifests, so every engine (Spark, Flink, Trino, ...) must derive the same bucket for the same row or partitioned files become unfindable. It also makes bucket partition values comparable across specs.
+
+4. Stability under schema evolution.
+   Multiple hash rules exist specifically so bucket assignments don't change when the schema is safely promoted:
+   - int hashes the same as the equivalent long (integer promotion-safe).
+   - float is hashed via its double cast (float→double safe).
+   - ns timestamps are truncated to micros (safe across the microsecond/nanosecond variants).
+   - decimal hashing ignores scale for a fixed unscaled value.
+   The spec's promotion rule for partitioned fields (Schema Evolution section) ties this together: it forbids promoting a bucket source from int to string because `34` and `"34"` hash differently, but allows int→long precisely because those hashes are defined to agree.
+
+5. Canonical value hashing (not raw storage bytes).
+   Hashing logical values (epoch days, micros, unscaled decimal, big-endian UUID) rather than on-disk bytes means the hash is independent of file format or physical representation, keeping bucketing consistent everywhere.
+
+6. Null handling.
+   Returning null (not hashing null) is consistent with every other transform and keeps nulls grouped into the null partition rather than being scattered by a hash of a sentinel.
+
+So: the bucket transform is a hash-to-a-fixed-number-of-buckets scheme, and every seemingly fussy detail (Murmur3 seeded with 0, sign-bit discard, per-type canonical byte encoding, promotion-safe hashing) exists to make bucketing deterministic and stable across engines and schema evolution, while still giving predictable, evenly-sized partitions.
+
+One correctness note: the spec does not give a test/example value for the bucket transform itself in the transform section, but Appendix B provides exact hash test values per type (e.g. `34` → 2017239379), which is how an implementation validates it's producing the canonical hashes that feed into the bucket formula.

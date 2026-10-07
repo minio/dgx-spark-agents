@@ -1,0 +1,43 @@
+I now have a complete picture of both integrations. Let me give the explanation.
+
+## Overview
+
+Both Spark and Flink hand off to Iceberg's core `FileIO` abstraction rather than doing their own storage I/O. The engine's job ends at producing `FileScanTask`/`CombinedScanTask` objects (from the table's metadata) and a `FileIO`; the `FileIO` turns those into actual byte streams. The two engines wrap FileIO differently because of how they distribute work.
+
+## Where the FileIO comes from
+
+Every `Table` exposes its configured `FileIO` via `table.io()` (OutputFileFactory.java:143 uses `table::io` as the default IO supplier). `ResolvingFileIO` is typically that instance — the scheme-based dispatcher from your earlier questions — so the whole engine read/write path funnels through it.
+
+## Spark READ path (batch + streaming)
+
+1. The scan produces a `FileIO` supplier captured in `SparkScan` (SparkScan.java:105, constructor :120).
+2. To get it to executors, Spark broadcasts it. For streaming, `SparkMicroBatchStream` wraps it in a serializable form and broadcasts it (SparkMicroBatchStream.java:83-84). `SerializableFileIOWithSize` (SparkMicroBatchStream.java:84) is a serializable `FileIO` wrapper that returns a fixed size estimate so Spark's cost-of-broadcast sizing is cheap (SerializableFileIOWithSize.java:43-58), forwards all `newInputFile`/`newOutputFile`/`deleteFile` calls to the real IO (:73-90), and avoids closing the shared driver instance on close (guarded by `serializationMarker`, :65-70).
+3. Each `SparkInputPartition` holds a broadcast `Broadcast<FileIO>` and exposes it as `partition.io()` (SparkInputPartition.java:38, :88-90) — the plan task group ships to executors, the FileIO is broadcast once.
+4. On an executor, `BatchDataReader` (batch columnar) is constructed with that FileIO (BatchDataReader.java:51-62, `partition.io()` at :56) and for each task calls `getInputFile(filePath)` to get an `InputFile` (BatchDataReader.java:108). `getInputFile` is inherited from `BaseReader` (BaseReader.java:179-181), which resolves all referenced input files via `fileIO.bulkDecrypt(...)` (BaseReader.java:183-191) — the concrete `newInputFile` calls happen inside that decryption path.
+5. Encryption is layered: `BaseReader` wraps the raw FileIO in `EncryptingFileIO.combine(fileIO, table.encryption())` (BaseReader.java:94). Deletes are also read through the same IO: `SparkDeleteFilter.getInputFile` (BaseReader.java:219-221) and a `BaseDeleteLoader` that opens delete files via `newInputFile` (BaseReader.java:232-237, optionally cached in `SparkExecutorCache` :239-256). This is the spec's delete-file read path (delete files are themselves bytes read through FileIO).
+6. The `InputFile`'s `newStream()` gives the seekable stream that the Parquet/ORC readers consume; `BatchDataReader.open` also supplies the split offset/length and residual predicate (BatchDataReader.java:116-124).
+
+Planning side, `fileIO.get()` is used directly in the driver for locality: `computePreferredLocations` calls `SparkPlanningUtil.fetchBlockLocations(fileIO.get(), taskGroups)` (SparkMicroBatchStream.java:169-172) — using FileIO to ask the filesystem where blocks live so tasks land next to their data.
+
+## Spark WRITE path
+
+Writing goes through the core `OutputFileFactory`: the Spark delta write builder creates an `OutputFileFactory` (SparkPositionDeltaWrite.java:452-454), and the factory asks the FileIO for an `OutputFile` at a generated, unique path — `ioSupplier.get().newOutputFile(locations.newDataLocation(...))` (OutputFileFactory.java:106-108, :117-121). The unique filename derives from partition/task/operation-id/counter (OutputFileFactory.java:93-103), which is exactly the spec's "writers create files in-place, then add them at commit" model — multiple tasks writing the same partition never collide because `create()` refuses to overwrite. Deletes during the delta write are read back through `EncryptingFileIO.combine(table.io(), ...).newInputFile(deleteFile)` (SparkPositionDeltaWrite.java:575-579).
+
+## Flink READ path
+
+Flink's `DataIterator` receives the `FileIO` plus a `CombinedScanTask` (DataIterator.java:52-60) and wraps the IO in an `InputFilesDecryptor` (DataIterator.java:59) — the Flink analogue of Spark's `bulkDecrypt`, handling decryption and `newInputFile` resolution. Reading each task calls `fileScanTaskReader.open(scanTask, inputFilesDecryptor)` (DataIterator.java:140-142), and the `RowDataReaderFunction`/`FileScanTaskReader<T>` is where Iceberg's row readers consume the input streams opened from the FileIO (RowDataReaderFunction.java:39 holds the `FileIO io`). So Flink's flow is: source split → `CombinedScanTask` + `FileIO` → decryptor/lazy input files → row/vectorized reader.
+
+## Flink WRITE path
+
+The Flink sink writes both data and manifest files through FileIO: `FlinkManifestUtil` reads existing data files from manifests via `ManifestFiles.read(manifestFile, io, specsById)` (FlinkManifestUtil.java:61-67) and reads completed files back via the same `FileIO io` (FlinkManifestUtil.java:137-139) — the IO is threaded through the sink so data/manifest bytes, plus manifest decoding, all share one storage adapter. The sink's delta writers (e.g. `BaseDeltaTaskWriter`, `FlinkManifestUtil`) use `OutputFileFactory` exactly as Spark does.
+
+## The common pattern
+
+Across both engines the division of labor is identical and worth noting:
+- Engine-side (Spark/Flink): plan tasks from metadata (metrics/partition pruning), ship a serialized/broadcast `FileIO` to workers, hand each worker a `CombinedScanTask`.
+- Core-side: `OutputFileFactory` (writes) and `InputFilesDecryptor` / `bulkDecrypt` (reads) convert those tasks into `InputFile`/`OutputFile` via the one `FileIO`, then into seekable streams.
+- Encryption is cross-cutting, inserted as `EncryptingFileIO` wrapping the raw FileIO in both engines' read paths (BaseReader.java:94; DataIterator.java:59).
+
+So "how query engines use file IO" is: they never touch storage primitives directly — they plan, serialize, and delegate to `FileIO`, which (often `ResolvingFileIO`) resolves the path scheme to the right storage backend. That's the same storage-agnostic boundary the spec mandates.
+
+I cited the v4.2 Spark and v2.3 Flink trees (the highest versions present); there are parallel copies under spark/v3.5, spark/v4.1, flink/v1.20, and flink/v2.2 with the same code shapes. I did not enumerate every one of those duplicated trees.

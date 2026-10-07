@@ -1,0 +1,59 @@
+I read the mapping core (NameMapping, MappedField, MappedFields, MappingUtil, NameMappingParser), plus the two consumers that actually apply it (AvroSchemaUtil.getId/getFieldId, ApplyNameMapping) and the two places it's maintained (SchemaUpdate, and the `MappingUtil.create(schema)` defaults in Avro.java / ProjectionDatumReader.java). Here are the failure modes and how the code guards against each.
+
+## 1. Duplicate / non-unique field IDs in the mapping
+
+A mapping that assigns the same id to two different fields silently corrupts id-based projection, stats, and scan planning, because everything downstream keys on field id.
+
+Guard: `MappingUtil.IndexById.field` does `Preconditions.checkState(!result.containsKey(field.id()), "Invalid mapping: ID %s is not unique", field.id())` at MappingUtil.java:235-236. Building the id index throws on the second occurrence of the same id, so a duplicate id surfaces as an error when the `fieldsById` index is built lazily via `NameMapping.find(int)`/`asMappedFields` (NameMapping.java:83-88).
+
+## 2. Malformed JSON in `schema.name-mapping.default`
+
+The table property is just a JSON string; an operator can put garbage in it.
+
+Guard: `NameMappingParser.fromJson` (NameMappingParser.java:85-87) routes through `fieldsFromJson`, which checks the top level is an array (`Preconditions.checkArgument(node.isArray(), ...)` :94) and that each element is an object (`:102-106`). A non-array or non-object throws. Because `field-id` is read as nullable int via `JsonUtil.getIntOrNull` (:108), a non-integer `field-id` also raises a Jackson/coercion error. Note the weakness: this only triggers when the mapping is actually parsed — reading a table that never touches the mapping won't parse it.
+
+## 3. No mapping for a name → unresolvable field id
+
+If the file has no id and the name isn't in the mapping, lookups return null.
+
+Guards (null-tolerant by design):
+- `NameMapping.find(names...)` returns `lazyFieldsByName().get(...)`; a missing name yields null (NameMapping.java:63-73).
+- In consumers, null is treated as "no id, cannot project": `AvroSchemaUtil.getId`/`getFieldId` return null when the schema property and the name mapping both miss — `if (mapping == null) return null` path at AvroSchemaUtil.java:307-315 and :411-419. `ApplyNameMapping.record` then decides per field: `if (newSchema != null && fieldId != null)` copy with id, else copy without and leave projection unresolvable (ApplyNameMapping.java:54-59). Failure is thus graceful (field becomes null/unprojectable) rather than a crash — matching the spec's projection order where unmatched names fall through to defaults/null (spec :403-408).
+
+## 4. The literal-dot rule violated: a real nested name colliding with a dotted literal
+
+This is an inherent ambiguity, not a coding fix: `IndexByName` joins child path and parent with a literal `.` (MappingUtil.java:202-204), and `find(List<String>)` keys on a `.`-joined path (NameMapping.java:63-77). If a data file has a literal field named `"a.b"` and the mapping also has nested `a -> b`, both can index to the same `"a.b"` key in the by-name map (MappingUtil.java:202). ImmutableMap then throws on the duplicate key when the lazy by-name index is built (MappingUtil.java:188-192). The spec acknowledges names may contain `.` (:420-421) but doesn't define precedence — so this is a genuine collision the code only surfaces as an exception, not a resolved ambiguity.
+
+## 5. Map/list key collisions on the `"key"`/`"value"`/`"element"` names
+
+The spec mandates child names `element`, `key`, `value` for lists/maps (spec :425-427). A struct could legitimately have a sub-field literally named `element`, or `key`/`value`. Because `CreateMapping` uses those exact strings (MappingUtil.java:297, :302-304), a struct field named `element` and an array's element under the same parent map to the same by-name key — the same duplicate-key crash as #4. The code guards the *arrays/maps themselves* by checking they exist: `isKeyValueMapping`/map requires both `key` find and `value` find non-null (ApplyNameMapping.java:106-108, :122-124), and lists require an `element` find (:98). So an incomplete key-value mapping is treated as "no id", not a crash — but a name collision still throws.
+
+## 6. id-less / name-less field dropped from an index
+
+Two spec-supported shapes silently become unreachable:
+- A field with `names` but no `field-id` (spec :424) is never added to the by-id index because `indexFields`/`indexIds` skip null ids (MappedFields.java:70-72, :81-84). It's still reachable by name but can never be projected *from* an id.
+- A field with an empty `names` and an id (spec :423) is only in the by-id index; it's not in the by-name map (IndexByName only registers names that exist, MappingUtil.java:208-210). This can't be reached by name lookup, which is correct but easy to mistake for a bug.
+
+Guard: there is none by design — it's structurally impossible to index a missing name/id. `find` returns null and the consumer treats it as unresolvable, rather than misassigning.
+
+## 7. Mapping becoming stale after schema evolution (rename / add / drop)
+
+The mapping is maintained in lockstep with schema changes; if it isn't, ids point at the wrong names.
+
+Guard: `SchemaUpdate.applyChangesToMetadata` (SchemaUpdate.java:484-505) re-parses the mapping and runs `MappingUtil.update(mapping, updates, parentToAddedIds)` on every schema change (:490-491), then rewrites the property (:496-497). `UpdateMapping` adds a newly-renamed name to the field's name set (MappingUtil.java:111-122) and registers new nested fields under the right parent (:124-155), removing a name that got reassigned to a different id (:157-167). Crucially, the whole maintenance is wrapped in try/catch that logs and *does not fail the update* (SchemaUpdate.java:501-504) — so a corrupt mapping degrades to a warning and a stale mapping, not a broken commit. That's a deliberate trade-off: don't let mapping maintenance block schema evolution.
+
+## 8. Unknown/missing `name-mapping.default` property
+
+If the property is absent and the file lacks ids, nothing can map the names.
+
+Guard: `SchemaUpdate` checks `metadata.property(DEFAULT_NAME_MAPPING, null)` and only updates if non-null (SchemaUpdate.java:485, :487). Consumers pass a null mapping and the entire name-mapping branch is skipped (`if (nameMapping != null)` at AvroSchemaUtil.java:307, :411), so reads fall back to the spec's later steps — defaults or null (spec :406-408). No mapping means graceful fallback, not an error.
+
+## 9. Wrong type coerced from a JSON `field-id` string/number
+
+`toInt` coerces both Number and String to int (AvroSchemaUtil.java:425-433) and throws `UnsupportedOperationException` on anything else — but that's the *downstream writer/reader* coercing Avro property values, not the mapping parser. On the parser side, `JsonUtil.getIntOrNull` (NameMappingParser.java:108) enforces an int at load time, so a malformed `field-id` (e.g. `"abc"`) fails before it ever reaches the name lookup.
+
+## Summary of the guard philosophy
+
+The code defends in layers: (a) parse-time validation rejects malformed JSON and non-array/non-object shapes (NameMappingParser.java:94, :102-106); (b) index-build time rejects duplicate ids and duplicate name keys (MappingUtil.java:235-236, and the ImmutableMap duplicate-key throw at MappingUtil.java:188-192); (c) lookup time is deliberately null-tolerant so unmapped names degrade to "unprojectable → null/default" per the spec's fallback order rather than crashing (AvroSchemaUtil.java:307-315, :411-419; ApplyNameMapping.java:54-59); and (d) maintenance is best-effort — a bad mapping warns and is skipped instead of breaking a schema commit (SchemaUpdate.java:501-504).
+
+The residual, genuinely un-guarded risks are the name-collision ambiguities (#4, #5) — the spec's literal-dot rule and the reserved element/key/value names are not disambiguated in code, they're just surfaced as duplicate-key exceptions — and reliance on the mapping actually being present and parsed (if nothing reads it, malformed JSON goes unnoticed until the first schema change or reader touches it).

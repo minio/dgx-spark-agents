@@ -1,0 +1,21 @@
+1. **What it is.** `DeleteFileIndex` is an in-memory index answering "which delete files apply to this data file?" by data sequence number and partition. Read the class-level contract first: `core/src/main/java/org/apache/iceberg/DeleteFileIndex.java:63-69`.
+
+2. **Entry point / lookup.** The public surface: `forEntry(ManifestEntry)` (from `ctx.deletes().forEntry(entry)` in the planner) and `forDataFile(long seq, DataFile)`. All delete resolution funnels through these. `DeleteFileIndex.java:150-175`.
+
+3. **Routing by `content` type.** Delete files are bucketed by `file.content()`: POSITION_DELETES vs EQUALITY_DELETES. Position deletes are further split into deletion vectors (Puffin) vs regular position-delete files via `ContentFileUtil.isDV`. `DeleteFileIndex.java:542-555`, `ContentFileUtil.java:142-144`.
+
+4. **Partition indexing.** Deletes apply only to data files in the same partition, so they're keyed by (specId, partition tuple) in a `PartitionMap`. Lookups use the data file's specId + partition. `DeleteFileIndex.java:181-197`, `PartitionMap.java:82-110`.
+
+5. **Sequence-number ordering.** Each partition/path group is sorted by data sequence number; `findStartIndex` binary-searches for the first applicable delete. This encodes the spec's rule that a delete only applies to data of equal-or-older / strictly-older age. `DeleteFileIndex.java:687-743`.
+
+6. **Equality-delete "strictly less" trick.** Equality deletes must apply only to strictly-older data, so apply-seq is stored as `dataSequenceNumber() - 1` and reuses the same `>=` search. `DeleteFileIndex.java:784-827, 881`.
+
+7. **Equality-delete metrics pruning.** Before returning equality deletes, `canContainEqDeletesForFile` uses lower/upper bounds and null/value counts to skip deletes that can't overlap the data file; missing stats conservatively assume a match. `DeleteFileIndex.java:258-342`.
+
+8. **File-scoped / DV indexing.** Position deletes and DVs scoped to one file are keyed by the referenced data-file path (`posDeletesByPath`, `dvByPath`). At most one DV per data file is enforced with a `ValidationException`. `DeleteFileIndex.java:199-232, 568-576`, `ContentFileUtil.java:63-89`.
+
+9. **How it's built.** `Builder.build()` reads delete manifests (parallel, via `Tasks.foreach`), filters DELETED entries and applies data/partition filters, then groups files into the buckets above. Filters/pushdowns pre-prune which manifests even get opened. `DeleteFileIndex.java:397-520, 616-669`, `ManifestReader.java:354-365`.
+
+10. **Who consumes it.** The engine-agnostic planner attaches per-file deletes into each `FileScanTask` (`ManifestGroup.java:191, 400-403`); engines read `task.deletes()` and apply them (Spark: `SparkDeleteFilter` in `BatchDataReader.java:115-127`). Spark's distributed scan builds the index via `builderFor(Iterable<DeleteFile>)` on executors (`SparkDistributedDataScan.java:151-173`). Flink goes through `ManifestGroup` with no direct reference.
+
+Advice: start at #1, then trace #2 → #3 → #9 to see how it's built and queried, and #10 to see the two-stage planning/reading flow that actually exercises it.

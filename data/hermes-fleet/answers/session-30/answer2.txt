@@ -1,0 +1,51 @@
+I now have the full picture across the base class and its concrete catalog implementations. Here's how the implementation follows the spec.
+
+## The design in code
+
+**BaseMetastoreTableOperations** (`core/srDir/.../BaseMetastoreTableOperations.java`) is the abstract skeleton for every metastore-backed catalog (Hive, JDBC, in-memory). It implements the "atomic swap of one table metadata file for another" model from spec.md:1136 and "Metastore Tables" from spec.md:1340-1354. The actual mechanics are split into what's generic and what each backing store must provide.
+
+## 1. Refresh reads the pointer; no locks
+
+spec.md:1357 says readers use the snapshot current when they load metadata. The base classes implement this via `refresh()` (BaseMetastoreTableOperations.java:86-102) and `doRefresh()` (:104-106) which the concrete class overrides (JdbcTableOperations.java:69-100) to read the `metadata_location` pointer row from DB and call `refreshFromMetadataLocation(...)` (JdbcTableOperations.java:99). `refreshFromMetadataLocation` (:175-216) actually loads the metadata JSON from that location over `FileIO` (spec.md:1149: metadata files stored at the base location), updates `currentMetadata`/`currentMetadataLocation`, and crucially it is a **read with no lock** — exactly the "readers will not acquire locks" requirement from spec.md:71.
+
+It also restores the `metadata-log` history: `refreshFromMetadataLocation` names files `%05d-<uuid>.metadata.json` (BaseMetastoreTableOperations.java:347-355), implementing the `V-<uuid>` naming from spec.md:1344, and `parseVersion` (:364-378) recovers version V from the filename.
+
+## 2. Commit = optimistic compare-and-swap on the pointer
+
+The generic `commit(base, metadata)` (BaseMetastoreTableOperations.java:108-135) implements the optimistic-concurrency contract of spec.md:95-97:
+
+- It first rejects a stale base before even touching the store (spec.md:1087's "writer must retry" precondition): if `base != current()` it throws `CommitFailedException` ("Cannot commit: stale table metadata", :112-113) or `AlreadyExistsException` when creating (:114-118). This is the check that "the snapshot on which an update is based is no longer current."
+- It writes the *new* metadata file out **before** swapping the pointer (:127), matching spec.md:1346-1347 ("Create a new table metadata file... write to a unique file, then swap").
+- `doCommit(base, metadata)` (:137-139) is the abstract step the concrete class fills in with the actual atomic swap.
+- After the swap succeeds it calls `requestRefresh()` (:129, :141-143), so the next `current()`/`refresh()` shows the new version (spec.md:1357: refresh picks up new metadata location).
+
+`writeNewMetadataIfRequired` (:149-153) / `writeNewMetadata` (:155-165) produce the new immutable version file and write it with `TableMetadataParser.overwrite` — an in-place table-state change that only becomes visible when the pointer moves (spec.md:131 "Once written, data and metadata files are immutable").
+
+## 3. The concrete swap: check-and-set
+
+The spec says the swap is "a check-and-put operation that validates the base is still current" (spec.md:1342). Each concrete catalog implements this as an atomic conditional update keyed on the old pointer value.
+
+**JDBC** (`JdbcTableOperations.java:103-144`) is the textbook case. `doCommit`:
+- reads the current pointer row (:107-109),
+- `validateMetadataLocation(table, base)` (:111, :200-209) throws `CommitFailedException` if the catalog's current `metadata_location` differs from `base.metadataFileLocation()` (the spec's "validates that the base version is still current"),
+- issues the atomic SQL update whose **WHERE clause includes `metadata_location = <old>`** (JdbcUtil.java:65-88, set in :554-560). The `UPDATE` only touches a row if the old pointer still matches, so the base-version check and the pointer move happen atomically in one statement — a true check-and-set (spec.md:1342). If `updatedRecords == 1` the commit succeeded; otherwise a concurrent commit already moved the pointer and `CommitFailedException` is thrown (JdbcTableOperations.java:157-162), allowing the writer to retry (spec.md:97, 1312-1319).
+
+**In-memory** (`InMemoryCatalog.java:450-486`) shows the same contract with a different primitive: under `synchronized(InMemoryCatalog.this)` it uses `tables.compute(...)` (a JDK-atomic map update at :466-484) that throws `CommitFailedException` if `existingLocation != oldLocation` (:469-482) — again the conditional swap that fails a concurrent commit rather than silently overwriting, which enforces the "linear history / concurrent writes are not lost" guarantee from spec.md:1136.
+
+Both concrete classes class get their retry/conflict handling for free from the base: a `CommitFailedException` bubbles up so the caller's snapshot producer can re-base on the new `current()` and retry (spec.md:97).
+
+## 4. Resolving ambiguous failures
+
+The spec acknowledges a commit can fail without clear proof of where it landed. The base provides `checkCommitStatus`/`checkCommitStatusStrict` (BaseMetastoreTableOperations.java:298-345) delegating to `BaseMetastoreOperations.checkCommitStatusStrict` (BaseMetastoreOperations.java:99-151). These treat failure as "did our new metadata location become current, or appear in `previous_files` (the metadata-log)?" (BaseMetastoreTableOperations.java:334-345), retrying the lookup with backoff/`COMMIT_NUM_STATUS_CHECKS` (:104-141). If the location is current it's `SUCCESS`; if not found it's `FAILURE`/`UNKNOWN`. This is the operational machinery for the spec's statement that "if the swap fails, another writer has already created V+1" (spec.md:1350) — distinguishing a genuine conflicting version from an ambiguous one.
+
+## Where it follows the spec, cited
+
+- Optimistic, no-lock refresh of metadata pointer — spec.md:93-95, 1357; BaseMetastoreTableOperations.java:71-75, 86-102.
+- Committing a *new* immutable metadata file, then swapping the pointer — spec.md:85, 131, 1346-1347; BaseMetastoreTableOperations.java:155-165 (+ doCommit call at :127).
+- Stale-base rejection before/at the swap — spec.md:1087"base no longer current must retry"; BaseMetastoreTableOperations.java:108-119, JdbcTableOperations.java:200-209, InMemoryCatalog.java:469-482.
+- Atomic check-and-put pointer update that makes the base-version check and the move a single op — spec.md:1342; JdbcUtil.java:65-88 + update() :537-565 (WHERE includes old metadata_location).
+- `CommitFailedException` → caller re-bases and retries — spec.md:97, 1312-1319.
+- `V-<uuid>.metadata.json` naming and `<V+1>` progression — spec.md:1344; BaseMetastoreTableOperations.java:347-355, 364-378.
+- Ambiguous-failure resolution against current + metadata history — spec.md:1350; BaseMetastoreTableOperations.java:298-345, BaseMetastoreOperations.java:99-151.
+
+One deliberate divergence to note: the spec says "if the swap fails, the writer goes back to step 1" (spec.md:1350) — this code doesn't loop the retry inside `doCommit`. The retry is driven by the *caller* (the snapshot producer re-invoking `commit` on a fresh base), so `doCommit` throws and lets the higher layer decide whether to retry, consistent with spec.md:97's "writers must retry the update based on the new current version." The in-memory/JDBC backends only re-read once for the atomic check rather than implementing a retry loop themselves.

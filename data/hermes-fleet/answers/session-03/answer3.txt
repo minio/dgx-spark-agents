@@ -1,0 +1,54 @@
+I have enough now. Here are the edge cases and failure modes of snapshot expiration, grouped by where the risk lives, each with the guard (file:line).
+
+## A. Wrong snapshots get expired
+
+**A1. Expiring a snapshot that a retained ref still points at.**
+An explicitly requested id (`expireSnapshotId`) that is the head of a live tag/branch must not be removed. Guard: `internalApply()` builds `retainedIdToRefs` from the surviving refs (RemoveSnapshots.java:207-213), then refuses any `idToRemove` that appears in it — "Cannot expire X. Still referenced by refs" (RemoveSnapshots.java:215-222, specifically `Preconditions.checkArgument` at 217).
+Additional backstop: `rewriteSnapshotsInternal` removes any ref whose snapshot ID is no longer in `snapshotsById` (TableMetadata.java:1461-1469), and `build()`'s log validator requires the last log entry to be the current snapshot (TableMetadata.java:1896-1900).
+
+**A2. Removing a ref's snapshot, then a concurrent commit retargets that ref.**
+Because `commit()` retries `internalApply()` against a fresh `ops.refresh()` (RemoveSnapshots.java:197, 361-373), the retain-set is recomputed on the new base each attempt, so a branch head advanced by a concurrent writer is honored and its new snapshot retained.
+
+**A3. Garbage-collection disabled tables.**
+Expiring would delete files that might be referenced by another table (shared file layouts). Guard: the constructor aborts with `ValidationException` when `gc.enabled` is false (RemoveSnapshots.java:87-89).
+
+## B. Files deleted while still reachable (the catastrophic class)
+
+**B1. Data file still live in a retained snapshot gets deleted.**
+The reachability strategy centers on this. `ReachableFileCleanup` computes `expiredSnapshots` = before − after (ReachableFileCleanup.java:64-74), then `pruneReferencedManifests` re-scans every surviving snapshot and removes any of its manifests from the deletion candidates (ReachableFileCleanup.java:109-142), and `findFilesToDelete` removes every path still present in `currentManifests` before issuing any delete (ReachableFileCleanup.java:199-226). Only paths in neither surviving state are deleted (ReachableFileCleanup.java:228).
+Spec basis: "a data file must not be deleted until the last snapshot in which it was listed is garbage collected" (spec 1162/1190).
+
+**B2. Incremental cleanup deleting files from a rolled-back / non-ancestor commit.**
+The speculative `IncrementalFileCleanup` (used only when the table is main-branch-only, chosen at RemoveSnapshots.java:391-408) scans DELETED manifest entries and deletes a file only when the entry is `Status.DELETED` AND that snapshot is no longer valid (IncrementalFileCleanup.java:298-307). For reverted/ADDED manifests it only deletes when the manifest wasn't written by an ancestor (IncrementalFileCleanup.java:233-245, 313-334). The whole path is gated: `validateCleanupCanBeIncremental` throws if snapshot ids were explicitly specified, non-main ancestors were removed, or any non-main snapshot exists (RemoveSnapshots.java:413-428) — i.e. incremental is never used when the table doesn't reduce exactly to clean main-branch history.
+
+**B3. Storm of parallel file deletes racing or corrupting the manifest scan.**
+All manifest reads during planning use container-safe copies: `manifestFile.copy()` (ReachableFileCleanup.java:133, 159; IncrementalFileCleanup.java:152, 230, 245), and shared candidate sets are `ConcurrentHashMap.newKeySet()` (e.g. ReachableFileCleanup.java:78-80, 113-114). This follows AGENTS.md's rule about `copyWithoutStats` when holding ManifestFiles in parallel. Bulk deletion is attempted, with per-file retry/`NotFoundException` suppression as fallback (FileCleanupStrategy.java:107-134).
+
+**B4. A crash/partial failure during file deletion.**
+Deletes are not transactional and cannot be atomically rolled back, so orphaned files (harmless garbage) are preferred over losing a live file. Guards: delete tasks use `.retry(3).suppressFailureWhenFinished().stopOnFailure(false)` (FileCleanupStrategy.java:124-132), and both cleanup strategies wrap scan/delete work in `.suppressFailureWhenFinished()` and log rather than abort (ReachableFileCleanup.java:176-183; IncrementalFileCleanup.java:118-128, 288-294). ReachableFileCleanup even falls back to an empty delete set if listing all reachable files fails (ReachableFileCleanup.java:223-226) — never guessing which files to remove.
+
+## C. History / time-travel corruption
+
+**C1. snapshot-log pointing at an expired snapshot breaks time travel.**
+If an expired snapshot stayed in the log, a point-in-time query could resolve to a nonexistent snapshot. Guard: `updateSnapshotLog` drops log entries whose snapshot no longer exists and, when any snapshot was removed, clears all history before the first gap so there are no false "current at time T" entries (TableMetadata.java:1879-1894). The comment at 1887-1891 spells out exactly the wrong result this prevents. This is the spec's rule to prune the snapshot log on expiration (spec 1163/1191).
+
+**C2. Specs/schemas referenced only by expired snapshots heap up metadata.**
+Guarded only when `cleanExpiredMetadata` is set: `internalApply` computes reachable specs/schemas (default + those used by retained snapshots' manifests) and removes the rest (RemoveSnapshots.java:239-273). Without that flag it's a no-op, so irrelevant metadata is intentionally retained by default (spec leaves it optional, 239).
+
+**C3. Statistics / partition-statistics files orphaned by expiration.**
+`rewriteSnapshotsInternal` calls `removeStatistics` and `removePartitionStatistics` for each removed snapshot (TableMetadata.java:1452-1453), and the cleanup strategies physically delete the corresponding statistics files (ReachableFileCleanup.java:101-106; IncrementalFileCleanup.java:274-279).
+
+## D. Concurrency / resource failure modes
+
+**D1. Commit lost-update under concurrent writers.**
+`commit()` retries with exponential backoff and `.onlyRetryOn(CommitFailedException)` (RemoveSnapshots.java:360-373), re-driving `internalApply` on the refreshed base each attempt (`ops.refresh()` at 197) — the spec's optimistic-concurrency retry contract (spec 95-99, 1314-1319).
+
+**D2. Infinite history growth if nothing ever expires.**
+Not a correctness bug, but this is the whole reason expiration exists (spec 1120). The code sets the age-cutoff from `history.expire.max-snapshot-age-ms` default in the constructor (`now - defaultMaxSnapshotAgeMs`, RemoveSnapshots.java:91-96) and enforces a `min-snapshots-to-keep` floor so the table can never shrink below the configured minimum (RemoveSnapshots.java:97-99, 324-326) — an intentional minimum so recent history is never fully swept even under a tiny cutoff.
+
+## The two genuinely hard failure modes (no clean guard)
+
+1. **Files shared across tables (objects reused by another table).** Nothing in RemoveSnapshots can know another table references the same object; it only knows this table's reachability. The guard is purely the `gc.enabled` flag (RemoveSnapshots.java:87-89) plus the operator contract not to share data paths across tables — the spec's own escape hatch.
+2. **Non-atomic file deletion.** Once a data file is gone there's no rollback. The code minimizes risk (reachability-first, suppresses failures, deletes per-file with retry) but cannot make deletes atomic; it deliberately biases to leaving orphans rather than deleting anything it's not sure is unreachable (ReachableFileCleanup.java:223-226).
+
+Both match the spec's design posture: snapshot validity (files exist) and physical deletion are only safe to couple because deletion is deferred until the last referencing snapshot is gone — and even then the implementation errs on the side of keeping data.

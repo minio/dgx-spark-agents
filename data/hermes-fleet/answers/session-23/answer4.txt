@@ -1,0 +1,40 @@
+I have everything I need. Here's how the two query engines use overwrite.
+
+## Apache Spark
+
+All Spark overwrite paths funnel into `SparkWrite` (spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java), which exposes one operator per mode (SparkWrite.java:186-212). These are selected by the Spark write config (`asDynamicOverwrite`, `asOverwriteByFilter`, `asCopyOnWriteOperation`, `asStreamingOverwrite`).
+
+**1. Static overwrite (`INSERT OVERWRITE` with a non-partitioned/static spec) → `OverwriteByFilter`**
+SparkWrite.java:385-425. It creates `table.newOverwrite()` (line 394) and calls `overwriteByRowFilter(overwriteExpr)` (line 395) — replacing everything matched by the filter — then `addFile` for each new file (line 400). Isolation is applied from the write config: `SERIALIZABLE` enables both `validateNoConflictingData` and `validateNoConflictingDeletes` (lines 410-412); `SNAPSHOT` enables only the delete validation (lines 413-414); `validateFromSnapshot` anchors the check (line 407). This is the engine opting into the concurrent-write guards described earlier.
+
+**2. Dynamic partition overwrite (`INSERT OVERWRITE` where partitions are derived from the data) → `DynamicOverwrite`**
+SparkWrite.java:347-383. Uses `table.newReplacePartitions()` (line 357) — the merge-based `ReplacePartitions` producer, which is the dynamic-partition form of overwrite — with the same isolation-level validation (lines 358-370). It skips commit entirely when no files were written (lines 352-355).
+
+**3. Copy-on-write DELETE/UPDATE → `CopyOnWriteOperation`**
+SparkWrite.java:427-549. This is how Spark implements row-level `DELETE`/`UPDATE` against a v1 table (or when copy-on-write is configured): it rewrites the files matching the scan. It creates `table.newOverwrite()` (line 463), deletes the scanned (overwritten) files plus their dangling DVs (lines 465-468), and adds the rewritten files (lines 471-474). Serializable isolation calls `validateFromSnapshot` with the scan's snapshot id (line 508) and drives the conflict detection with the scan filter (lines 511-514); snapshot isolation skips `validateNoConflictingData` (lines 537-539).
+
+**4. Streaming complete mode → `StreamingOverwrite`**
+SparkWrite.java:652-673. Each epoch in a streaming `complete` query does `table.newOverwrite().overwriteByRowFilter(Expressions.alwaysTrue())` (lines 660-661) and adds the new files (line 664). Using `alwaysTrue()` means "delete every existing file, then add these" — a full table replacement per micro-batch, which matches the spec's `OVERWRITE` whole-file semantics (only files whose rows all match, here trivially all, get dropped).
+
+Note the contrast with `BaseReplacePartitions` (used by dynamic overwrite) which derives the `replace`-styled behavior from merge manager + filter manager, versus `OverwriteFiles` which is the explicit `overwrite` producer — Spark uses both depending on dynamic vs. static overwrite.
+
+## Apache Flink
+
+Flink's overwrite is the dynamic-partition flavor: `INSERT OVERWRITE` replaces the partitions that the new data touches.
+
+**Enabling it:** The Table API/`INSERT OVERWRITE` sets the flag via `IcebergTableSink.applyOverwrite` (flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/IcebergTableSink.java:199-200), and it's rejected for unbounded streams (IcebergTableSink.java:131-132). The `overwrite` builder is also exposed on the sink builders (IcebergSink.java:482-483, FlinkSink.java:260-262) and carried into `FlinkWriteConf.overwriteMode()` (FlinkWriteConf.java:62-67), matching the `overwrite-enabled` option (FlinkWriteOptions.java:62). For DataStream it requires a bounded source (IcebergSink.java:773-781).
+
+**Executing it — two committer variants:**
+
+- `IcebergFilesCommitter.replacePartitions` (flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/IcebergFilesCommitter.java:304-327): used by the checkpoint-based unify sink. It rejects delete files ("Cannot overwrite partitions with delete files.", line 310-311) and uses `table.newReplacePartitions()` (line 313), adding each new data file (line 317). The same "replace partitions vs. delta txn" branch is in `IcebergCommitter.java:217-218,229` and `DynamicCommitter` (DynamicCommitter.java:260-264, and `replacePartitions` at 269-297 using `newReplacePartitions` at line 277).
+- The batch-oriented `IcebergSink`/`FlinkSink` path routes overwrite into `IcebergFilesCommitter` constructed with `replacePartitions=true` (IcebergSink.java:843, FlinkSink.java:539).
+
+So Flink's `INSERT OVERWRITE` = `ReplacePartitions` (dynamic partition overwrite), committing all pending files in one snapshot (DynamicCommitter.java:275-277 — "we commit everything in one snapshot"). Unlike Spark, Flink does not call the explicit `validateNoConflicting*` bridge methods in these paths; dynamic overwrite's safety comes from `ReplacePartitions`' own merge-based validation, and the committer itself enforces the "no delete files in an overwrite" precondition.
+
+## The pattern across both engines
+
+- **Full/static overwrite** (Spark `OverwriteByFilter`, streaming complete) goes straight to `OverwriteFiles.overwriteByRowFilter` — the explicit `overwrite` producer, with `SERIALIZABLE`/`SNAPSHOT` isolation selecting the conflict-validation guards.
+- **Dynamic partition overwrite** (`INSERT OVERWRITE` on partitioned tables, both Spark and all of Flink) uses `ReplacePartitions`, which is a different producer sharing the same `MergingSnapshotProducer` machinery but replacing only the touched partitions.
+- **Copy-on-write deletes/updates** (Spark) reuse `OverwriteFiles` to delete-then-add rewritten files, with the scan-derived conflict filter.
+
+Citation anchors: SparkWrite.java:394-415 (filter overwrite), 357-370 (dynamic), 463-539 (CoW), 660-664 (streaming); IcebergTableSink.java:199-200 & 131-132 (Flink flag + bounded check); IcebergFilesCommitter.java:304-327 and DynamicCommitter.java:260-297 (Flink replace-partitions commit); IcebergSink.java:482-483, 773-781 (option plumbing).

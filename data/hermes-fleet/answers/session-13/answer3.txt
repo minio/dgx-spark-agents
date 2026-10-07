@@ -1,0 +1,71 @@
+Now I have the complete picture, including the `InclusiveEvalVisitor` where the conservative-bounds guards live. Here are the edge cases and failure modes, grouped by failure class, with the guards.
+
+## 1. Missing stats / null bounds (metadata incompleteness)
+
+The core invariant of the whole design is: **planning is safe to skip a file only when it can *prove* no row matches.** Everywhere stats are absent, the code bails to "might match" rather than assume.
+
+- **Manifest has no partition summary** — `ManifestEvaluator.eval` returns `ROWS_MIGHT_MATCH` when `manifest.partitions()` is null (ManifestEvaluator.java:86-89). A manifest with no stats is never skipped.
+- **Missing lower/upper bound in a manifest partition summary** — `lt`/`ltEq` return cannot-match only if a lower bound exists; a null bound returns might-match (ManifestEvaluator.java:176-177, 194-195). Same for `gt`/`gtEq` against a missing upper bound (ManifestEvaluator.java:214-217, 232-235) and `eq` when either bound is missing (ManifestEvaluator.java:248-250).
+- **File metrics missing** — `InclusiveMetricsEvaluator` reads metrics maps that may lack columns; the visitor's `mayContainNull` returns true when the map is null or the id absent (InclusiveMetricsEvaluator.java:100-102), and `lowerBound`/`upperBound` return null when the id isn't in the map (InclusiveMetricsEvaluator.java:129-133, 139-143). Every operator then treats a null bound as might-match (e.g. `lt` at InclusiveEvalVisitor.java:165-168, `gt` at 219-221, `eq` at 268-270; `in` at 312-314 with a null upper meaning "no upper bound", 324).
+- **NaN bounds are treated as unreliable**, not as real values — `lt`/`ltEq`/`eq`/`in` return might-match when the bound is NaN (InclusiveEvalVisitor.java:191-195, 260-262, 311-315), with an explicit note that first-value-NaN in ORC corrupts both bounds (InclusiveMetricsEvaluator.java:43-46).
+
+## 2. Wrong bounds (bad metadata, not just missing)
+
+A writer could produce bounds that are not true min/max. The planner treats bounds as *ranges*, so a false bound can only cause an underestimate.
+
+- The comparison logic assumes a bound is a valid bound: e.g. `lt(col,X)` is impossible only when `lower >= X` (InclusiveEvalVisitor.java:175-178), `eq` when `lower > X || upper < X` (253-278), `in` when no literal lies in `[lower, upper]` (320-327). Because these prune *only* on contradictions with the stored range, an incorrectly narrow (over-tight) bound is the dangerous case — and the code cannot detect it, because it's the writer's bug. The one thing the planner refuses to do is invent values: `notEq`/`notIn` explicitly decline to prune from bounds because "the bounds are not necessarily a min or max value" — it only prunes when lower==upper (`uniqueValue`, InclusiveEvalVisitor.java:282-294, 335-345, 437-459).
+
+## 3. Bounds not preserved through a transform
+
+When the predicate references a *transformed* partition column (e.g. `bucket`), the lower/upper bound of the raw source column cannot always be mapped.
+
+- `InclusiveEvalVisitor.transformLowerBound`/`transformUpperBound` only derive a bound when `transform.preservesOrder()` (InclusiveEvalVisitor.java:485-503); for non-order-preserving transforms (bucket, truncate) it returns null → might-match for the transformed term.
+- `InclusiveProjection` handles this at projection time: a partition field with an *unknown transform* is skipped and the predicate defaults to always-true (Projections.java:202-207, via `getFieldsBySourceId` returning null). This mirrors the spec: "The inclusive projection for an unknown partition transform is *true*" (spec:1065) and the required read behavior for unknown transforms (spec:563).
+
+## 4. Equality-delete cross-file skip is conservative
+
+`DeleteFileIndex.canContainEqDeletesForFile` decides whether an equality delete file can affect a data file **before reading either**, using only stats (DeleteFileIndex.java:258-320). Its failure modes are all guarded toward applying:
+
+- If bounds are missing (`checkRanges == false`) it "assume[s] they match" (DeleteFileIndex.java:298-300).
+- If any single bound on any equality field is missing it continues assuming a match (DeleteFileIndex.java:308-311).
+- Nested (non-primitive) equality fields have no stats, so it skips them rather than prune (DeleteFileIndex.java:275-278).
+- Null-count checks only prune when there is a *definitive* null/non-null mismatch (DeleteFileIndex.java:280-297); any unknown count defers to might-apply. This is the spec's "metrics can be used to determine whether a delete file's rows overlap" being an optimization, never a correctness risk.
+
+## 5. Duplicate content files in a snapshot
+
+The spec says duplicate live manifest entries make scan results undefined (spec:1071). The planner doesn't try to dedupe or validate — `DataTableScan` just streams whatever entries match (ManifestGroup.java:393-405). The comment/validate exists only where it could corrupt indexing: `DeleteFileIndex.add` throws if two DVs target the same data file (`Can't index multiple DVs for %s`, DeleteFileIndex.java:568-576). Duplicate *data* entries simply become duplicate scan tasks; the spec explicitly labels that undefined rather than requiring a guard (spec:1071-1072).
+
+## 6. Delete/partition mismatch (corrupted metadata)
+
+- Position/equality deletes and DVs are matched to data files by path/spec/partition. The code *validates* rather than silently applying the wrong delete set: `validatePartitionMatch` throws `ValidationException` on spec-id mismatch (DeleteFileIndex.java:234-242) or partition-tuple mismatch (243-253). A DV whose `dataSequenceNumber <` the data file's throws (DeleteFileIndex.java:224-228). These throw at plan time so a corrupt table fails loudly instead of returning wrong deletions.
+
+## 7. Equality vs position delete sequencing semantics
+
+- Equality deletes apply only to data files with seq *strictly less* than the delete (spec:1085); the code encodes this as `applySequenceNumber = dataSequenceNumber - 1` and a binary-search start index (DeleteFileIndex.java:881, 811, 687-703).
+- Position deletes/DVs apply with seq <= (spec:1077, 1081) via `PositionDeletes.filter` finding the insertion point and slicing from there (DeleteFileIndex.java:726-743).
+- **Edge:** if two delete files share a sequence number, `findStartIndex` walks back to the *first* occurrence (DeleteFileIndex.java:697-699) so ties are all included. And in-memory starvation is bounded: position deletes are sorted by seq with `Comparator.comparingLong(...)` (DeleteFileIndex.java:711-713), so the "apply all newer deletes" slice stays correct even with equal seqs.
+
+## 8. Concurrency / reuse bugs in the planning path
+
+This is the highest-risk *implementation* failure mode, and the biggest source of past bugs.
+
+- **Shared entry objects are reused by the Avro reader.** `ManifestReader.open` enables `reuseContainers()` (ManifestReader.java:344) and `ManifestGroup` documents that entries must be defensively copied before retention (ManifestGroup.java:242-244). `planFiles` → `createFileScanTasks` calls `ContentFileUtil.copy(...)` before handing the entry to a task (ManifestGroup.java:398-399), and `iterable.iterator()` calls `e.file().copy(...)` (ManifestReader.java:373) — the summary Javadoc at ManifestGroup.java:171-176 calls this out explicitly. Skipping the copy is a silent-corruption bug.
+- **Parallel planning reuses mutable per-manifest state.** When an executor is set, manifest entries run concurrently (ParallelIterable, ManifestGroup.java:216-217). The `idAssigner` for `first_row_id` uses per-reader state (`nextRowId`, ManifestReader.java:443-453) and `PartitionData`/`GenericDataFile` reuse containers — kept inside each reader instance so it's isolated per manifest. The task context caches (`residualCache`, `taskContextCache`, `evalCache`) are keyed by `specId` (ManifestGroup.java:182-206, 279-292), which is safe because all files in one manifest share one spec. But note the spec's warning is real: container reuse inside a parallel scan is exactly why `DataTableScan` defensively copies at the task boundary.
+- **Per-spec caches are built lazily and thread-safely** via Caffeine `LoadingCache` (ManifestGroup.java:182-189, 279-292; DeleteFileIndex.java:619-640) — a global shared mutable stats structure would be a race; Caffeine serializes per-key construction.
+
+## 9. Time-of-check/time-of-use and commit races
+
+`doPlanFiles()` takes `snapshot = snapshot()` once (DataTableScan.java:65) and plans entirely from that immutable snapshot's manifests. A concurrent commit creates a *new* metadata file and snapshot; the in-flight plan is unaffected because it holds a reference to the old snapshot's manifest list (BaseSnapshot.java:183-200 reads and caches it). This is serializable isolation (spec:71): a scan sees a stable snapshot. The failure mode would be reading manifests after they've been garbage-collected by a concurrent expiration — but because the scan holds the snapshot's own manifest list (fetched once), and the spec only allows GC after the snapshot is no longer live (spec:1162), the plan is safe unless the storage layer deletes live files.
+
+## 10. Incremental scans
+
+`DataTableScan.appendsBetween` throws if a base snapshot is also set, guarded by `Preconditions.checkState` (DataTableScan.java:33-36), and `appendsAfter` requires a current snapshot (DataTableScan.java:46-49). Without these, an incremental scan plus a full scan on the same scan object would be ambiguous.
+
+## The unifying principle
+
+Every guard falls into one of two shapes, and that's the whole design:
+
+1. **Plan-time pruning is *only* allowed on proof of no-match.** Missing/null/NaN bounds, unknown transforms, non-order-preserving transforms, and missing overlap all resolve to "might match." This is the inclusive projection contract (Projections.java:36-42; spec:1061-1062) carried down to the file level (`InclusiveMetricsEvaluator`, `InclusiveEvalVisitor`).
+2. **Application-time (deletes) is either validated or made conservative.** Sequence ordering, partition equality, and single-DV-per-file are either *checked-and-throws* (DeleteFileIndex.java:224-255, 568-576) or *allowed-to-over-apply* (canContainEqDeletesForFile defaults to apply).
+
+So the planner's #1 safety property — never drop a row that should be returned — is bought by making every uncertain case a false-positive (over-read), never a false-negative (under-read). The remaining real risks are not in the planning logic but in (a) writers emitting genuinely wrong bounds, (b) the reader-container-reuse discipline being violated, and (c) storage deleting files while a plan is in flight.

@@ -1,0 +1,70 @@
+I've now read the full row-delta machinery: `BaseRowDelta`, `MergingSnapshotProducer`, `SnapshotProducer`, `DeleteFileIndex`, `ManifestFilterManager`, and the relevant `ContentFileUtil` helpers. Here are the edge cases and failure modes, and how each is guarded.
+
+## Correctness of delete application
+
+1. Delete applied to wrong (newer) data — the ordering failure mode.
+The cardinal rule is that deletes only apply to older data. Position deletes/DVs must apply when data.seq <= delete.seq (including same-commit deletes); equality deletes only when data.seq < delete.seq (spec.md:1075-1091). `DeleteFileIndex.PositionDeletes.filter` returns every delete at or after the data file's sequence number (DeleteFileIndex.java:687-743), while equality deletes are indexed at `dataSequenceNumber - 1` so the same `>=` search yields strict-less-than (DeleteFileIndex.java:881). Getting this wrong would silently resurrect or wrongly drop rows.
+
+2. Equality delete sweeping rows written in the same commit.
+Because an equality delete can't know about rows added concurrently, the spec mandates strict `<`. `EqualityDeleteFile.applySequenceNumber = wrapped.dataSequenceNumber() - 1` (DeleteFileIndex.java:878-882) is the exact guard.
+
+3. Delete file with a newer data file present — DV/position validation on read.
+`findDV` throws if a DV's sequence number is less than its data file's (DeleteFileIndex.java:224-228), and partition/spec mismatches throw an explicit "metadata is corrupted" ValidationException (DeleteFileIndex.java:234-255). These turn silent corruption into a loud failure.
+
+## Scope and partitioning
+
+4. Delete escaping its partition (wrong rows deleted).
+Position deletes are keyed by file path, then partition (DeleteFileIndex.java:200-215); equality deletes are keyed by partition or global (DeleteFileIndex.java:596-614). The partition-tuple and spec-id equality checks (DeleteFileIndex.java:236-254) enforce the spec's "deletes apply only to same-partition files."
+
+5. Position deletes that reference the wrong data file.
+File-scoped position deletes are matched by exact path in `posDeletesByPath` (DeleteFileIndex.java:200-215) — a mis-key would delete rows in the wrong file. `validatePartitionMatch` (DeleteFileIndex.java:234-255) is the backstop.
+
+## Deletion-vector invariants
+
+6. Two DVs for the same data file.
+Spec allows at most one DV per data file (spec.md:1366). Guarded at index-build with `"Can't index multiple DVs for %s"` (DeleteFileIndex.java:568-575). On the write path, concurrently-added DVs for the same referenced file fail `validateAddedDVs` (MergingSnapshotProducer.java:869-922). Note the subtle correctness point in `addedDeleteFilesIndexedPerSnapshot`: it must check one index per snapshot because a data file can carry a different replacement DV in each snapshot of the validation window (MergingSnapshotProducer.java:619-632).
+
+7. DV left dangling after its data file is removed.
+Spec: removing a data file must remove its DV (spec.md:1367). When a data file is deleted in the same commit, its DVs are dropped via `removeDanglingDeletesFor` (MergingSnapshotProducer.java:1038-1039) and the dangling-filter in `ManifestFilterManager.isDanglingDV` (ManifestFilterManager.java:498-500, 466-470).
+
+8. Duplicate/conflicting DVs written by the same commit.
+`mergeDVs` collapses multiple in-commit DVs per referenced file into one via `DVUtil.mergeAndWriteDVsIfRequired` (MergingSnapshotProducer.java:1209-1236). And a data file that is both removed and targeted by new deletes is rejected (BaseRowDelta.java:181-193).
+
+## Concurrency / optimistic-commit conflicts
+
+9. Referenced data file disappears during the commit.
+`validateDataFilesExist` scans the validation window and fails with "missing data files" if a required file was deleted concurrently (MergingSnapshotProducer.java:817-866; invoked at BaseRowDelta.java:141-149). This is the spec's serializable-isolation requirement (spec.md:1317-1318).
+
+10. New conflicting data or deletes land during the commit.
+`validateAddedDataFiles` (MergingSnapshotProducer.java:391-412), `validateNoNewDeletesForDataFiles` (MergingSnapshotProducer.java:475-553), and `validateNoNewDeleteFiles` (MergingSnapshotProducer.java:574-584). These compare against `startingSnapshotId`, so a concurrent write that overlaps triggers a retry rather than a silent merge.
+
+11. A delete references a file that no longer exists as a target (missing delete-target validation).
+`failMissingDeletePaths` → `validateRequiredDeletes` throws "Missing required files to delete" (ManifestFilterManager.java:281-303), surfaced at BaseRowDelta.java:151-153 when validateDeletes is on.
+
+12. Partial-row filter match.
+A row filter that matches only some rows of a file means the whole file can't be deleted atomically; the code throws "Cannot delete file where some, but not all, rows match filter" (ManifestFilterManager.java:472-479, 527-534).
+
+13. Over-deleting via a broad row filter.
+`failAnyDelete` turns any matched delete into a hard `DeleteException` (ManifestFilterManager.java:117-119, 481-484).
+
+## Version / format gating
+
+14. Using a delete feature on a table version that forbids it.
+`validateDeleteFileForVersion` hard-fails each case: "Deletes are supported in V2 and above" for v1; "Must not use DVs ... in V2" for v2; "Must use DVs ... in V3/V4" for position deletes in v3+ (MergingSnapshotProducer.java:295-316). Enforced at add time (MergingSnapshotProducer.java:290-293) and re-checked on commit to guard a concurrent format upgrade (MergingSnapshotProducer.java:1019). This is what keeps a v2 position-delete table from silently breaking v3 rules, and matches spec.md:1358-1364.
+
+15. Stale delete files from a much older commit.
+`dropDeleteFilesOlderThan(minDataSequenceNumber)` removes delete files whose sequence number is below the oldest live data, because they can no longer match any row (MergingSnapshotProducer.java:1025-1034; ManifestFilterManager.java:160-164, 466-469). Without this, deletes accumulate forever and slow scans.
+
+## Retry / cleanup
+
+16. Uncommitted manifests left behind after a failed commit.
+`cleanUncommitted` removes manifests from failed attempts, and only frees manifests after confirming the committed snapshot via refresh (MergingSnapshotProducer.java:1112-1132; SnapshotProducer.java:484-582). Manifest filter/merge caches are invalidated on each mutation and cleaned of uncommitted results (ManifestFilterManager.java:361-364).
+
+17. Commit-state unknown (can't tell if the write landed).
+`SnapshotProducer.commit` special-cases `CommitStateUnknownException` so it isn't swallowed into a blind retry that could double-apply (SnapshotProducer.java:536-544); strict cleanup only runs when safe (SnapshotProducer.java:538-543).
+
+## The non-obvious failure mode
+
+The most important one to keep in mind: the write path (`BaseRowDelta`/`MergingSnapshotProducer`) is where ordering is *created* for the new snapshot, but the effective ordering is only realized later by `DeleteFileIndex` on the read path — the two are separate classes with no shared object. The spec's protection is the sequence-number inheritance, and the code's protection is that both halves derive everything from the same committed sequence numbers (data files, delete files, DVs). The single place that reasoning could in principle diverge is version interpretation of a `POSITION_DELETES` file — a v2 position delete file vs. a v3 DV both have content `POSITION_DELETES`; the code distinguishes them purely by storage format (`isDV` == PUFFIN, ContentFileUtil.java:142-144). That's the classification that makes v3 coexist with upgraded v2 tables, and it's keyed to a format check rather than to a version field, so it's worth being aware of if you're auditing correctness there.
+
+If you'd like, I can go deeper on any one of these — for example trace exactly how `DVUtil.mergeAndWriteDVsIfRequired` reconciles overlapping in-commit DVs, or how the read path chooses between a v2 position-delete file and a v3 DV for the same data file.

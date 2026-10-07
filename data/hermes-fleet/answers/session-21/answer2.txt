@@ -1,0 +1,37 @@
+I've read `TableProperties.java` in full and traced its callers. Here's how the implementation follows the spec.
+
+## The properties map lives in immutable table metadata
+
+The spec (format/spec.md ~line 1160/1188) defines `properties` as a string→string map in table metadata. The code mirrors this:
+
+- `TableMetadata.properties()` returns the stored map (TableMetadata.java:504-506).
+- `property(...)`, `propertyAsBoolean/Int/Long` (TableMetadata.java:508-525) delegate to `PropertyUtil` helpers that read a single string value from the map and parse it, returning a default when absent (PropertyUtil.java:47-117). This is exactly the spec's "control settings that affect reading and writing" — typed getters over an untyped string map, with defaults supplied by the caller.
+
+Persistence also matches: `TableMetadataParser.java:103` defines `PROPERTIES = "properties"`, writes it as a string map (line 220 via `JsonUtil.writeStringMap`), and parses it back, defaulting to an empty map when absent (lines 468-474). So properties round-trip as a simple string map in the metadata JSON, per spec Appendix C.
+
+## Reserved properties are not persisted — "not arbitrary metadata"
+
+The spec says properties are "not intended to be used for arbitrary metadata." The implementation draws a clean line between configuration knobs (persisted) and control-only keywords:
+
+- `TableProperties.RESERVED_PROPERTIES` (TableProperties.java:74-84) lists control keywords that are used only at create/update time: `format-version`, `uuid`, `snapshot-count`, `current-snapshot-summary`, `current-snapshot-id`, `current-snapshot-timestamp-ms`, `current-schema`, `default-partition-spec`, `default-sort-order`.
+- `TableMetadata.persistedProperties()` (TableMetadata.java:93-106) explicitly filters OUT all reserved properties before they are stored, so they never pollute the persisted metadata map. This is enforced twice: `unreservedProperties` (line 87) and a `Preconditions.checkArgument` in `newTableMetadata` (TableMetadata.java:115-118) that rejects creating a table with reserved properties.
+
+So the Java side enforces the spec's intent: the persisted `properties` are read/write behavior config, and control-only settings that must not live on as metadata are stripped or rejected.
+
+## Property interpretation is engine-agnostic and defaults are explicit
+
+The broad `write.*`, `read.*`, `commit.*`, `write.parquet.*`, `write.orc.*`, `write.avro.*`, `read.split.*` constants (TableProperties.java:89-464) are all just named string keys with companion `_DEFAULT` constants. None of them embed engine logic in core — consistent with the spec's choice to leave the long tail to implementations. The abundance of `_DEFAULT` constants is the code-side realization of the spec's "control settings that affect reading and writing" and its own defaults (e.g. `commit.retry.num-retries` = 4).
+
+## Spec-named properties wired into behavior
+
+- commit.retry.num-retries — the spec's own example. Consumed in `RemoveSnapshots.commit()` (RemoveSnapshots.java:362-367) and generally via `base.propertyAsInt(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT)`; `PropertyUtil.validateCommitProperties` (PropertyUtil.java:134-151) validates commit-related properties are non-negative integers at table creation.
+- history.expire.* — the spec's retention defaults. `RemoveSnapshots` reads `MAX_SNAPSHOT_AGE_MS`, `MIN_SNAPSHOTS_TO_KEEP`, `MAX_REF_AGE_MS` from table properties with defaults (RemoveSnapshots.java:91-102). Per the spec, snapshot references may override these; `SnapshotRefParser` reads/parses `min-snapshots-to-keep`, `max-snapshot-age-ms`, `max-ref-age-ms` per ref, written only when non-null (SnapshotRefParser.java:34-58) — exactly the "defaults to table property, may override on the ref" pattern from the spec's Snapshot References section.
+- write.data.path / write.metadata.path — the spec's path-construction properties (Appendix F). `LocationProviders` reads `WRITE_DATA_LOCATION` (`write.data.path`) and defaults to `<tableLocation>/data` (LocationProviders.java:104-115), and selects the provider based on `write.object-storage.enabled` (LocationProviders.java:70-77).
+- schema.name-mapping.default — the spec's column-projection fallback. `SchemaUpdate.applyChangesToMetadata` reads it via `metadata.property(TABLE_PROPERTIES.DEFAULT_NAME_MAPPING, null)` and updates it as a normal property (SchemaUpdate.java:485-500).
+- format-version — the spec's reserved table property; `TableMetadata.newTableMetadata` reads it to pick the metadata format version (TableMetadata.java:75-77), and it's reserved (never persisted).
+
+## How updates flow (matching immutable-metadata evolution)
+
+Property changes go through the builder: `Builder.setProperties` / `removeProperties` mutate a copy of the property map (TableMetadata.java:1474-1490), and `replaceProperties` re-applies `persistedProperties` filtering so a commit that changes properties still never stores reserved keywords (TableMetadata.java:756). Because a commit produces a new metadata file atomically, property changes are versioned and serializable — the same behavior the spec's immutable-metadata design describes.
+
+Net: the implementation treats properties as an opaque string→string config map carried in immutable metadata, parsed through defaulted getters, with control-only "reserved" keys stripped and rejected, and reads/writes them all through the core `TableMetadata`/`PropertyUtil` layer without any engine-specific logic baked into core — a faithful realization of the spec's "config for read/write behavior, not arbitrary metadata" rule.

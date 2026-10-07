@@ -1,0 +1,40 @@
+I've read the full spec (format/spec.md, 2153 lines) in three chunks. Here's what it says about position deletes and the reasoning behind the design.
+
+## What the spec defines
+
+Position deletes are one of two row-level delete types (the other being equality deletes). They were introduced in v2 and are described across four places: the "Row-level Deletes" overview, "Scan Planning," "Delete Formats," and Appendix F.
+
+**Overview (v2 feature).** A position delete marks a row deleted by naming its *data file path* and its *ordinal position within that file* (line 115). Deletes are stored in separate delete files tracked by partition in their own manifests, and are applied to older data files in the same partition.
+
+**The core format (position delete files, v2).** Each row in a position delete file (the `file_position_delete` struct, lines 1399-1416) contains:
+- `file_path` (id 2147483546) — the full URI of the data file, which must match the target data file's manifest entry path exactly
+- `pos` (id 2147483545) — the 0-based row position in that file
+- `row` (id 2147483544) — *optional* deleted row values, and when present it's a `required` struct holding any subset of the table schema
+
+A data row is deleted if there's an entry for its file+position. Rows in the delete file must be **sorted by `file_path`, then `pos`** — explicitly for filter pushdown by file in columnar formats and for streaming row filtering while scanning to avoid holding all deletes in memory (lines 1413-1416).
+
+**Scan-planning rules (lines 1079-1083).** A position delete file applies to a data file only when *all* of these hold:
+- file paths are equal (if `referenced_data_file` is set), or by matching partition
+- the data file's data sequence number is ≤ the delete file's data sequence number
+- partition (spec + values) is equal
+- there is no deletion vector that must be applied to the data file (a DV, when present, subsumes all prior position deletes)
+
+Deletes are applied only to *older, same-partition* data files, except position deletes also apply to data files **from the same commit** (equal sequence numbers), which lets you delete rows added in the same commit (line 1091).
+
+**Deprecated in v3, replaced by deletion vectors (lines 1358, 1363, 1395).** v3 says writers must not add new position delete files; existing ones remain valid and must be merged into a deletion vector when one is created. DVs are binary (Roaring) bitmaps, one per data file, stored in Puffin — the spec calls them "more efficient at execution time than position delete files" (line 1366). At most one DV per data file in a snapshot; when present, readers can safely ignore matching position delete files (lines 1366, 1387).
+
+**v3+ metadata additions:** `referenced_data_file` (optional for position files that delete only one data file, required for DVs), `content_offset`/`content_size_in_bytes` (to point directly at a DV blob), and a `sort_order_id` rule that position delete files must be sorted by file+position *not* table order, with readers ignoring the sort order id for them (line 754). Appendix F notes no implementation writes the optional `row` values and the Java implementation deprecated them in 1.11.0 (lines 2143-2145).
+
+## Why it's designed this way
+
+**Immutable files + no rewriting.** The whole premise of v2 (lines 39-45) is that data files are immutable. Position deletes let you remove individual rows *without rewriting the data files* — you record "what's gone" in a small sidecar file instead of rewriting large Parquet/ORC files. This keeps the O(1)-remote-call scan-planning goal: planning only reads manifests, not data.
+
+**Positions sidestep schema coupling.** Unlike equality deletes (match by column value), a position delete doesn't need to store or index any column values to identify a row. It's the simplest, most space-efficient representation: the identity of a row *is* its (file, position) — no join against actual values, no hash, no ambiguity with nulls or duplicate values. The path+pos identifier is also why position deletes can carry the deleted `row` as an optional reconstruction aid rather than as the matching key.
+
+**Sequence numbers control age/timing.** A delete must never remove a row that didn't exist when the delete was written. The `data file's sequence ≤ delete's sequence` rule guarantees you only apply a delete to data that predates it. The same-commit exception (equal sequence numbers) is what makes atomic "insert and delete in one snapshot" possible — e.g., handling a primary-key conflict or a self-join without waiting for the next commit.
+
+**File+position sorting is a deliberate engineering trade.** Sorting by file then position is what lets a reader push down file-level filters AND consume deletes as a streaming merge while scanning, so a large delete set doesn't have to be materialized in memory to apply to one scan.
+
+**Deletion vectors (v3) are the convergence.** Over time, position *files* proved inefficient at execution — many small files, whole-file reads, repeated rewriting as deletes accumulate for the same file. The DV replaces a delete file with a compact bitmap keyed directly to one data file; the "merge into one DV per data file, readers ignore the old position files once a DV exists" rule (lines 1366-1367, 1387-1388) is what lets engines replace old position deletes with vectors without ambiguity. Position deletes remain in the spec only as a backward-compatible carry-over from v2 (and v2 files stay applyable in upgraded v3/v4 tables).
+
+Want me to go deeper on any piece — e.g., how sequence-number inheritance actually works in the manifest metadata, or the exact DV bitmap encoding?

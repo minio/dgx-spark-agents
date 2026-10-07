@@ -1,0 +1,57 @@
+I've now traced both the read path and the write path through the Spark and Flink integrations. Here's how query engines use partitioning, cited to file and line.
+
+## The two-sided contract
+
+Query engines lean on partitioning in exactly two directions that mirror the spec's *Storage separation* goal (spec.md:76):
+
+- **On read (pruning):** convert a data predicate into partition predicates via `Transform.project`/`projectStrict`, evaluate each file's partition tuple, and drop files that can't match.
+- **On write (layout):** apply the transform to each row to compute its partition tuple, group rows by that tuple, and fan out one file per partition.
+
+Both directions funnel through the `PartitionKey`/`Transform` machinery I covered earlier — the engine never reimplements the bucketing or truncation math; it just drives Iceberg's own classes.
+
+## Read side — Spark
+
+**1. Spark turns Spark V2 predicates into Iceberg expressions and hands them to the scan.** In `SparkScanBuilder.pushPredicates` (SparkScanBuilder.java:152-196), each Spark predicate is converted via `SparkV2Filters.convert` and bound to the schema (169-174). The comment at 153-161 is the exact spec contract ("filters that select entire partitions ... used prune files during job planning"). Critically, `ExpressionUtil.selectsPartitions(expr, ...)` decides whether a filter can be evaluated entirely on the Iceberg side vs. must remain a post-scan filter (SparkScanBuilder.java:178-184) — this is the inclusive-projection/pruning boundary. The bound expressions then get passed to `newBatchScan().filter(...)` (SparkScanBuilder.java:479).
+
+**2. The scan is built and the Iceberg batch scan's `.filter()` is what does the actual partition pruning.** `SparkScanBuilder.buildBatchScan` (SparkScanBuilder.java:469-504) sets `.filter(filterExpression())` (479), which pushes the predicate into the Iceberg scan (core) — the place where `Transform.project`'s inclusive projection meets manifest + file-level pruning.
+
+**3. Spark asks the scan to report the partitioning so its optimizer and shuffle can align to it.** `SparkPartitioningAwareScan implements SupportsReportPartitioning` (SparkPartitioningAwareScan.java:59-60). It computes a *grouping key type* from the union of scanned specs via `Partitioning.groupingKeyType(expectedSchema(), specs())` (137-139) and reports `KeyGroupedPartitioning` when grouped, else `UnknownPartitioning` (107-122). To build the Spark-side grouping key transforms it indexes `PartitionField`s by field id across all specs (`indexFieldsById`, 157-167) and converts them with `Spark3Util.toTransforms` (141-155). This lets Spark do a partitioning-compatible shuffle so downstream operators (e.g. the sort-merge join or the write) can avoid a re-partition — a direct use of `spec.fields()` and `field.fieldId()`.
+
+**4. The scans it plans are partition-aware.** `specs()` collects the distinct spec ids from planned tasks and resolves them back to `PartitionSpec`s (SparkPartitioningAwareScan.java:169-177), and `tasks()` calls `scan.planFiles()` (181) to get tasks, each carrying a spec and partition tuple.
+
+**5. Runtime join-filter pruning re-evaluates partitions after planning.** `SparkBatchQueryScan` implements `SupportsRuntimeV2Filtering` (SparkBatchQueryScan.java:66). `filterAttributes()` walks every `PartitionField.sourceId()` across all specs to advertise which columns can be used for join-key runtime filtering (105-124). When Spark delivers `IN` predicates, `filter(Predicate[])` (127-164) does the full pipeline in one place:
+- projects the runtime filter onto partition values using the *inclusive* projection per spec — `Projections.inclusive(spec, caseSensitive()).project(runtimeFilterExpr)` (134-135),
+- builds an `Evaluator` over `spec.partitionType()` (136) — using the spec's partition struct from `PartitionSpec.partitionType()` (PartitionSpec.java:135-152),
+- and filters planned tasks by evaluating `task.partition()` against the evaluator keyed by `task.spec().specId()` (140-147).
+
+Note it keys evaluators by **spec id** (137, 144) — exactly the spec's rule that each file must be filtered by the spec that wrote it (spec.md:1059, described in a previous turn).
+
+## Read side — Flink
+
+Flink's read path delegates partition pruning the same way: its `FlinkDataSource`/reader hands filters into `newBatchScan().filter(...)`, so pruning is again Iceberg core applying `Transform.project`. Flink itself doesn't reimplement the projection — the partitioning dependency shows up mostly on the write side (below). The FlinkCatalog explicitly *declines* the classic Hive-style directory-partition API (`createPartition`/`dropPartition` throw `UnsupportedOperationException`, FlinkCatalog.java:913-938) — because Iceberg doesn't model partitions as catalog entities; they're derived from the spec at write time.
+
+## Write side — Spark
+
+Spark's sink also drives partitioning through core. In `SparkWrite`, the data is written with a `PartitioningWriter` (`FanoutDataWriter`/`RollingDataWriter`, SparkWrite.java:49-54), and it reports `advisoryPartitionSizeInBytes()` (159-163) so the Spark planner sizes writes. For `dynamicOverwrite` it commits "dynamic partition overwrite with N new data files" (343-346) — a partition-aware overwrite that derives which partitions to replace from the spec, again so queries need no partition literals (spec.md:76).
+
+## Write side — Flink (most explicit partitioning use in either engine)
+
+Flink's sink materializes the partition tuple per row and shuffles by it to avoid small files:
+
+**1. `PartitionKeySelector` computes each row's partition and shuffles on it.** It holds a `PartitionKey` built from the spec and schema (`new PartitionKey(spec, schema)`, PartitionKeySelector.java:44-48) and its `getKey` applies the transform and returns the partition path string: `partitionKey.partition(wrap(row)); return partitionKey.toPath();` (61-65). The class Javadoc states the purpose: "shuffle by partition key, then each partition/bucket will be written by only one task ... reduces small files in partitioned fanout" (30-34). So Flink uses the partition tuple itself as the data-shuffle key.
+
+**2. `PartitionKey` applies the transform via the same classes used for pruning.** `PartitionKey` builds a `FieldTransform(sourceId, transform)` per partition field (PartitionKey.java:67-73) and `partition(row)` (63-65) computes the tuple — delegating to the exact `Transform.apply`/`bind` machinery from the earlier turns (e.g. the `(hash & MAX) % N` bucket). `toPath()` returns `spec.partitionToPath(this)` (53-55), which renders the `name=value/...` directory path (PartitionSpec.java:220-235).
+
+**3. Bucket-aware physical repartitioning.** For the fan-out write policy Flink even optimizes bucketing specifically: `BucketPartitioner`/`BucketPartitionKeySelector` (BucketPartitionKeySelector.java:34-55) extract the bucket field id from the spec (`partitionSpec.fields().get(i).fieldId()`) and repartition rows so all rows in the same bucket land on one task — again reading `spec.fields()` to derive behavior rather than hardcoding it.
+
+## How this ties back to the design
+
+Everything the engines do with partitioning is **derived from the `PartitionSpec`, never supplied by the user**:
+- Read pruning derives partition predicates from data predicates (SparkScanBuilder.java:178-184; SparkBatchQueryScan.java:134-147) — the inclusive projection from spec.md:1061.
+- Per-file evaluation is keyed by the file's own spec id (SparkBatchQueryScan.java:137,144) — spec.md:1059.
+- Write layout computes the partition tuple by applying the spec transforms (PartitionKey.java:67-73) and shuffles on it (PartitionKeySelector.java:61-65).
+
+So when a table's spec evolves, the engines pick up new specs automatically: the read side refilters by each file's stored spec id and recomputes grouping keys from the union of active specs, and the write side just reads the current `spec.fields()`. No engine logic embeds a particular partition scheme, which is the whole point of separating partitioning from table semantics.
+
+## One caveat on scope
+I capped this at the integration entry points and the `PartitionScanTask` level. The deepest core plumbing the engines rely on — `ManifestGroup`/`ManifestEvaluator` (which consume the inclusive projection and the spec stored in each manifest during `planFiles()`), and the file-level `PartitionEvaluator`/`MetricsEvaluator` — lives in `core/` and I didn't trace its internals here. That's where a file's stored partition tuple is actually matched against the projected partition predicate. Want me to walk that path next, or is the integration-layer view enough?

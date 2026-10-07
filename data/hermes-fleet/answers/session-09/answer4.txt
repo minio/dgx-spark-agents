@@ -1,0 +1,29 @@
+I have everything I need. Here's the explanation.
+
+## How query engines use sort orders
+
+The key point: across both Spark and Flink, sort orders are used in the **write path**, not the read/scan path. Readers never consult the sort order — as the spec says, reads use specs stored in manifests (spec.md:656, 1166). The sort order's job is to tell the engine "this table's files are supposed to be arranged in this order," and the engine exploits it by **emitting the data pre-sorted (or shuffling to group it) so the files land in that order**, and by **declaring that ordering as a required/expected property of the write**. The Spark ordering machinery additionally references the per-task ordering this produces.
+
+### Spark: sort order becomes a required ordering on the write
+
+The flow is: Iceberg sort order → `SortOrderUtil` → Spark `SortOrder[]` → reported to the Spark planner as a write requirement, so Spark physically sorts/clusters the output.
+
+- `SparkWriteBuilder.writeRequirements()` calls into `writeConf.copyOnWriteRequirements(...)`/`writeRequirements(...)`, which builds the requirements and returns a `SparkWriteRequirements` carrying a `Distribution` plus an `ordering` (`SparkWriteUtil.java:99-104`, `SparkWriteBuilder.java:176-178`; `SparkWriteRequirements.java:34-36, 53-55`).
+- `SparkWriteUtil.writeOrdering` decides whether to request ordering: if fanout is enabled **and** the table sort order is unsorted, no ordering is required (`EMPTY_ORDERING`); otherwise it asks for the full ordering (`SparkWriteUtil.java:246-252`). The comment at 242-245 states the two reasons a task-local ordering helps: a defined table sort order, and partitioning with fanout off.
+- The actual ordering is computed as `ordering(table)` → `Spark3Util.toOrdering(SortOrderUtil.buildSortOrder(table))` (`SparkWriteUtil.java:258-260`).
+- `SortOrderUtil.buildSortOrder` (`core/.../SortOrderUtil.java:40-42, 79-124`) composes the ordering: it prefixes the user/table sort order with any partition fields that aren't already covered by it (removing partition fields that the sort already satisfies via `sortField.transform().satisfiesOrderOf(field.transform())`, lines 93-111), so files are clustered within partitions and sorted within the cluster.
+- `Spark3Util.toOrdering` (`Spark3Util.java:269-273`) dispatches each Iceberg sort field through `SortOrderVisitor` into the visitor `SortOrderToSpark` (`SortOrderToSpark.java:30-100`), which emits Spark data-source-v2 `SortOrder` expressions (`Expressions.sort(...asc/desc...)`, `Expressions.bucket/years/months/days/hours/truncate`) and maps Iceberg `SortDirection`/`NullOrder` onto Spark's `SortDirection`/`NullOrdering` (`SortOrderToSpark.java:89-100`). This `SortOrder[]` is handed to Spark as the required ordering so the physical plan sorts (or ranges/clusters) the written records accordingly.
+
+So Spark consumes the sort order as a **declared write ordering requirement** — it turns the advisory Iceberg order into an actual `SORT`/`CLUSTER` in the plan, and because the ordering derives from identity/order-preserving transforms (e.g. `satisfiesOrderOf` at `SortOrderUtil.java:105`), it knows a denser sort (days(ts)) already satisfies a coarser partitioned-order (month(ts)) and doesn't sort redundantly.
+
+### Flink: sort order drives range partitioning of the shuffle
+
+The Flink sink also reads the table sort order, specifically for **range distribution** when writing:
+
+- `FlinkSink` pulls `SortOrder sortOrder = table.sortOrder()` (`FlinkSink.java:619`) and, in `RANGE` distribution mode (`FlinkSink.java:662-694`), uses it to build the range-shuffle key. If the sort order is unsorted but the table is partitioned, it synthesizes a sort order from the partition spec (`sortOrder = Partitioning.sortOrderFor(partitionSpec)`, `FlinkSink.java:680-683`). `IcebergSink.java:970-973, 1062-1065` does the same.
+- The sort order reaches the shuffle machinery as a `StatisticsOrRecordTypeInformation` (`FlinkSink.java:686-687`) feeding `DataStatisticsOperator`/`RangePartitioner` in `flink/.../sink/shuffle/`. There, `SortKeyUtil.sortKeySchema` builds the projected schema from `sortOrder.fields()` (`SortKeyUtil.java:34-36`), and `SortKeySerializer` computes the binary sort key — its size is `sortOrder.fields().size()` (`SortKeySerializer.java:63`) and its state snapshot enforces that the order hasn't changed across savepoints via `sortOrder.sameOrder(...)` (`SortKeySerializer.java:375-376`, with the order (de)serialized through `SortOrderParser` at 403-405). The range partitioner then routes rows so that records that are close in sort-key space (and thus close in the table order) land in the same writer, producing data files that approximately follow the sort order.
+
+That last part is the Flink-specific nuance from the spec ("streaming writes are not required to honor the default order"): Flink doesn't guarantee a fully sorted file, it uses the sort order only as the key for a **sketch/range partitioner** to co-locate nearby keys — a best-effort clustering rather than a global sort.
+
+### Read path: none
+Neither engine reads with the sort order; it never affects scan planning or file selection. It exists purely to shape how new data is written, so that future scans/compactions see already-clustered files.

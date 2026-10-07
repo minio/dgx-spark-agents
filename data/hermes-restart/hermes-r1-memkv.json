@@ -1,0 +1,18 @@
+{
+ "label": "memkv",
+ "wall_s": 145.9,
+ "server": {
+  "prompt_tokens_total": 3269653.0,
+  "generation_tokens_total": 6275.0,
+  "prefix_cache_hits_total": 3144960.0,
+  "external_prefix_cache_hits_total": 91392.0,
+  "time_to_first_token_seconds_sum": 29.1,
+  "time_to_first_token_seconds_count": 30.0,
+  "request_prefill_time_seconds_sum": 23.1,
+  "request_decode_time_seconds_sum": 112.5
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "ten, so it never compacts away rows that a newer delete would still have removed. This plugs into the optimistic-commit validation from the previous discussion.\n\nNote that compaction rewrites that target compacting data files and *separately* rewriting delete files both route through the same index/merge machinery: deleted entries (status DELETED) and dead manifests are dropped in `apply()` (MergingSnapshotProducer.java:1021-1055), and the delete manifest merge manager bin-packs/splits delete manifests (`deleteMergeManager.mergeManifests`, :1067).\n\n**2. Delete-file-only rewrite / DV consolidation:** `RewriteFiles` also supports replacing delete files directly \u2014 `rewriteFiles(..., Set<DeleteFile> deleteFilesToReplace, ..., Set<DeleteFile> deleteFilesToAdd)` (BaseRewriteFiles.java:91-120). This is used to **merge/consolidate** position delete files and, importantly in v3, to **convert/merge them into deletion vectors** \u2014 the spec says \"Existing position deletes must be written to delete vectors when updating the position deletes for a data file\" (spec.md:1395). Because the rewritten files keep their original `dataSequenceNumber` (set via `dataSequenceNumber(long)`, BaseRewriteFiles.java:79-82), the ordering guarantees are preserved so the merge doesn't change which deletes apply.\n\n**The key invariant preserved by both:** rewriting never changes the *logical* table contents \u2014 data sequence numbers are preserved (`rewriteFiles(..., long sequenceNumber)` BaseRewriteFiles.java:85-89), and partition/sequence matching in `DeleteFileIndex` stays valid. The rewritten snapshot is still a `REPLACE` that requires the replaced files to still be present (the commit validation from the concurrency discussion), so a compaction can't silently drop data or deletes.\n\n## Format-version support summary\n\n| Mechanism | v1 | v2 | v3 | v4 |\n|---|---|---|---|---|\n| Position delete files | \u2717 | \u2713 | read-only (deprecated, ~spec:1395) | read-only |\n| Equality delete files | \u2717 | \u2713 | \u2713 | read-only (no new, ~spec:1422) |\n| Deletion vectors | \u2717 | \u2717 | \u2713 | \u2713 |\n\n## Key citations\n- Spec: row-level deletes v2 intro (spec.md:39-45, 109-119); delete formats (1356-1473); scan-planning apply rules (1073-1092); position files (1391-1416); equality files (1418-1469); DVs (1375-1389); v2/v3/v4 changes (1983-2051, 1927-1978, 1897-1925).\n- Code: `DeleteFileIndex.forDataFile` (DeleteFileIndex.java:158-175) and partition/path/DV lookups (:177-232); sequence semantics via `applySequenceNumber = dataSeq - 1` (:881) and `PositionDeletes.filter` (:726-743); `BitmapPositionDeleteIndex`; `data/DeleteFilter.applyPosDeletes`/`applyEqDeletes`/`filter` (DeleteFilter.java:188-190, 192-273); `Deletes.toPositionIndex`/`toEqualitySet` (Deletes.java:119-195); version gating (MergingSnapshotProducer.java:295-316); compaction `BaseRewriteFiles` (BaseRewriteFiles.java:43-156) and its delete handling in `MergingSnapshotProducer.apply` (1021-1067); DV detection `ContentFileUtil.isDV` (ContentFileUtil.java:142-143).\n",
+ "stderr": ""
+}

@@ -1,0 +1,414 @@
+{
+ "tag": "oc-e2e-r12-day1-2",
+ "wall_s": 247.4,
+ "returncode": 0,
+ "server": {
+  "prompt_tokens_total": 636007.0,
+  "generation_tokens_total": 11064.0,
+  "prefix_cache_hits_total": 602112.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 20.2,
+  "time_to_first_token_seconds_count": 22.0,
+  "request_prefill_time_seconds_sum": 19.0,
+  "request_decode_time_seconds_sum": 210.7
+ },
+ "meta": {
+  "durationMs": 240326,
+  "agentMeta": {
+   "sessionId": "iceberg-1007-1412-12",
+   "sessionFile": "agent:main:explicit:iceberg-1007-1412-12",
+   "provider": "vllm",
+   "model": "dsv4flash",
+   "contextTokens": 1000000,
+   "contextTokensSource": "resolved",
+   "agentHarnessId": "openclaw",
+   "credentialSource": {
+    "kind": "direct",
+    "evidence": "environment",
+    "authorization": "declared"
+   },
+   "usage": {
+    "input": 636007,
+    "output": 11064,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "reasoningTokens": 6520,
+    "total": 647071,
+    "cost": {
+     "total": 0
+    }
+   },
+   "lastCallUsage": {
+    "input": 38377,
+    "output": 2990,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": {
+     "total": 0
+    },
+    "reasoningTokens": 1033,
+    "total": 41367
+   },
+   "promptTokens": 38377,
+   "contextBudgetStatus": {
+    "schemaVersion": 1,
+    "source": "pre-prompt-estimate",
+    "updatedAt": 1791409616942,
+    "provider": "vllm",
+    "model": "dsv4flash",
+    "route": "fits",
+    "shouldCompact": false,
+    "estimatedPromptTokens": 18777,
+    "contextTokenBudget": 1000000,
+    "promptBudgetBeforeReserve": 980000,
+    "reserveTokens": 20000,
+    "effectiveReserveTokens": 20000,
+    "remainingPromptBudgetTokens": 961223,
+    "overflowTokens": 0,
+    "toolResultReducibleChars": 0,
+    "messageCount": 4,
+    "unwindowedMessageCount": 4,
+    "sessionId": "iceberg-1007-1412-12"
+   },
+   "codeModeEngaged": false,
+   "assistantTurns": 22,
+   "bridgeCalls": {
+    "search": 0,
+    "describe": 0,
+    "call": 0
+   },
+   "costUsd": 0,
+   "terminalReceipt": {
+    "runId": "fc11ae92-93d7-48d7-9240-d5487f1f1139",
+    "sessionId": "iceberg-1007-1412-12",
+    "turnId": "fc11ae92-93d7-48d7-9240-d5487f1f1139",
+    "requested": {
+     "provider": "vllm",
+     "model": "dsv4flash"
+    },
+    "effective": {
+     "provider": "vllm",
+     "model": "dsv4flash",
+     "responseModel": "dsv4flash"
+    },
+    "successfulToolNames": [
+     "read"
+    ],
+    "rerouted": false,
+    "terminalDisposition": "visible"
+   }
+  },
+  "aborted": false,
+  "systemPromptReport": {
+   "source": "run",
+   "generatedAt": 1791409615800,
+   "sessionId": "iceberg-1007-1412-12",
+   "sessionKey": "agent:main:explicit:iceberg-1007-1412-12",
+   "provider": "vllm",
+   "model": "dsv4flash",
+   "workspaceDir": "/sandbox/.openclaw/workspace",
+   "bootstrapMaxChars": 20000,
+   "bootstrapTotalMaxChars": 60000,
+   "bootstrapTruncation": {
+    "warningMode": "always",
+    "warningShown": false,
+    "truncatedFiles": 0,
+    "nearLimitFiles": 0,
+    "totalNearLimit": false
+   },
+   "sandbox": {
+    "mode": "off",
+    "sandboxed": false
+   },
+   "systemPrompt": {
+    "chars": 47986,
+    "hash": "77671f5c39293961caa65896d7196ea87efc24d5d541f431b3925d6c3ef4eebe",
+    "projectContextChars": 22367,
+    "nonProjectContextChars": 25619
+   },
+   "injectedWorkspaceFiles": [
+    {
+     "name": "AGENTS.md",
+     "path": "/sandbox/.openclaw/workspace/AGENTS.md",
+     "missing": false,
+     "rawChars": 6449,
+     "injectedChars": 6449,
+     "truncated": false
+    },
+    {
+     "name": "SOUL.md",
+     "path": "/sandbox/.openclaw/workspace/SOUL.md",
+     "missing": false,
+     "rawChars": 1526,
+     "injectedChars": 1526,
+     "truncated": false
+    },
+    {
+     "name": "IDENTITY.md",
+     "path": "/sandbox/.openclaw/workspace/IDENTITY.md",
+     "missing": false,
+     "rawChars": 1398,
+     "injectedChars": 1398,
+     "truncated": false
+    },
+    {
+     "name": "USER.md",
+     "path": "/sandbox/.openclaw/workspace/USER.md",
+     "missing": false,
+     "rawChars": 1136,
+     "injectedChars": 1136,
+     "truncated": false
+    },
+    {
+     "name": "BOOTSTRAP.md",
+     "path": "/sandbox/.openclaw/workspace/BOOTSTRAP.md",
+     "missing": false,
+     "rawChars": 7475,
+     "injectedChars": 7475,
+     "truncated": false
+    }
+   ],
+   "skills": {
+    "promptChars": 6597,
+    "hash": "3901714edd8552a2ed5584d30a27f3876d91f3f6d79297d2dd02698a54d76b20",
+    "entries": [
+     {
+      "name": "add-model-provider",
+      "blockChars": 299
+     },
+     {
+      "name": "browser-automation",
+      "blockChars": 324
+     },
+     {
+      "name": "canvas",
+      "blockChars": 243
+     },
+     {
+      "name": "clawhub",
+      "blockChars": 302
+     },
+     {
+      "name": "cloud-image-bake",
+      "blockChars": 285
+     },
+     {
+      "name": "configure-channel",
+      "blockChars": 287
+     },
+     {
+      "name": "control-ui",
+      "blockChars": 338
+     },
+     {
+      "name": "diagnose-gateway",
+      "blockChars": 279
+     },
+     {
+      "name": "diagram-maker",
+      "blockChars": 264
+     },
+     {
+      "name": "gh-issues",
+      "blockChars": 287
+     },
+     {
+      "name": "github",
+      "blockChars": 494
+     },
+     {
+      "name": "healthcheck",
+      "blockChars": 276
+     },
+     {
+      "name": "meme-maker",
+      "blockChars": 249
+     },
+     {
+      "name": "node-connect",
+      "blockChars": 333
+     },
+     {
+      "name": "node-inspect-debugger",
+      "blockChars": 275
+     },
+     {
+      "name": "notion",
+      "blockChars": 270
+     },
+     {
+      "name": "python-debugpy",
+      "blockChars": 263
+     },
+     {
+      "name": "skill-creator",
+      "blockChars": 282
+     },
+     {
+      "name": "spike",
+      "blockChars": 249
+     },
+     {
+      "name": "visualize",
+      "blockChars": 280
+     },
+     {
+      "name": "weather",
+      "blockChars": 287
+     }
+    ]
+   },
+   "tools": {
+    "listChars": 0,
+    "schemaChars": 6113,
+    "entries": [
+     {
+      "name": "ls",
+      "summaryChars": 192,
+      "summaryHash": "90bdd7a772f66ad236d45f18e28ee873b8c795fe219804f2c19074a867423e20",
+      "schemaChars": 254,
+      "schemaHash": "ebe8d6a85b7011ec7e0d43a759b3b53b1ce96e682f54a64312b10e89260e9af9",
+      "propertiesCount": 3
+     },
+     {
+      "name": "read",
+      "summaryChars": 164,
+      "summaryHash": "d136f5b09e28d671addad4ca800b75b8aa6a36002bc739ead964f618d3e34829",
+      "schemaChars": 481,
+      "schemaHash": "b1b9b637dfe1dfade40f50c37cf840a298f1992b534cb9425b7470233a6b0cbb",
+      "propertiesCount": 5
+     },
+     {
+      "name": "edit",
+      "summaryChars": 130,
+      "summaryHash": "4149500b1f6501ec6450e4c048bdb6844764dd4a888a10846726cbbc7256152e",
+      "schemaChars": 501,
+      "schemaHash": "adf3140833ca927b84c66c989d6833fdcbd9de011dd2ffc59f9a2c4d3c25f127",
+      "propertiesCount": 2
+     },
+     {
+      "name": "write",
+      "summaryChars": 49,
+      "summaryHash": "f9ce3d8ac929a51498c03331b97c59bfaa2bb4d25580a5ddf0102e6a8e173aec",
+      "schemaChars": 191,
+      "schemaHash": "b61d2da23febf5fbda55e391526f36d283e9e9fb7f1a1dbadcf5c618a0632287",
+      "propertiesCount": 2
+     },
+     {
+      "name": "apply_patch",
+      "summaryChars": 71,
+      "summaryHash": "5c1173efe93d080a386a23216bc3e58db2e0033eb3ddea697eb2439938b7cae4",
+      "schemaChars": 153,
+      "schemaHash": "05521268363ff4f191472c90d69ef08a503ba9acf1d2febc50b3ee68db32ab65",
+      "propertiesCount": 1
+     },
+     {
+      "name": "exec",
+      "summaryChars": 503,
+      "summaryHash": "db730359f8e2e0af6b787dd3717ee4d33189b95f908103250e1e203079218503",
+      "schemaChars": 1242,
+      "schemaHash": "aeabc27dd35e066195bd6dc30a5fd0e3598974789e8784eb7303eee80fe82518",
+      "propertiesCount": 12
+     },
+     {
+      "name": "process",
+      "summaryChars": 258,
+      "summaryHash": "c9c81d9c38f731d0efcc810924c78c3161c38524baa561c6f9251638d9e164b2",
+      "schemaChars": 1164,
+      "schemaHash": "6cf3281369349e15ea532e644c8ec7f94c96fa6a4e3287272c8cfe90b0960516",
+      "propertiesCount": 12
+     },
+     {
+      "name": "openclaw",
+      "summaryChars": 456,
+      "summaryHash": "45212b5ccc76e78f8dc05e9a9d90d721c53f16f18ee08a23a5868020bbe24f6d",
+      "schemaChars": 196,
+      "schemaHash": "9956b2b6fde1ca6ca3d035b66217a09c717a6503aa4e59a2ce184dbf67849bd3",
+      "propertiesCount": 2
+     },
+     {
+      "name": "sessions_yield",
+      "summaryChars": 337,
+      "summaryHash": "1dddf4158ea2c44cf79c93b483fd18bc48c6e32fe32fafca3fe83b5309310ce8",
+      "schemaChars": 457,
+      "schemaHash": "6f3649fb583d30499a48925363f0158ecff856d7bc44e9531dd9cbd8c23c6428",
+      "propertiesCount": 3
+     },
+     {
+      "name": "tool_search",
+      "summaryChars": 502,
+      "summaryHash": "acdcab138b356606711452241e668c366bdb15428e39a28a94d7be27d7968626",
+      "schemaChars": 1139,
+      "schemaHash": "0a78304973631f66103ff3f0c767433fdc00fb89d629bd5b12d1ada29940d382",
+      "propertiesCount": 3
+     },
+     {
+      "name": "tool_describe",
+      "summaryChars": 92,
+      "summaryHash": "fc74d14dc28e4026dba1a8904339a6bef1ce8118588e0bff809c37be73ce7a02",
+      "schemaChars": 125,
+      "schemaHash": "8b60055097c87990f29b27c1f82ecea48435ffb1163c486121a2189f118aa0a4",
+      "propertiesCount": 1
+     },
+     {
+      "name": "tool_call",
+      "summaryChars": 61,
+      "summaryHash": "0dc569a573cbc94928d868c94a178930879ac898b541cd9009338699a3e7d1fd",
+      "schemaChars": 210,
+      "schemaHash": "f48bfb0705c11b32ccbdfd456b791ce458604b1f51b1e31f61bc2d7b25ae07b9",
+      "propertiesCount": 2
+     }
+    ]
+   },
+   "currentTurn": {
+    "promptChars": 233,
+    "runtimeContextChars": 52,
+    "modelOnlyPromptChars": 0
+   }
+  },
+  "finalPromptText": "Read /data/iceberg/core/src/main/java/org/apache/iceberg/SnapshotProducer.java in full and the code it calls to commit. Explain step by step what happens when two writers commit to the same table at the same time. Cite file and line.",
+  "finalAssistantVisibleText": "Both files plus the commit path are read in full. Here's the step-by-step story of two writers committing to the same table concurrently, with citations.\n\n## The players\n\n- `SnapshotProducer.java` (929 lines) \u2014 the generic commit machinery used by every `SnapshotUpdate` (append, overwrite, delete, etc.). I read all of it.\n- `Tasks.java` (`util`) \u2014 the retry framework it funnels commits through. I read all of it.\n- `BaseMetastoreTableOperations.java` \u2014 the `commit` contract and the stale-metadata check; plus its concrete implementations `JdbcTableOperations.java` and `HadoopTableOperations.java` for the actual atomic step.\n\n## 1. Both writers set up on the same base\n\nEach writer's `SnapshotProducer` constructor captures the current table metadata once: `this.base = ops.current()` (`SnapshotProducer.java:133`). So both writers see the same table state (say a single snapshot `S1`). This is fine \u2014 Iceberg is optimistic, not locking.\n\n`commit()` is the entry point (`SnapshotProducer.java:484`). Each commit attempt goes through `apply()` (`SnapshotProducer.java:295`), which calls `refresh()` (`SnapshotProducer.java:296`, implemented at `477-479`) to pick up any concurrently-committed changes, then computes everything *of its own*: a fresh snapshot id, the new manifest list, all its data/deletes, and the snapshot summary. Crucially, **all of this occurs before the atomic catalog step** \u2014 the two writers independently write their own manifest files and manifest lists to object storage. Those files are *uncommitted* at this point, so they don't affect readers or each other.\n\nEach attempt writes a uniquely-named manifest list: `commitUUID` is generated once in the constructor (`SnapshotProducer.java:104`), and the filename embeds `snap-{snapshotId}-{attempt}-{commitUUID}` (`SnapshotProducer.java:619-631`, `attempt.incrementAndGet()` at `632`). So retries never collide on files.\n\n## 2. The retry loop\n\n`commit()` wraps the actual commit in a `Tasks.foreach(ops)` loop (`SnapshotProducer.java:489`) configured with:\n- `.retry(COMMIT_NUM_RETRIES, ...)` \u2014 default 4 retries (`SnapshotProducer.java:490`, constants at `36-39`)\n- `.exponentialBackoff(min, max, total, 2.0)` (`SnapshotProducer.java:491-494`)\n- `.onlyRetryOn(CommitFailedException.class)` (`SnapshotProducer.java:496`) \u2014 only stale-commit conflicts are retried\n\nInside the loop (`SnapshotProducer.java:498`) it calls `apply()` again, then builds the new `TableMetadata` from `base`: if the new snapshot id already exists in base it's a rollback branch (`503-505`), otherwise it advances the branch head or adds a staged snapshot (`512-515`). If nothing actually changed it skips the atomic commit (`520-521`), and finally:\n\n```java\ntaskOps.commit(base, updated.withUUID());   // SnapshotProducer.java:533\n```\n\nThis is the atomic step, delegated to the catalog.\n\n## 3. The atomic step decides the winner\n\nThe optimistic-concurrency check is in `BaseMetastoreTableOperations.commit` (`BaseMetastoreTableOperations.java:109-127`):\n\n```java\nif (base != current()) {                       // :111\n  if (base != null) {\n    throw new CommitFailedException(\"Cannot commit: stale table metadata\");  // :113\n  } else {\n    throw new AlreadyExistsException(...);     // :116\n  }\n}\n...\ndoCommit(base, metadata);                      // :127\n```\n\n`base` is the metadata this writer started from; `current()` is what the catalog now holds, live. Two writers may pass this check simultaneously if they both loaded before either committed \u2014 the real serialization happens in `doCommit` against the catalog backend:\n\n- **JDBC:** `JdbcTableOperations.doCommit` (`JdbcTableOperations.java:103`) first re-validates that the catalog row still points at the writer's base metadata (`validateMetadataLocation`, `JdbcTableOperations.java:200-211`, throwing `CommitFailedException` at `205` if changed), then does a conditional `UPDATE` where the metadata location must match the old one (`updateTable`, `146-163`; the check `` updatedRecords == 1 `` and `CommitFailedException` at `160-162`). Whichever writer's `UPDATE` happens first wins; the loser's `UPDATE` matches 0 rows \u2192 `CommitFailedException`.\n- **Hadoop (without catalog):** `HadoopTableOperations.commit` (`HadoopTableOperations.java:131`) re-checks staleness itself (`135-137`), writes a temp metadata file, then performs the atomic operation \u2014 an atomic rename to the next versioned metadata file (`renameToFinal`, `161-162`; on failure throws `CommitFailedException` at `381`/`390`).\n\nSo the loser is *rejected*, not corrupted: the winner's metadata file/pointer stands, the loser's metadata never becomes current.\n\n## 4. The loser retries on top of the winner\n\nThe loser's `CommitFailedException` propagates back up into `Tasks.runTaskWithRetry` (`Tasks.java:406`, invoked single-threaded via the loop at `SnapshotProducer.java:498`). `runTaskWithRetry`:\n\n- increments the attempt counter (`Tasks.java:412`)\n- checks the retry policy: because `onlyRetryExceptions` is set, it retries only when the exception *is* a `CommitFailedException` (`Tasks.java:440-448`); anything else (or `CommitStateUnknownException`) is thrown immediately\n- computes an exponential backoff delay `minSleep * scaleFactor^(attempt-1)`, capped, with random jitter (`Tasks.java:452-460`), then sleeps (`Tasks.java:462-467`)\n- stops if `attempt >= maxAttempts` or the total retry window elapsed (`Tasks.java:428-433`)\n\nOn the next pass of the loop, `apply()` runs again (`SnapshotProducer.java:498`) and the first thing it does is `refresh()` (`SnapshotProducer.java:477-479`, called from `296`) \u2014 which reloads the metadata from the catalog, now seeing the winner's snapshot `S2`. So the loser rebuilds its snapshot with `S2` as its parent, on top of the winner's manifests. This is the \"append-only, linearizable history\" behavior of Iceberg: concurrent writers don't interleave, they retry and rebase.\n\nNote the snapshot id is not reused: on retry `apply()` re-runs and a fresh snapshot id is generated (guarded in `snapshotId()`, `SnapshotProducer.java:~662-672`), so each attempt is a distinct, uniquely-named snapshot/manifest list.\n\n## 5. Giving up and failure handling\n\nIf conflicts outlast the retry budget, `runTaskWithRetry` rethrows (`Tasks.java:428-433`), `SnapshotProducer.commit()` catches the `RuntimeException` (`SnapshotProducer.java:538`) and, unless strict cleanup is in effect or it's a non-`CleanableFailure`, deletes all uncommitted manifests and manifest lists it created (`cleanAll()`, `SnapshotProducer.java:610-616`) then rethrows. `CommitStateUnknownException` is special-cased at `536-537`: it is rethrown with **no cleanup**, because we can't know whether the commit actually landed (per the contract documented at `TableOperations.java:60-73`).\n\n## 6. Winner finishes\n\nAfter the loop, the winner refreshes and loads its snapshot by id (`SnapshotProducer.java:553`) \u2014 loading by id rather than by head, because another commit may have landed meanwhile. It cleans up manifests referenced only by its failed attempts and deletes unused manifest lists (`556-567`), then notifies listeners/reporters (`SnapshotProducer.java:584-596`).\n\n## The compact summary\n\nTwo writers committing simultaneously:\n\n1. Both build independent snapshots + manifest lists against the same base (`SnapshotProducer.java:133, 295`).\n2. Each tries the atomic catalog commit (`SnapshotProducer.java:533`) guarded by the stale-metadata check (`BaseMetastoreTableOperations.java:111-114`), serialized by the backend \u2014 conditional update (JDBC `JdbcTableOperations.java:160`) or atomic rename (Hadoop `HadoopTableOperations.java:161`).\n3. Exactly one wins; the loser gets `CommitFailedException`, which the retry loop retries with exponential backoff (`SnapshotProducer.java:489-496`, `Tasks.java:440-467`), refreshing the base on each retry (`SnapshotProducer.java:477-479`) and rebasing its snapshot on the winner's new head.\n4. After retries are exhausted the loser cleans up its uncommitted files (unless state is unknown) and fails; the winner's snapshot becomes the new table head and retains only the winner's set of manifests.",
+  "finalAssistantRawText": "Both files plus the commit path are read in full. Here's the step-by-step story of two writers committing to the same table concurrently, with citations.\n\n## The players\n\n- `SnapshotProducer.java` (929 lines) \u2014 the generic commit machinery used by every `SnapshotUpdate` (append, overwrite, delete, etc.). I read all of it.\n- `Tasks.java` (`util`) \u2014 the retry framework it funnels commits through. I read all of it.\n- `BaseMetastoreTableOperations.java` \u2014 the `commit` contract and the stale-metadata check; plus its concrete implementations `JdbcTableOperations.java` and `HadoopTableOperations.java` for the actual atomic step.\n\n## 1. Both writers set up on the same base\n\nEach writer's `SnapshotProducer` constructor captures the current table metadata once: `this.base = ops.current()` (`SnapshotProducer.java:133`). So both writers see the same table state (say a single snapshot `S1`). This is fine \u2014 Iceberg is optimistic, not locking.\n\n`commit()` is the entry point (`SnapshotProducer.java:484`). Each commit attempt goes through `apply()` (`SnapshotProducer.java:295`), which calls `refresh()` (`SnapshotProducer.java:296`, implemented at `477-479`) to pick up any concurrently-committed changes, then computes everything *of its own*: a fresh snapshot id, the new manifest list, all its data/deletes, and the snapshot summary. Crucially, **all of this occurs before the atomic catalog step** \u2014 the two writers independently write their own manifest files and manifest lists to object storage. Those files are *uncommitted* at this point, so they don't affect readers or each other.\n\nEach attempt writes a uniquely-named manifest list: `commitUUID` is generated once in the constructor (`SnapshotProducer.java:104`), and the filename embeds `snap-{snapshotId}-{attempt}-{commitUUID}` (`SnapshotProducer.java:619-631`, `attempt.incrementAndGet()` at `632`). So retries never collide on files.\n\n## 2. The retry loop\n\n`commit()` wraps the actual commit in a `Tasks.foreach(ops)` loop (`SnapshotProducer.java:489`) configured with:\n- `.retry(COMMIT_NUM_RETRIES, ...)` \u2014 default 4 retries (`SnapshotProducer.java:490`, constants at `36-39`)\n- `.exponentialBackoff(min, max, total, 2.0)` (`SnapshotProducer.java:491-494`)\n- `.onlyRetryOn(CommitFailedException.class)` (`SnapshotProducer.java:496`) \u2014 only stale-commit conflicts are retried\n\nInside the loop (`SnapshotProducer.java:498`) it calls `apply()` again, then builds the new `TableMetadata` from `base`: if the new snapshot id already exists in base it's a rollback branch (`503-505`), otherwise it advances the branch head or adds a staged snapshot (`512-515`). If nothing actually changed it skips the atomic commit (`520-521`), and finally:\n\n```java\ntaskOps.commit(base, updated.withUUID());   // SnapshotProducer.java:533\n```\n\nThis is the atomic step, delegated to the catalog.\n\n## 3. The atomic step decides the winner\n\nThe optimistic-concurrency check is in `BaseMetastoreTableOperations.commit` (`BaseMetastoreTableOperations.java:109-127`):\n\n```java\nif (base != current()) {                       // :111\n  if (base != null) {\n    throw new CommitFailedException(\"Cannot commit: stale table metadata\");  // :113\n  } else {\n    throw new AlreadyExistsException(...);     // :116\n  }\n}\n...\ndoCommit(base, metadata);                      // :127\n```\n\n`base` is the metadata this writer started from; `current()` is what the catalog now holds, live. Two writers may pass this check simultaneously if they both loaded before either committed \u2014 the real serialization happens in `doCommit` against the catalog backend:\n\n- **JDBC:** `JdbcTableOperations.doCommit` (`JdbcTableOperations.java:103`) first re-validates that the catalog row still points at the writer's base metadata (`validateMetadataLocation`, `JdbcTableOperations.java:200-211`, throwing `CommitFailedException` at `205` if changed), then does a conditional `UPDATE` where the metadata location must match the old one (`updateTable`, `146-163`; the check `` updatedRecords == 1 `` and `CommitFailedException` at `160-162`). Whichever writer's `UPDATE` happens first wins; the loser's `UPDATE` matches 0 rows \u2192 `CommitFailedException`.\n- **Hadoop (without catalog):** `HadoopTableOperations.commit` (`HadoopTableOperations.java:131`) re-checks staleness itself (`135-137`), writes a temp metadata file, then performs the atomic operation \u2014 an atomic rename to the next versioned metadata file (`renameToFinal`, `161-162`; on failure throws `CommitFailedException` at `381`/`390`).\n\nSo the loser is *rejected*, not corrupted: the winner's metadata file/pointer stands, the loser's metadata never becomes current.\n\n## 4. The loser retries on top of the winner\n\nThe loser's `CommitFailedException` propagates back up into `Tasks.runTaskWithRetry` (`Tasks.java:406`, invoked single-threaded via the loop at `SnapshotProducer.java:498`). `runTaskWithRetry`:\n\n- increments the attempt counter (`Tasks.java:412`)\n- checks the retry policy: because `onlyRetryExceptions` is set, it retries only when the exception *is* a `CommitFailedException` (`Tasks.java:440-448`); anything else (or `CommitStateUnknownException`) is thrown immediately\n- computes an exponential backoff delay `minSleep * scaleFactor^(attempt-1)`, capped, with random jitter (`Tasks.java:452-460`), then sleeps (`Tasks.java:462-467`)\n- stops if `attempt >= maxAttempts` or the total retry window elapsed (`Tasks.java:428-433`)\n\nOn the next pass of the loop, `apply()` runs again (`SnapshotProducer.java:498`) and the first thing it does is `refresh()` (`SnapshotProducer.java:477-479`, called from `296`) \u2014 which reloads the metadata from the catalog, now seeing the winner's snapshot `S2`. So the loser rebuilds its snapshot with `S2` as its parent, on top of the winner's manifests. This is the \"append-only, linearizable history\" behavior of Iceberg: concurrent writers don't interleave, they retry and rebase.\n\nNote the snapshot id is not reused: on retry `apply()` re-runs and a fresh snapshot id is generated (guarded in `snapshotId()`, `SnapshotProducer.java:~662-672`), so each attempt is a distinct, uniquely-named snapshot/manifest list.\n\n## 5. Giving up and failure handling\n\nIf conflicts outlast the retry budget, `runTaskWithRetry` rethrows (`Tasks.java:428-433`), `SnapshotProducer.commit()` catches the `RuntimeException` (`SnapshotProducer.java:538`) and, unless strict cleanup is in effect or it's a non-`CleanableFailure`, deletes all uncommitted manifests and manifest lists it created (`cleanAll()`, `SnapshotProducer.java:610-616`) then rethrows. `CommitStateUnknownException` is special-cased at `536-537`: it is rethrown with **no cleanup**, because we can't know whether the commit actually landed (per the contract documented at `TableOperations.java:60-73`).\n\n## 6. Winner finishes\n\nAfter the loop, the winner refreshes and loads its snapshot by id (`SnapshotProducer.java:553`) \u2014 loading by id rather than by head, because another commit may have landed meanwhile. It cleans up manifests referenced only by its failed attempts and deletes unused manifest lists (`556-567`), then notifies listeners/reporters (`SnapshotProducer.java:584-596`).\n\n## The compact summary\n\nTwo writers committing simultaneously:\n\n1. Both build independent snapshots + manifest lists against the same base (`SnapshotProducer.java:133, 295`).\n2. Each tries the atomic catalog commit (`SnapshotProducer.java:533`) guarded by the stale-metadata check (`BaseMetastoreTableOperations.java:111-114`), serialized by the backend \u2014 conditional update (JDBC `JdbcTableOperations.java:160`) or atomic rename (Hadoop `HadoopTableOperations.java:161`).\n3. Exactly one wins; the loser gets `CommitFailedException`, which the retry loop retries with exponential backoff (`SnapshotProducer.java:489-496`, `Tasks.java:440-467`), refreshing the base on each retry (`SnapshotProducer.java:477-479`) and rebasing its snapshot on the winner's new head.\n4. After retries are exhausted the loser cleans up its uncommitted files (unless state is unknown) and fails; the winner's snapshot becomes the new table head and retains only the winner's set of manifests.",
+  "replayInvalid": true,
+  "livenessState": "working",
+  "stopReason": "stop",
+  "executionTrace": {
+   "winnerProvider": "vllm",
+   "winnerModel": "dsv4flash",
+   "attempts": [
+    {
+     "provider": "vllm",
+     "model": "dsv4flash",
+     "result": "success",
+     "stage": "assistant"
+    }
+   ],
+   "fallbackUsed": false,
+   "runner": "embedded"
+  },
+  "requestShaping": {
+   "thinking": "off"
+  },
+  "completion": {
+   "stopReason": "stop",
+   "finishReason": "stop"
+  },
+  "toolSummary": {
+   "calls": 23,
+   "tools": [
+    "exec",
+    "read"
+   ],
+   "failures": 14,
+   "unresolvedError": {
+    "toolName": "exec"
+   }
+  },
+  "terminalReply": {
+   "disposition": "visible",
+   "text": "Both files plus the commit path are read in full. Here's the step-by-step story of two writers committing to the same table concurrently, with citations.\n\n## The players\n\n- `SnapshotProducer.java` (929 lines) \u2014 the generic commit machinery used by every `SnapshotUpdate` (append, overwrite, delete, etc.). I read all of it.\n- `Tasks.java` (`util`) \u2014 the retry framework it funnels commits through. I read all of it.\n- `BaseMetastoreTableOperations.java` \u2014 the `commit` contract and the stale-metadata check; plus its concrete implementations `JdbcTableOperations.java` and `HadoopTableOperations.java` for the actual atomic step.\n\n## 1. Both writers set up on the same base\n\nEach writer's `SnapshotProducer` constructor captures the current table metadata once: `this.base = ops.current()` (`SnapshotProducer.java:133`). So both writers see the same table state (say a single snapshot `S1`). This is fine \u2014 Iceberg is optimistic, not locking.\n\n`commit()` is the entry point (`SnapshotProducer.java:484`). Each commit attempt goes through `apply()` (`SnapshotProducer.java:295`), which calls `refresh()` (`SnapshotProducer.java:296`, implemented at `477-479`) to pick up any concurrently-committed changes, then computes everything *of its own*: a fresh snapshot id, the new manifest list, all its data/deletes, and the snapshot summary. Crucially, **all of this occurs before the atomic catalog step** \u2014 the two writers independently write their own manifest files and manifest lists to object storage. Those files are *uncommitted* at this point, so they don't affect readers or each other.\n\nEach attempt writes a uniquely-named manifest list: `commitUUID` is generated once in the constructor (`SnapshotProducer.java:104`), and the filename embeds `snap-{snapshotId}-{attempt}-{commitUUID}` (`SnapshotProducer.java:619-631`, `attempt.incrementAndGet()` at `632`). So retries never collide on files.\n\n## 2. The retry loop\n\n`commit()` wraps the actual commit in a `Tasks.foreach(ops)` loop (`SnapshotProducer.java:489`) configured with:\n- `.retry(COMMIT_NUM_RETRIES, ...)` \u2014 default 4 retries (`SnapshotProducer.java:490`, constants at `36-39`)\n- `.exponentialBackoff(min, max, total, 2.0)` (`SnapshotProducer.java:491-494`)\n- `.onlyRetryOn(CommitFailedException.class)` (`SnapshotProducer.java:496`) \u2014 only stale-commit conflicts are retried\n\nInside the loop (`SnapshotProducer.java:498`) it calls `apply()` again, then builds the new `TableMetadata` from `base`: if the new snapshot id already exists in base it's a rollback branch (`503-505`), otherwise it advances the branch head or adds a staged snapshot (`512-515`). If nothing actually changed it skips the atomic commit (`520-521`), and finally:\n\n```java\ntaskOps.commit(base, updated.withUUID());   // SnapshotProducer.java:533\n```\n\nThis is the atomic step, delegated to the catalog.\n\n## 3. The atomic step decides the winner\n\nThe optimistic-concurrency check is in `BaseMetastoreTableOperations.commit` (`BaseMetastoreTableOperations.java:109-127`):\n\n```java\nif (base != current()) {                       // :111\n  if (base != null) {\n    throw new CommitFailedException(\"Cannot commit: stale table metadata\");  // :113\n  } else {\n    throw new AlreadyExistsException(...);     // :116\n  }\n}\n...\ndoCommit(base, metadata);                      // :127\n```\n\n`base` is the metadata this writer started from; `current()` is what the catalog now holds, live. Two writers may pass this check simultaneously if they both loaded before either committed \u2014 the real serialization happens in `doCommit` against the catalog backend:\n\n- **JDBC:** `JdbcTableOperations.doCommit` (`JdbcTableOperations.java:103`) first re-validates that the catalog row still points at the writer's base metadata (`validateMetadataLocation`, `JdbcTableOperations.java:200-211`, throwing `CommitFailedException` at `205` if changed), then does a conditional `UPDATE` where the metadata location must match the old one (`updateTable`, `146-163`; the check `` updatedRecords == 1 `` and `CommitFailedException` at `160-162`). Whichever writer's `UPDATE` happens first w\u2026"
+  }
+ },
+ "answer": "Both files plus the commit path are read in full. Here's the step-by-step story of two writers committing to the same table concurrently, with citations.\n\n## The players\n\n- `SnapshotProducer.java` (929 lines) \u2014 the generic commit machinery used by every `SnapshotUpdate` (append, overwrite, delete, etc.). I read all of it.\n- `Tasks.java` (`util`) \u2014 the retry framework it funnels commits through. I read all of it.\n- `BaseMetastoreTableOperations.java` \u2014 the `commit` contract and the stale-metadata check; plus its concrete implementations `JdbcTableOperations.java` and `HadoopTableOperations.java` for the actual atomic step.\n\n## 1. Both writers set up on the same base\n\nEach writer's `SnapshotProducer` constructor captures the current table metadata once: `this.base = ops.current()` (`SnapshotProducer.java:133`). So both writers see the same table state (say a single snapshot `S1`). This is fine \u2014 Iceberg is optimistic, not locking.\n\n`commit()` is the entry point (`SnapshotProducer.java:484`). Each commit attempt goes through `apply()` (`SnapshotProducer.java:295`), which calls `refresh()` (`SnapshotProducer.java:296`, implemented at `477-479`) to pick up any concurrently-committed changes, then computes everything *of its own*: a fresh snapshot id, the new manifest list, all its data/deletes, and the snapshot summary. Crucially, **all of this occurs before the atomic catalog step** \u2014 the two writers independently write their own manifest files and manifest lists to object storage. Those files are *uncommitted* at this point, so they don't affect readers or each other.\n\nEach attempt writes a uniquely-named manifest list: `commitUUID` is generated once in the constructor (`SnapshotProducer.java:104`), and the filename embeds `snap-{snapshotId}-{attempt}-{commitUUID}` (`SnapshotProducer.java:619-631`, `attempt.incrementAndGet()` at `632`). So retries never collide on files.\n\n## 2. The retry loop\n\n`commit()` wraps the actual commit in a `Tasks.foreach(ops)` loop (`SnapshotProducer.java:489`) configured with:\n- `.retry(COMMIT_NUM_RETRIES, ...)` \u2014 default 4 retries (`SnapshotProducer.java:490`, constants at `36-39`)\n- `.exponentialBackoff(min, max, total, 2.0)` (`SnapshotProducer.java:491-494`)\n- `.onlyRetryOn(CommitFailedException.class)` (`SnapshotProducer.java:496`) \u2014 only stale-commit conflicts are retried\n\nInside the loop (`SnapshotProducer.java:498`) it calls `apply()` again, then builds the new `TableMetadata` from `base`: if the new snapshot id already exists in base it's a rollback branch (`503-505`), otherwise it advances the branch head or adds a staged snapshot (`512-515`). If nothing actually changed it skips the atomic commit (`520-521`), and finally:\n\n```java\ntaskOps.commit(base, updated.withUUID());   // SnapshotProducer.java:533\n```\n\nThis is the atomic step, delegated to the catalog.\n\n## 3. The atomic step decides the winner\n\nThe optimistic-concurrency check is in `BaseMetastoreTableOperations.commit` (`BaseMetastoreTableOperations.java:109-127`):\n\n```java\nif (base != current()) {                       // :111\n  if (base != null) {\n    throw new CommitFailedException(\"Cannot commit: stale table metadata\");  // :113\n  } else {\n    throw new AlreadyExistsException(...);     // :116\n  }\n}\n...\ndoCommit(base, metadata);                      // :127\n```\n\n`base` is the metadata this writer started from; `current()` is what the catalog now holds, live. Two writers may pass this check simultaneously if they both loaded before either committed \u2014 the real serialization happens in `doCommit` against the catalog backend:\n\n- **JDBC:** `JdbcTableOperations.doCommit` (`JdbcTableOperations.java:103`) first re-validates that the catalog row still points at the writer's base metadata (`validateMetadataLocation`, `JdbcTableOperations.java:200-211`, throwing `CommitFailedException` at `205` if changed), then does a conditional `UPDATE` where the metadata location must match the old one (`updateTable`, `146-163`; the check `` updatedRecords == 1 `` and `CommitFailedException` at `160-162`). Whichever writer's `UPDATE` happens first wins; the loser's `UPDATE` matches 0 rows \u2192 `CommitFailedException`.\n- **Hadoop (without catalog):** `HadoopTableOperations.commit` (`HadoopTableOperations.java:131`) re-checks staleness itself (`135-137`), writes a temp metadata file, then performs the atomic operation \u2014 an atomic rename to the next versioned metadata file (`renameToFinal`, `161-162`; on failure throws `CommitFailedException` at `381`/`390`).\n\nSo the loser is *rejected*, not corrupted: the winner's metadata file/pointer stands, the loser's metadata never becomes current.\n\n## 4. The loser retries on top of the winner\n\nThe loser's `CommitFailedException` propagates back up into `Tasks.runTaskWithRetry` (`Tasks.java:406`, invoked single-threaded via the loop at `SnapshotProducer.java:498`). `runTaskWithRetry`:\n\n- increments the attempt counter (`Tasks.java:412`)\n- checks the retry policy: because `onlyRetryExceptions` is set, it retries only when the exception *is* a `CommitFailedException` (`Tasks.java:440-448`); anything else (or `CommitStateUnknownException`) is thrown immediately\n- computes an exponential backoff delay `minSleep * scaleFactor^(attempt-1)`, capped, with random jitter (`Tasks.java:452-460`), then sleeps (`Tasks.java:462-467`)\n- stops if `attempt >= maxAttempts` or the total retry window elapsed (`Tasks.java:428-433`)\n\nOn the next pass of the loop, `apply()` runs again (`SnapshotProducer.java:498`) and the first thing it does is `refresh()` (`SnapshotProducer.java:477-479`, called from `296`) \u2014 which reloads the metadata from the catalog, now seeing the winner's snapshot `S2`. So the loser rebuilds its snapshot with `S2` as its parent, on top of the winner's manifests. This is the \"append-only, linearizable history\" behavior of Iceberg: concurrent writers don't interleave, they retry and rebase.\n\nNote the snapshot id is not reused: on retry `apply()` re-runs and a fresh snapshot id is generated (guarded in `snapshotId()`, `SnapshotProducer.java:~662-672`), so each attempt is a distinct, uniquely-named snapshot/manifest list.\n\n## 5. Giving up and failure handling\n\nIf conflicts outlast the retry budget, `runTaskWithRetry` rethrows (`Tasks.java:428-433`), `SnapshotProducer.commit()` catches the `RuntimeException` (`SnapshotProducer.java:538`) and, unless strict cleanup is in effect or it's a non-`CleanableFailure`, deletes all uncommitted manifests and manifest lists it created (`cleanAll()`, `SnapshotProducer.java:610-616`) then rethrows. `CommitStateUnknownException` is special-cased at `536-537`: it is rethrown with **no cleanup**, because we can't know whether the commit actually landed (per the contract documented at `TableOperations.java:60-73`).\n\n## 6. Winner finishes\n\nAfter the loop, the winner refreshes and loads its snapshot by id (`SnapshotProducer.java:553`) \u2014 loading by id rather than by head, because another commit may have landed meanwhile. It cleans up manifests referenced only by its failed attempts and deletes unused manifest lists (`556-567`), then notifies listeners/reporters (`SnapshotProducer.java:584-596`).\n\n## The compact summary\n\nTwo writers committing simultaneously:\n\n1. Both build independent snapshots + manifest lists against the same base (`SnapshotProducer.java:133, 295`).\n2. Each tries the atomic catalog commit (`SnapshotProducer.java:533`) guarded by the stale-metadata check (`BaseMetastoreTableOperations.java:111-114`), serialized by the backend \u2014 conditional update (JDBC `JdbcTableOperations.java:160`) or atomic rename (Hadoop `HadoopTableOperations.java:161`).\n3. Exactly one wins; the loser gets `CommitFailedException`, which the retry loop retries with exponential backoff (`SnapshotProducer.java:489-496`, `Tasks.java:440-467`), refreshing the base on each retry (`SnapshotProducer.java:477-479`) and rebasing its snapshot on the winner's new head.\n4. After retries are exhausted the loser cleans up its uncommitted files (unless state is unknown) and fails; the winner's snapshot becomes the new table head and retains only the winner's set of manifests.",
+ "error": null
+}

@@ -1,0 +1,51 @@
+I read `MetricsUtil.java` in full plus the column-metrics code it calls: `Conversions.java` (bound serialization), `MetricsConfig.java` + `MetricsModes.java` (which metrics to persist), `FieldMetrics.java`, and `Metrics.java`. Here's how the implementation follows the spec, with file:line citations.
+
+## Where the spec's metric fields live
+
+The `Metrics` class (api/src/main/java/org/apache/iceberg/Metrics.java:35-43) is the in-memory mirror of the spec's `data_file` metric maps. Each field maps 1:1 to a spec field id:
+
+- `columnSizes` -> spec `column_sizes` (108)
+- `valueCounts` -> spec `value_counts` (109), "including nulls, NaN" per the Javadoc at Metrics.java:62
+- `nullValueCounts` -> `null_value_counts` (110)
+- `nanValueCounts` -> `nan_value_counts` (137), documented float/double-only at Metrics.java:107-109
+- `lowerBounds` / `upperBounds` -> `lower_bounds`/`upper_bounds` (125/128), as `Map<Integer, ByteBuffer>` (Metrics.java:39-40) — the spec stores bounds "serialized as binary" (spec.md:735-736)
+
+Two fields are implementation extensions beyond the spec maps: `avgValueSizes` (column_sizes-derived, Metrics.java:41) and `originalTypes` (Metrics.java:43, explicitly "not serialized") — the spec has no avg value size or per-field type; those are engine conveniences.
+
+## "Missing metric = unknown" -> the drop functions
+
+The spec says all metrics are optional and a missing value means "don't prune". `MetricsUtil.copyWithoutFieldCounts` (MetricsUtil.java:51-62) and `copyWithoutFieldCountsAndBounds` (:71-83) implement that escape hatch — the core mechanism for the metrics config modes. They rebuild a `Metrics` object dropping count/bound entries for selected field ids. The helper `copyWithoutKeys` (:85-97) returns null when the map becomes empty (:96), exactly matching the spec's "omitted / null" representation rather than writing an empty map.
+
+## The NaN case
+
+`createNanValueCounts` (MetricsUtil.java:103-117) populates NaN counts from `FieldMetrics` only where allowed: it drops nested leaf columns inside maps/lists via `inMapOrList` (:119-128) and honors `metricsConfig.columnMode(id) != None` (:115). This lines up with the spec's rule that `nan_value_counts` is only for float/double columns (spec.md:733, 829) — the mode gating is the writer's way of choosing whether to write it at all.
+
+## Bound encoding follows Appendix D, including type promotion
+
+`Conversions.toByteBuffer` (api/src/main/java/org/apache/iceberg/types/Conversions.java:86-147) implements the spec's "Binary single-value serialization" (Appendix D, spec.md:1827-1855) exactly:
+
+- int/date -> 4-byte little-endian (Conversions.java:98-100; spec.md:1835, 1839)
+- long/time/timestamp/timestamp_ns -> 8-byte little-endian (:101-105)
+- float/double -> 4/8-byte little-endian (:106-109)
+- string -> UTF-8 bytes (:110-116; spec.md:1845)
+- decimal -> unscaled two's-complement big-endian (:122-123; spec.md:1849)
+- geometry/geography -> bounding-box point (:135-140), matching the spec's bound serialization note (spec.md:1863-1864)
+- variant -> concatenated metadata+value (:124-134; spec.md:1865)
+
+The promotion heuristic is the direct implementation of the spec's "LENGTH OF BOUNDS -> INFERRED TYPE AT WRITE TIME" table (spec.md:367-379). `fromByteBuffer` (Conversions.java:154-215) decodes `LONG`/`TIMESTAMP`/etc. by inspecting remaining bytes: `if (tmp.remaining() < 8) return (long) tmp.getInt();` (:175-178) — a 4-byte bound is decoded as the promoted-from `int`; same for double/float (:182-187). This is precisely the "4 bytes = written as int/float/date, 8 bytes = long/double/timestamp" rule.
+
+## Metrics config: the layer that decides what's optional
+
+`MetricsConfig` builds the modes (none/counts/truncate/full) that decide which optional fields get written. `MetricsModes.fromString` (MetricsModes.java:39-55) parses `none`/`counts`/`full`/`truncate(N)`; `Full.hasBounds()` returns true, `Counts`/`None` false (MetricsModes.java:81-82, 100-101, 127-128, 169-170). `MetricsConfig.from` (MetricsConfig.java:263-302) assembles per-column modes: default mode, sort columns promoted to `truncate(16)` (:394-402), user overrides via `write.metadata.metrics.column.*` (:337-350), and force-full for partition source columns (:352-368). `columnMode(int)` (:129-137) resolves by field id. This whole axis is the spec's "optional" escape hole: the spec doesn't mandate a particular mode set, but the config governs which of the optional metric maps are actually persisted — always preserving the spec invariant that a dropped metric means "unknown, don't prune" rather than an incorrect value.
+
+## Readable metrics (metadata-table projection)
+
+`READABLE_METRIC_COLS` (MetricsUtil.java:144-197) re-exposes raw metrics as typed columns. Notably, lower/upper bound values are decoded with `Conversions.fromByteBuffer(field.type(), ...)` (:186-187, 196-197) — the same spec-bound decoding above. It only surfaces metrics for primitive columns (`field.type().isPrimitiveType()`, :421; and `MetricsConfig.limitFieldIds` restricts to primitive/variant, MetricsConfig.java:172-174), matching the spec's statement that these stats apply to column values. `readableMetricsSchema` (:360-397) and `readableMetricsStruct` (:407-433) build the schema/value projection. `metricsMode` (:135-142) is deprecated and now just delegates to `MetricsConfig.columnMode` — a per spec, no behavior of its own.
+
+## FieldMetrics: the per-field carrier
+
+`FieldMetrics` (core/src/main/java/org/apache/iceberg/FieldMetrics.java:24-32) carries `valueCount`/`nullValueCount`/`nanValueCount`/`lowerBound`/`upperBound`/`originalType` per field id — the typed input that `createNanValueCounts` consumes and that file writers ultimately funnel into the `Metrics` maps. `originalType` (FieldMetrics.java:31, :88) exists specifically to carry the "type at write time" needed for correct bound decoding after promotion.
+
+## Summary of alignment
+
+The implementation is faithful to the spec's design in three concrete ways: (1) the `Metrics`/`MetricsConfig` layer treats every metric as optional and encodes "dropped" as null/omitted — the spec's "unknown = don't prune" rule; (2) bound serialization in `Conversions` implements Appendix D bit-for-bit, including the byte-length type-promotion inference annotated in the spec; and (3) the drop/NaN/logic in `MetricsUtil` preserves the spec's accuracy contract (bounds enclose real non-null, non-NaN values), so pruning never excludes a file that could match. The only things in the code with no spec counterpart (`avgValueSizes`, `originalTypes`, readable-metrics projection) are engine conveniences layered on top, not changes to the on-disk format.

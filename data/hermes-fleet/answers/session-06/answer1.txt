@@ -1,0 +1,35 @@
+I read the full spec (format/spec.md, 2153 lines). Here's what it says about transactions and the reasoning behind the design.
+
+## What the spec says about transactions
+
+The spec's transaction model is built on three ideas, all under the "Optimistic Concurrency" and "Commit Conflict Resolution and Retry" sections:
+
+1. Serializable isolation. Reads always see a committed snapshot and never take locks. A write adds and removes files in a single atomic operation and is never partially visible. This is the stated goal in the "Goals" section.
+
+2. Atomic metadata swap. Table state lives in metadata files. Every change creates a brand-new metadata file and atomically swaps a pointer from the base version to the new one. There is no in-place mutation of table state — you always write the new state elsewhere and commit by swapping the pointer. The spec deliberately does not standardize how the swap happens; it gives two options:
+   - File-system tables: atomic rename of a unique file to a versioned name. This section is explicitly marked deprecated and removed in v4 because it's unsafe on object stores and local FS.
+   - Metastore tables: a check-and-put / CAS on a pointer held in a catalog or database, which validates the base version is still current before making the new metadata current.
+
+3. Optimistic concurrency with retry. A writer snapshots the current metadata, builds its update optimistically, and commits. If the base version is no longer current at commit time, the write fails and must be retried against the new version. Crucially, the spec defines exactly which operations can be re-applied safely:
+   - Appends always can (no preconditions).
+   - Replaces (compaction, format change) must verify the files being deleted are still in the table.
+   - Deletes must verify the specific files are still present (unless expression-based, e.g. "where ts < X", which can always re-apply).
+   - Schema/partition changes must validate the schema didn't change between base and current.
+
+Sequence numbers underpin this. Every successful commit gets a monotonically increasing sequence number; a snapshot is optimistically assigned the next one, and reassigned on retry. Sequence numbers are what let concurrent writers reason about ordering and what makes row-level delete/replace logic safe across retries — they track the relative age of files.
+
+Why it's designed this way — this is the key part. The design is a direct consequence of the stated Goals and the "Scale"/"Speed" goals. The intent is:
+
+- No locks and no central transaction coordinator. Readers never block or block writers. Commits are conflict-detected (CAS / compare-and-swap) rather than conflict-prevented (locking). That's what makes Iceberg work on object stores like S3, where there is no lock service, and what makes job planning scale by being pushed to clients rather than bottlenecking on a metadata store.
+
+- Optimistic concurrency rather than pessimistic: conflicts are rare in DW workloads (mostly appends to different files), so paying nothing for coordination most of the time, and retrying on the rare collision, is cheaper than holding locks.
+
+- Write-once immutable files. Because files are never modified after being written, an aborted/retried writer leaves no partial state — garbage files, yes, but never a torn table state. Combined with the atomic pointer swap, a commit is all-or-nothing.
+
+- Verification makes retries safe. Rather than trying to support arbitrary re-application, the spec restricts which operations can be blindly retried, and for those that can't (e.g. you deleted a specific file), it requires re-validating the precondition. This is what preserves serializable isolation under concurrency instead of naively "just try again."
+
+- Readers read a snapshot, not "the table." A reader is unaffected by writes until it explicitly refreshes. This gives consistent point-in-time reads for free and is why time travel works.
+
+One nuance worth calling out: it's not the database "transactions" you might imagine — there's no rollback or global ordering, and multi-statement atomic transaction APIs (BEGIN/COMMIT spanning operations) aren't in this spec. "Transaction" here means a single optimistic, atomic commit of metadata via CAS, with defined retry semantics. The concurrency isolation is serializable in effect because each successful commit is applied to the then-current version atomically.
+
+Practical takeaway: the tradeoff is that the writer does the work of conflict handling (retry + verify), and the storage layer only has to provide a compare-and-swap capable pointer — which is exactly what relational catalogs (Hive, Nessie, Glue) and even object stores can provide — rather than demanding a full transactional / locking infrastructure from the backing store. That's the central design bet: move the transaction logic up into the writer and keep the storage contract minimal.

@@ -1,0 +1,60 @@
+I have enough to give a thorough, well-cited explanation. Let me quickly confirm the `currentSnapshot`/`refs` main-branch invariant and the `validateRefs` usage are consistent, which I already have. I now have all pieces.
+
+## How the implementation follows the spec
+
+### 1. The reference record — fields map 1:1 to the spec
+
+`SnapshotRef` (api/.../SnapshotRef.java) models the spec's snapshot-reference object exactly. The spec defines the reference fields as `snapshot-id`, `type`, `min-snapshots-to-keep`, `max-snapshot-age-ms`, `max-ref-age-ms` (format/spec.md:1107-1115). The class holds the equivalent four/five fields:
+
+- `snapshotId` (SnapshotRef.java:30)
+- `type` as a `SnapshotRefType` enum (SnapshotRef.java:31)
+- `minSnapshotsToKeep` (:32)
+- `maxSnapshotAgeMs` (:33)
+- `maxRefAgeMs` (:34)
+
+Serialization confirms the mapping — `SnapshotRefParser` writes exactly those kebab-case keys (SnapshotRefParser.java:32-36, 48-58), matching the spec's JSON keys and its "optional fields only written when present" rule (only `snapshot-id` and `type` are always written; the three retention fields are conditional).
+
+### 2. Branch vs. tag identity
+
+The spec distinguishes the two by a `type` string `tag` or `branch` (spec.md:1103, 1111). The enum captures both (SnapshotRefType.java:24-26) with case-insensitive parsing (`fromString` uses `toUpperCase(Locale.ROOT)`, SnapshotRefType.java:28-36) — consistent with AGENTS.md's Postel's-law guidance. The class exposes `isBranch()`/`isTag()` (SnapshotRef.java:57-63) built on that type.
+
+### 3. Retention fields are branch-only — enforced at the builder
+
+The spec says `min-snapshots-to-keep` and `max-snapshot-age-ms` are "For `branch` type only" and `max-ref-age-ms` applies to "all snapshot references except the `main` branch" (spec.md:1112-1114). `SnapshotRef.Builder` enforces this at construction time:
+
+- `minSnapshotsToKeep` rejects being set on a tag: `Preconditions.checkArgument(value == null || !type.equals(TAG), "Tags do not support setting minSnapshotsToKeep")` (SnapshotRef.java:154-162).
+- `maxSnapshotAgeMs` does the same for tags (SnapshotRef.java:164-172).
+- `maxRefAgeMs` is allowed for any type (SnapshotRef.java:174-179).
+
+So an invalid state (a tag carrying snapshot-retention settings) can't even be constructed — mirroring the spec's rule that those fields only apply to branches.
+
+### 4. `main` is the permanent, special-cased branch
+
+The spec states there is always a `main` branch pointing at `current-snapshot-id` and that it never expires (spec.md:1167, 1114). This is implemented in several coordinated places:
+
+- The constant `MAIN_BRANCH = "main"` (SnapshotRef.java:28).
+- Reflection of parse-time: when no `refs` exist, `TableMetadataParser` synthesizes a `main` branch pointing at `current-snapshot-id` (TableMetadataParser.java:500-506).
+- The invariant `current-snapshot-id == main.snapshotId` is validated in `validateRefs` (TableMetadata.java:879-889), and enforced on mutation in `Builder.setRef`: setting `main` updates `currentSnapshotId` (TableMetadata.java:1335-1336), and `main` can only ever be a branch, never a tag (`setRef` throws "Cannot set main to a tag", :1330-1333).
+- `main` is unforgeable as a tag via the builder too, and `main` never expires: in expiration, `computeRetainedRefs` unconditionally retains `MAIN_BRANCH` and skips the max-ref-age check (RemoveSnapshots.java:283-286), mirroring the spec line "The `main` branch never expires."
+
+### 5. Retention / expiration policy maps to the spec's algorithm
+
+The spec's expiration procedure (spec.md:1124-1132) is implemented nearly line-for-line in `RemoveSnapshots`:
+
+- Step 2 (remove refs older than `max-ref-age-ms`, except main): `computeRetainedRefs` (RemoveSnapshots.java:278-301). It skips `main` (:283), and for every other ref drops it when the referenced snapshot's age exceeds `maxRefAgeMs` (falling back to the table default when the ref has no explicit value, :289-294) — exactly "max-ref-age-ms ... Defaults to table property."
+- Step 3 (add each referenced snapshot to the retained set): handled via `computeAllBranchSnapshotsToRetain`/`computeBranchSnapshotsToRetain` which walks `ancestorsOf` the branch's snapshot (RemoveSnapshots.java:303-333) and `unreferencedSnapshotsToRetain` for tags (each tag adds exactly its one snapshot, :337, 342-344).
+- Step 4 (keep branch ancestors until older than `max-snapshot-age-ms` AND past the first `min-snapshots-to-keep`): `computeBranchSnapshotsToRetain` (RemoveSnapshots.java:320-333) — it keeps an ancestor while `idsToRetain.size() < minSnapshotsToKeep` OR `ancestor.timestampMillis() >= expireSnapshotsOlderThan`, and stops (returns) once both conditions fail. That is the spec's "older than max age, AND not among the first min-to-keep" cutoff.
+- Branch-only semantics (the `isBranch()` gate at :306 and :338) and "tags only pin their own snapshot, not ancestry" (:342-344) both follow the spec.
+
+### 6. Branch writes reuse the commit machinery; tags are immutable labels
+
+The spec says branches advance by committing a new snapshot as the referenced snapshot using the standard commit-conflict-resolution, while tags just label an existing snapshot (spec.md:1103). Correspondingly:
+
+- The commit path is `TableMetadata.Builder.setBranchSnapshot`/`setRef`, which resolve the new snapshot and go through the normal atomic metadata-swap commit (TableMetadata.java:1298-1318, 1320-1358). Note `setRef` validates the target exists and produces a `MetadataUpdate.SetSnapshotRef` (:1348-1355) — a serializable metadata update, per the spec's requirement that all mutations produce `MetadataUpdate` objects.
+- A tag merely points at an already-existing snapshot; it never rewrites `currentSnapshotId` (only the `main` branch name does, TableMetadata.java:1335), which is how the implementation honors the "tags are labels for individual snapshots" definition.
+
+### 7. Immutable reference objects
+
+The spec treats references as immutable records (they live in the `refs` map). `SnapshotRef` is built once via `Builder` (SnapshotRef.java:36-47, 140-184) with no setters; moving a branch to a new snapshot creates a *new* `SnapshotRef` via `builderFrom(ref, newSnapshotId)` preserving retention properties (SnapshotRef.java:113-134), and `setRef` short-circuits when nothing changed (TableMetadata.java:1321-1324). This matches the spec's model of references as fixed values in a keyed map that get replaced, not mutated.
+
+One nuance worth flagging: the spec distinguishes `max-ref-age-ms` "(For snapshot references except the main branch)" while `min`/`max` are branch-only. The builder allows `maxRefAgeMs` on tags and branches alike, and `main` is excluded only in the expiration pass (RemoveSnapshots.java:283) — a faithful split of the two constraints.

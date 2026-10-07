@@ -1,0 +1,56 @@
+I read `BaseDVFileWriter.java` in full plus the deletion-vector code it drives: `DVFileWriter.java` (the interface), `PositionDeleteIndex.java`, `BitmapPositionDeleteIndex.java`, `RoaringPositionBitmap.java`, `Blob.java` (Puffin blob metadata), and `ContentFileUtil.isFileScoped`. Here's how the implementation maps to the spec.
+
+## Storage of the vector — Puffin `deletion-vector-v1`
+
+The spec says DVs use the `deletion-vector-v1` blob in the Puffin format (spec.md:1379). `close()` writes all accumulated deletes into a single Puffin file (BaseDVFileWriter.java:128-150), and `toBlob()` creates the blob with `StandardBlobTypes.DV_V1` (BaseDVFileWriter.java:201). The blob is written per referenced data file inside one writer (BaseDVFileWriter.java:147, `writer.write(toBlob(positions, path))`), so multiple DVs share one Puffin file — matching "Multiple deletion vectors can be stored in the same file" (spec.md:1385).
+
+The spec requires position deletes to be sorted and encoded by file + position (spec.md:1413), and a DV to "identify deleted rows of a file by encoding deleted positions in a bitmap" (spec.md:1377). The `Blob` declares `inputFields = [row position]` (BaseDVFileWriter.java:202) — the position column — and carries two properties (BaseDVFileWriter.java:207-211):
+- `referenced-data-file` = the data file path — reflecting the spec requirement that DV metadata "must include the referenced data file" (spec.md:1371) and the manifest `referenced_data_file` field (spec.md:755).
+- `cardinality` = `positions.cardinality()` — the number of deleted positions, which the spec stores as the DV's `record_count` ("the cardinality of a deletion vector", spec.md:724/103).
+
+## Blob offsets / direct access
+
+The spec requires the DV blob's `content_offset` and `content_size_in_bytes` to "exactly match the `offset` and `length` stored in the Puffin footer" so a reader can fetch just that blob (spec.md:756, 1385). `write()` captures `BlobMetadata` from Puffin for each path (BaseDVFileWriter.java:186-188), and `createDV()` copies those into the manifest delete file as `.withContentOffset(blobMetadata.offset())` and `.withContentSizeInBytes(blobMetadata.length())` (BaseDVFileWriter.java:177-178). The blob's offset/length come straight from the Puffin footer metadata in the same close, so they are exact by construction.
+
+## Shared Puffin path + per-vector range
+
+The spec says manifests track DVs "individually by the containing file location (`file_path`), starting offset (`content_offset`) and length (`content_size_in_bytes`)" and multiple vectors can share a file (spec.md:1385). `close()` records that all vectors share one path and file size ("DVs share the Puffin path and file size but have different offsets", BaseDVFileWriter.java:152-159) and calls `createDV` per path with each blob's own offset/length (BaseDVFileWriter.java:156-159, 177-178). All are tagged `.ofPositionDeletes()`, `.withFormat(PUFFIN)`, and `.withReferencedDataFile(...)` (BaseDVFileWriter.java:170-176).
+
+## One DV per data file / merging previous deletes
+
+The spec mandates at most one DV per data file and that writers "must merge new deletes with existing vectors or position delete files" (spec.md:1366, 1387, 1951-1952). `BaseDVFileWriter.delete(...)` keys state by data-file path in a `deletesByPath` map (BaseDVFileWriter.java:62, 90-105), so each path yields exactly one `Deletes`/one DV in the result. On close, it loads previous deletes for that path and merges them into the new positions (`loadPreviousDeletes.apply(path)`, then `positions.merge(previousPositions)`; BaseDVFileWriter.java:137-139). This is the sync-merge rule: the new vector absorbs prior position deletes/older vectors so a reader can ignore matching position delete files once a DV exists (spec.md:1387).
+
+The merge is implemented in `BitmapPositionDeleteIndex.merge` via the Roaring bitmap union `bitmap.setAll(that.bitmap)` (BitmapPositionDeleteIndex.java:61-64). The writer also tracks the superseded delete files for rewrite: only "DVs and file-scoped deletes can be discarded from the table state" (BaseDVFileWriter.java:141-144), gated on `ContentFileUtil.isFileScoped` = having a `referenced_data_file` (ContentFileUtil.java:138-140). This matches the spec's note that file-scoped position delete files can be replaced once folded into a DV, while multi-file position delete files must be kept until fully superseded (spec.md:1956).
+
+## Referenced data file set in the result
+
+`close()` accumulates every referenced data-file path into a `CharSequenceSet` (`referencedDataFiles.add(path)`, BaseDVFileWriter.java:148) and returns it in `DeleteWriteResult` (BaseDVFileWriter.java:161). This is the metadata needed to apply the scan-scope rule that a DV only applies to the data file whose `file_path` equals the DV's `referenced_data_file` (spec.md:1075-1078), and to enforce one-vector-per-file.
+
+## Bitmap encoding — 64-bit positions over 32-bit Roaring bitmaps
+
+The spec describes DVs as supporting positive 64-bit positions but optimized for 32-bit via a collection of 32-bit Roaring bitmaps, splitting a position into a high-4-byte "key" and low-4-byte sub-position, with a bitmap per key (spec.md:1381-1383). `RoaringPositionBitmap` implements exactly this:
+- It is "a bitmap that supports positive 64-bit positions … optimized for cases where most positions fit in 32 bits by using an array of 32-bit Roaring bitmaps" (RoaringPositionBitmap.java:34-40).
+- `set()` splits a position: `key = high 32 bits`, `pos32Bits = low 32 bits`, indexes a per-key `RoaringBitmap` (RoaringPositionBitmap.java:74-80); `contains()` looks up the key's bitmap and tests the sub-position, returning false if no bitmap exists for that key (RoaringPositionBitmap.java:143-148) — the "if a bitmap is not found for the key, then it is not set" behavior.
+- Keys are allocated lazily as the largest position grows (`allocateBitmapsIfNeeded`, RoaringPositionBitmap.java:237-250), and positions are validated to be >= 0 and <= `MAX_POSITION` (RoaringPositionBitmap.java:421-427), i.e. positive 64-bit positions whose key fits, as the spec requires "positive 64-bit positions" (spec.md:1381).
+
+The on-disk bytes use the portable Roaring wire format: the outer `BitmapPositionDeleteIndex.serialize()` writes little-endian bitmap data wrapped with a length, a magic number, and a CRC-32 checksum (BitmapPositionDeleteIndex.java:116-142), and `deserialize()` validates the CRC, magic, bitmap-data length against `contentSizeInBytes`, and cardinality against `recordCount` (BitmapPositionDeleteIndex.java:151-221). `serializedSizeInBytes()`/`serialize()` emit the count of 32-bit bitmaps plus, per key (ordered), the key and the standard serialized Roaring bitmap (RoaringPositionBitmap.java:257-289) — matching the "collection of 32-bit Roaring bitmaps" semantics the spec describes.
+
+## Space optimization
+
+The spec's compaction motivation is that a DV is "more efficient at execution time than position delete files" (spec.md:1366). `close()` periodically space-optimizes by run-length encoding before serializing (`bitmap.runLengthEncode()`, BaseDVFileWriter.java:131), which the bitmap implements as `bitmap.runOptimize()` on each 32-bit Roaring bitmap (RoaringPositionBitmap.java:177-183) — the same approach that keeps sparse deletes compact in the portable Roaring format.
+
+## Where snapshot/sequence identity is deferred
+
+The spec defers the snapshot ID and sequence number to inheritance (spec.md:932-937). `toBlob()` passes `-1` for both with the comment "snapshot ID is inherited" / "sequence number is inherited" (BaseDVFileWriter.java:203-204). The blob carries no absolute snapshot identity; that's filled in downstream when the manifest/delete entry is tied to a committed snapshot — consistent with the spec's design of writing files before the optimistic commit's sequence number is known.
+
+## Net correspondence
+
+- DV blob type + Puffin container: BaseDVFileWriter.java:201, 128-150 ↔ spec.md:1379, 1385.
+- Direct blob access via offset/length: BaseDVFileWriter.java:177-178, 186-188 ↔ spec.md:756, 1385.
+- One DV per data file, shared path, per-vector range: BaseDVFileWriter.java:156-159, 62 ↔ spec.md:1366, 1385.
+- Merging prior deletes / superseding position delete files: BaseDVFileWriter.java:137-145, ContentFileUtil.java:138-140 ↔ spec.md:1366, 1387, 1951-1956.
+- 32-bit-keyed Roaring split of 64-bit positions: RoaringPositionBitmap.java:34-48, 74-80, 143-148, 359-372 ↔ spec.md:1381-1383.
+- Referenced data file / cardinality metadata: BaseDVFileWriter.java:207-211, 179 ↔ spec.md:1371, 724.
+- Inherited snapshot/sequence: BaseDVFileWriter.java:203-204 ↔ spec.md:932-937.
+
+One thing to flag: the spec divorces DV blobs from Iceberg "data files" (a DV lives in a Puffin blob, not a columnar data file), and this writer reflects that — there's no row/projection machinery; a vector is just a serialized position bitmap in a blob, which is precisely the "more efficient at execution time" property the spec cites.

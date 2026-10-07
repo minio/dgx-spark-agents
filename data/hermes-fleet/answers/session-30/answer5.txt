@@ -1,0 +1,23 @@
+Ten bullets for a new contributor, each with the first thing to read (file:line):
+
+1. **The core model — metadata is immutable, commits are an atomic pointer swap.** Table state lives in versioned JSON metadata files; every change writes a new file and swaps the pointer. Read `format/spec.md:85` and `format/spec.md:1134-1138`.
+
+2. **Concurrency is optimistic, not locked.** Writers build against the base they read, commit by swapping the pointer from base → new; on conflict they retry against the fresh current version. This is the serializable-isolation basis. Read `format/spec.md:91-99` and the retry conditions at `format/spec.md:1312-1319`.
+
+3. **The catalog pointer mechanism is deliberately not standardized.** The spec gives two options — deprecated file-system rename and metastore check-and-put — and leaves the swap to each catalog. Read `format/spec.md:1321-1354`.
+
+4. **The abstract skeleton every catalog extends** — `BaseMetastoreTableOperations`. It implements refresh, stale-base rejection, and the write-new-file-then-swap flow; concrete catalogs fill in `doRefresh`/`doCommit`. Read `core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java:108-139`.
+
+5. **The check-and-set swap in a real catalog (JDBC).** The `UPDATE`'s WHERE clause pins the old `metadata_location`, so the base-version check and the pointer move are one atomic statement; 0 rows changed ⇒ `CommitFailedException`. Read `core/src/main/java/org/apache/iceberg/jdbc/JdbcTableOperations.java:103-163` (SQL at `JdbcUtil.java:65-88`).
+
+6. **Ambiguous-failure resolution.** A failed commit may have landed or not; the code refreshes and checks whether the new location is current or in the metadata history, distinguishing SUCCESS/FAILURE/UNKNOWN. Read `core/src/main/java/org/apache/iceberg/BaseMetastoreOperations.java:99-151`.
+
+7. **Commit-time fields are inherited, not written eagerly.** Sequence numbers and row IDs are set null and filled in from the manifest list at read time, so a manifest can be reused across retries. Read `format/spec.md:928-937` and `format/spec.md:101-107`.
+
+8. **The retry loop lives one level up, in the core snapshot producer.** Query engines call `operation.commit()`; `SnapshotProducer.commit()` re-bases and retries on `CommitFailedException` (with backoff), then calls `ops.commit(base, updated)`. Read `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:484-533`.
+
+9. **Engines never touch the swap directly** — they build a `SnapshotUpdate` (append/overwrite/row-delta), add files, and `commit()`. Spark: `SparkWrite.java:256-258` (and append at `:320-333`); Flink commits per checkpoint: `IcebergFilesCommitter.java:370-403`.
+
+10. **Isolation is chosen per write at the engine layer.** Spark's overwrite picks SERIALIZABLE vs SNAPSHOT by calling `validateNoConflictingData/Deletes`; the catalog swap is what actually enforces it. Read `SparkWrite.java:346-359` (ties to `format/spec.md:99`).
+
+Add this mental map: `format/spec.md` defines the model and the contract; `BaseMetastoreTableOperations.java` + a concrete catalog (`JdbcTableOperations`/`InMemoryCatalog`) implement the pointer swap; `SnapshotProducer` + the engine writers are the callers that drive and retry it.

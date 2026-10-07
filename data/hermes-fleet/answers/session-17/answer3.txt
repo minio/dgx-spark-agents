@@ -1,0 +1,51 @@
+I now have the full picture (I already read RESTSessionCatalog, RESTTableOperations, Endpoint, RESTTableCache, ResourcePaths, and RESTClient from the prior turn, plus verified the retry/error-handler machinery). Here are the edge cases and failure modes, and how each is guarded, with file:line citations.
+
+1. Treating a transient error/HB as a no-op (proxy returns 304 HTML)
+If a proxy returns a 304 or 200 with an HTML body in place of LoadTableResponse, the client would silently treat "no body" as "use the cached table" — returning a wrong/absent result instead of failing. Guard: loadInternal checks `response == null` and then `Preconditions.checkNotNull(cachedTable, "Invalid load table response: null")` — RESTSessionCatalog.java:512-516 — throwing if there's no valid cached copy rather than fabricating one. This is an anti-304 poisoning guard.
+
+2. Proxy drops the ETag on an If-None-Match request
+The ETag is the only signal for "not modified"; if a proxy strips it, the server can't return 304 and the client can't trust a cached table. Guard: only the ETag-bearing response is stored in the cache (RESTSessionCatalog.java:604-607), and `headersForLoadTable` refuses to send If-None-Match when the cached entry has no ETag — `Preconditions.checkArgument(eTag != null, "Invalid ETag: null")` at RESTSessionCatalog.java:1765. So a cache miss on ETag degrades to a full reload, never a stale read.
+
+3. Stale cached metadata after a concurrent server-side change
+The client caches table metadata per session (RESTTableCache.java:42-103, keyed by sessionId + identifier). If another writer commits server-side, the cached copy is stale. Guard: (a) cache entries expire after write (RESTTableCache.java:48-72, configurable `table-cache.expire-after-write-ms`); (b) mutations invalidate the relevant entries (dropTable/renameTable/purgeTable call invalidateTable, e.g. RESTSessionCatalog.java:370-372, 413); (c) the ETag/If-None-Match round-trip on every load naturally refreshes (RESTSessionCatalog.java:508-510).
+
+4. Table UUID mismatch between cached and refreshed metadata
+Refreshing to a different table would silently swap tables. Guard: `checkUUID` validates the refreshed metadata's UUID equals the current one and throws `Preconditions.checkState` otherwise — RESTTableOperations.java:321-332, called from updateCurrentMetadata at 313-318. This matches the spec's table-uuid invariant (format/spec.md:1148/1176).
+
+5. Commit not based on the current metadata (lost update)
+The classic optimistic-concurrency failure. Guard: every POST commit carries UpdateRequirements encoding the expected base state; the server rejects a stale base (RESTTableOperations.java:183-220, e.g. UpdateRequirements.forUpdateTable at 211). The error handler translates a 409/validation failure into CommitFailedException (ErrorHandlers.java:128, 231) so the engine can retry against fresh metadata, per the spec's commit conflict resolution (format/spec.md:1312-1320). Server side, the *server* does the retry loop limited to CommitFailedException (CatalogHandlers.java:624-630, 786-792) — and create-transactions deliberately do not retry because "if the table exists, retrying is not a solution" (CatalogHandlers.java:614).
+
+6. Commit outcome unknown (network drop after server applied the change)
+A dropped response after a successful server-side apply leaves the client unsure whether the commit happened, which can cause double-commit of a snapshot. Guard: CommitStateUnknownException is caught (RESTTableOperations.java:228-235) and, for snapshot-add-only writes to main, the client reconciles by refreshing and checking whether the expected snapshot ID now exists (reconcileOnSimpleUpdate, RESTTableOperations.java:251-265, expectedSnapshotIdIfSnapshotAddOnly at 272-307). Only when the snapshot can't be confirmed does it rethrow.
+
+7. Idempotency not guaranteed for retried mutations (double side-effect)
+Network-level retries of a POST can double-apply. Guard: when the server advertises idempotency-key support, the client attaches an Idempotency-Key header to mutation requests (RESTSessionCatalog.java:224-228; mutationHeaders threaded into every POST/DELETE, e.g. RESTTableOperations.java:227). The retry strategy only retries idempotency-keyed requests (ExponentialHttpRequestRetryStrategy.java:80, 166-171) and bounds them by the key lifetime (HTTPClient.java:180, 347).
+
+8. Unsupported endpoint (older server or server without view/scan-plan support)
+Talking to a server that lacks an endpoint would fail with a confusing network error or, worse, silently no-op. Guard: client-side endpoint negotiation — fetchConfig reads the server's advertised endpoints (RESTSessionCatalog.java:232-245) and every operation checks `Endpoint.check(...)` and throws UnsupportedOperationException (or a typed NoSuchTable/NoSuchViewException with a clear message) before issuing the call; e.g. loadTable at RESTSessionCatalog.java:483-489. For optional endpoints it instead falls back (e.g. tableExists falls back to a load when V1_TABLE_EXISTS is absent — RESTSessionCatalog.java:420-434, and namespaceExists similar at 908-917).
+
+9. Missing/empty namespace or identifier in the path
+An empty namespace would produce a malformed path or an accidental root listing. Guard: every entry point validates before calling, throwing NoSuchTableException/NoSuchNamespaceException/NoSuchViewException — checkIdentifierIsValid RESTSessionCatalog.java:1546-1551, checkNamespaceIsValid 1558-1562, checkViewIdentifierIsValid 1552-1556 (all called from list/load/drop, e.g. 329, 359, 851).
+
+10. Null or empty metadata location on register
+Registering a table with an empty location would create a broken catalog entry. Guard: `Preconditions.checkArgument(!Strings.isNullOrEmpty(...))` before the request — registerTable RESTSessionCatalog.java:757-760; registerView 1723-1726.
+
+11. Invalid, non-positive configuration values
+Bad config (page size, cache TTL, max entries, retries) would cause nonsensical behavior. Guard: Preconditions at initialize and construction — pageSize must be positive RESTSessionCatalog.java:257-262; cache expireAfterWrite non-negative RESTTableCache.java:53-61; retries positive ExponentialHttpRequestRetryStrategy.java:105.
+
+12. Server returns a negative/invalid snapshot operation or bad metadata
+Guard is on the response path: `configResponse.validate()` after fetching server config (RESTSessionCatalog.java:1542) and `updateCurrentMetadata` ignoring server config on refresh/commit with an explanatory comment about the REST spec (RESTTableOperations.java:309-319).
+
+13. Mutation against a table only to discover it's a view (or vice-versa)
+Replace/create operations check the sibling type exists and throw AlreadyExistsException (replaceTransaction RESTSessionCatalog.java:1167-1170; RESTViewBuilder.replace 1924-1928), preventing name collisions across tables and views.
+
+14. Cross-session auth / wrong session credentials
+Each request binds an AuthSession derived from the catalog session + session context (RESTSessionCatalog.java:454, 561-563; RESTClient.withAuthSession RESTClient.java:226-228), which lets per-table config issue scoped credentials (RESTSessionCatalog.java:588) so a table's data access can't leak across principals.
+
+15. Commit to a "create" transaction when tables already exist isn't retried to avoid duplicate creates
+Covered in #5 — create transactions decline retry (CatalogHandlers.java:614, 639-655), wrapping validation failures as CommitFailedException for the client to refresh rather than blindly re-POSTing.
+
+16. Network I/O and connection config
+Socket/connect timeouts are configured through connection config so hung servers don't block forever (HTTPClient.java:506-524), and IOExceptions during request execution are translated to UncheckedIOException (HTTPClient.java:202, 251, 357) — the retry strategy then decides whether a retry is safe.
+
+The two genuinely hard failure modes, by design, are #5 (lost-update under optimistic concurrency) and #6 (unknown commit state after a network failure) — both are inherent to the table spec's atomic-pointer-swap model (format/spec.md:91-99, 1312-1320) and are handled not by preventing them but by detecting them (requirements + ETag + refresh) and reconciling or surfacing them as typed, retryable exceptions. The rest are guarded at the API boundary with Preconditions and typed exceptions so misconfiguration, stale state, or proxy oddities fail loudly instead of corrupting data or returning wrong results.

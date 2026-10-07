@@ -1,0 +1,49 @@
+Here's the honest picture. The key finding first, then the two ways engines actually engage with `JdbcCatalog`.
+
+## Preview: the JDBC catalog is NOT hard-wired into Spark or Flink
+
+A search for production (non-test) references of `JdbcCatalog` in the Spark module returns **zero** hits — the only Spark matches are test fixtures (e.g. spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/TestBaseWithCatalog.java:68, which sets up multiple `JdbcCatalog` instances for isolation) and javadoc. So there is no Spark integration code that calls into the JDBC catalog directly.
+
+The one genuine production dependency is in **Flink's maintenance (trigger-lock) feature**: `IcebergFlinkCommitLockImpl` reuses JDBC, but it does **not** use `JdbcCatalog` — see below. Here's the breakdown.
+
+## 1. How a query engine actually gets a JdbcCatalog: generic, config-driven loading
+
+Neither Spark nor Flink imports `JdbcCatalog`. Instead both go through a generic loader that resolves the class from configuration. This is the real "how engines use it" path.
+
+**The selection logic — `CatalogUtil.buildIcebergCatalog`** (core/src/main/java/org/apache/iceberg/CatalogUtil.java:312-353):
+- If `catalog-impl` is set, use that class (line 313).
+- Otherwise map the `type` option; `case ICEBERG_CATALOG_TYPE_JDBC:` → `catalogImpl = ICEBERG_CATALOG_JDBC` (line 333-335), where `ICEBERG_CATALOG_JDBC = "org.apache.iceberg.jdbc.JdbcCatalog"` (CatalogUtil.java:86).
+- Then `loadCatalog(...)` (line 352) reflection-instantiates it, calls `setConf`, and `initialize(name, options)` — the `initialize` we walked through earlier (JdbcCatalog.java:116-168: reads `uri`, `warehouse-location`, builds `FileIO` and the `JdbcClientPool`, creates catalog tables, handles schema version).
+
+Engines lean on this same utility in slightly different ways:
+
+- **Spark** — `SparkCatalog` documents `catalog-impl` precisely as the hook: "to use the hadoop catalog, use the `catalog-impl` option" (spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java:104-107). So to use JDBC you set `spark.sql.catalog.<name>.type=jdbc` (or point `catalog-impl` at `org.apache.iceberg.jdbc.JdbcCatalog`), plus `uri`, `warehouse`, and `jdbc.user/password`. Spark then calls `buildIcebergCatalog` and drives the resulting `Catalog` through the normal Iceberg Spark interface.
+
+- **Flink** — `FlinkCatalogFactory.createCatalogLoader` (flink/v2.2/flink/src/main/java/org/apache/iceberg/flink/FlinkCatalogFactory.java:87-122). If `catalog-impl` is set, it returns `CatalogLoader.custom(...)` (lines 89-98), which instantiates any class including `JdbcCatalog`. **Note a real limitation:** the factory's `switch` for `type` only handles `hive`, `hadoop`, `rest` (lines 101-121); there's no `jdbc` `case`. So from Flink you must set `catalog-impl` explicitly — the `type=jdbc` shortcut in `CatalogUtil` is not wired into `FlinkCatalogFactory`'s switch.
+
+Once loaded, both engines treat it as an opaque `Catalog` interface: `loadTable`/`createTable`/`listTables` (→ `doRefresh`/`doCommit` we traced), namespace ops, and view ops. The engine never touches the JDBC internals.
+
+## 2. The one direct, non-catalog reuse: Flink maintenance locks
+
+Flink's maintenance API has a `JdbcLockFactory` (flink/v2.2/flink/src/main/java/org/apache/iceberg/flink/maintenance/api/JdbcLockFactory.java). It reuses the JDBC machinery — **but not the catalog**. It builds its own `JdbcClientPool` (line 96: `new JdbcClientPool(1, uri, properties)`), reuses `JdbcClientPool`/`UncheckedSQLException`/`UncheckedInterruptedException` (lines 32-34), and maintains a *separate* lock table (`flink_maintenance_lock`) rather than `iceberg_tables`. How it's created: `LockFactoryBuilder.createJdbcLockFactory` (flink/v2.2/flink/src/main/java/org/apache/iceberg/flink/maintenance/operator/LockFactoryBuilder.java:46-47, 57-69).
+
+It demonstrates the *pattern* the catalog relies on (atomic conditional DML against a DB table), but it's not "using the JDBC catalog":
+- `tryLock` = an `INSERT ... VALUES` whose PK `(LOCK_TYPE, LOCK_ID)` makes concurrent acquire fail atomically (JdbcLockFactory.java:60-62, 181-196).
+- `isHeld`/`instanceId` = point `SELECT` (JdbcLockFactory.java:63-64, 213-232).
+- `unlock` = `DELETE ... WHERE INSTANCE_ID=?` so a retried unlock can't remove someone else's newer lock (JdbcLockFactory.java:65-67, 236-267) — the same "conditional DML against an owned row" idea as the catalog's `WHERE metadata_location = ?` check-and-put, and it guards the exact retry race it documents at lines 238-247.
+- It shares the same failure classification (connection timeouts, SQLSTATEs), JdbcLockFactory.java:148-159.
+
+So functionally it's a sibling of the catalog built on the same `JdbcClientPool` primitives, not a consumer of `JdbcCatalog`.
+
+## 3. Tests and fixtures (not production, but they show integration)
+
+- Flink test `TestFlinkCatalogViewIncapableCatalog` configures `'catalog-impl'='org.apache.iceberg.jdbc.JdbcCatalog'` (flink/v1.20/flink/src/test/java/org/apache/iceberg/flink/TestFlinkCatalogViewIncapableCatalog.java:51) to exercise Flink against a catalog lacking view support.
+- The REST-catalog compatibility server defaults its backing store to `JdbcCatalog` (open-api/src/testFixtures/java/org/apache/iceberg/rest/RESTCatalogServer.java:85), and the docker REST fixture sets `CATALOG_CATALOG__IMPL=org.apache.iceberg.jdbc.JdbcCatalog` (docker/iceberg-rest-fixture/Dockerfile:37) — so JDBC is the default backend used to *test* the REST catalog.
+
+## Bottom line
+
+- **There is no Spark integration code that uses the JDBC catalog.** Spark reaches it purely through `CatalogUtil.buildIcebergCatalog`'s `type=jdbc`/`catalog-impl` resolution (CatalogUtil.java:333-335, 86) → reflection `initialize` (JdbcCatalog.java:116-168), then treats it as a generic `Catalog`.
+- **Flink reaches it the same way**, but only via `catalog-impl` (FlinkCatalogFactory.java:89-98) — its `type` switch omits `jdbc` (lines 101-121).
+- **The only direct JDBC dependency in a Flink production path is `JdbcLockFactory`** (JdbcLockFactory.java, wired in LockFactoryBuilder.java:46-47), which reuses `JdbcClientPool` but implements its own lock table and is independent of `JdbcCatalog`.
+
+So "how engines use the JDBC catalog" is best answered as: they don't bind to it at build time; they load it by name from configuration through the shared `CatalogUtil`/`CatalogLoader` layer, then interact through the standard `Catalog`/`TableOperations` contract — and the one hard-coded JDBC reuse in the integrations is the Flink maintenance lock factory, which parallels but does not use the catalog itself.

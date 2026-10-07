@@ -1,0 +1,39 @@
+I've read the entire spec.md (2,153 lines, start to end). Here's what it says about catalog commits and the reasoning behind it.
+
+## What the spec says
+
+**Table state lives in immutable metadata files.** The core model (lines 83-99) is that a table's state is maintained in JSON metadata files. All state changes create a *new* metadata file, and commit means atomically swapping the table's metadata pointer from the old version to the new one. Data files are written in place, and only get added to the table as part of an explicit commit. This produces a linear history of metadata versions so concurrent writes are not lost (lines 1134-1138).
+
+**Commits are optimistic.** Writers build their new metadata assuming the version they read is still current. They then commit by swapping the pointer from their base version to their new version. The atomic swap is the basis of *serializable isolation*: readers always use a committed snapshot, never see partial writes, and never take locks (line 71, 93).
+
+**Retry on conflict.** If a commit is attempted against a base version that's no longer current, it fails and can be retried against the newer current version. The conditions under which an update can be re-applied decide the isolation level (lines 97-99, 1312-1319):
+
+- Append operations have no requirements and can always be re-applied.
+- Replace operations (compaction, format change) must verify the files being deleted are still in the table.
+- Delete operations must verify specific files are still present; expression-based deletes can always be re-applied.
+- Schema/partition-spec updates must validate the schema didn't change.
+
+**The swap mechanism itself is not standardized.** The spec deliberately leaves *how* the atomic swap happens to the catalog, giving two examples (lines 1138, 1321-1354):
+
+1. **File-system tables**: atomic rename of `v<V+1>.metadata.json` (now explicitly deprecated and marked unsafe in object stores and local file systems).
+2. **Metastore tables**: a `check-and-put` / `check-and-swap` on a pointer stored in a metastore or database, which validates the base version is still current before pointing the table at the new metadata file. This is the pattern the REST/Hive/JDBC catalogs use.
+
+**Commit-time bookkeeping removes uncertainty from uncommitted work.** Several fields are "inherited" rather than written eagerly because their true values aren't known until a commit succeeds (lines 101-107, 928-937):
+
+- **Sequence numbers** are optimistically assigned at commit; manifests/manifest-lists are written with `null` sequence numbers and the real value is inherited from the manifest list at read time. This lets a manifest be written *once* and reused across retries — only the manifest list (which changes anyway) must be rewritten.
+- **Row lineage** (`first-row-id`, `_row_id`, `next-row-id`) follows the same pattern (lines 461-546, 988-997): values are inherited after the snapshot's sequence number / row range is assigned at commit.
+- The manifest list is rewritten on every commit attempt because the optimistic sequence number is written there (lines 1001-1003).
+
+**Retention and references** (lines 1101-1132): branches/tags are tracked as snapshot references, and snapshot expiration uses their retention policies. The table metadata records snapshot-log and metadata-log to keep history for time-travel and debugging.
+
+## Why it's designed this way
+
+The design is a direct response to the goals stated up front (lines 69-77): **serializable isolation, speed (O(1) scan planning), scale (planning is client-side, not bottlenecked on a central store), and storage separation.** Several intentional tradeoffs follow:
+
+- **No locks on readers.** Reads are lock-free because they pin a committed snapshot by pointer. The catalog's only job is a compare-and-swap on one pointer — that's the single point of serialization, and it's O(1), so it scales without a hot central coordinator doing per-file work.
+- **Atomic swap instead of locking** keeps writers tolerant of a crash mid-commit: a failed/new metadata file is simply garbage, never a partially applied state. Nothing writable in place is ever visible until the swap succeeds.
+- **Optimistic concurrency over pessimistic locking** means a slow writer doesn't block others; conflicts are cheap retries, and the "retry conditions" let each writer choose how strong an isolation guarantee it actually needs.
+- **Lazy/inherited commit-time fields (sequence numbers, row ids)** exist so that an optimistic commit that gets retried doesn't have to rewrite data, manifest, and metadata files — only the manifest list and a fresh snapshot. This keeps retries cheap, which is what makes optimistic concurrency viable at scale.
+- **Decoupling the swap mechanism from the format** lets each catalog pick a concurrency primitive it can actually run correctly (a conditional pointer update in a DB/REST service, versus rename on a POSIX FS) rather than forcing one mechanism on all storage. That's also why the unsafe file-system-rename scheme is being removed in v4.
+
+In short: catalog commits are a single atomic pointer swap with optimistic retry, and the fields that depend on commit order are delegated via inheritance so retries stay cheap — all in service of lock-free, scalable, isolated reads and writes.

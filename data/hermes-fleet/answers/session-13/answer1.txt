@@ -1,0 +1,33 @@
+I've read the full spec (all 2153 lines). Here's what it says about scan planning and the design reasoning behind it.
+
+## What the spec says
+
+The dedicated **Scan Planning** section (spec.md:1053-1098) is short but sits on a lot of machinery elsewhere in the spec. The core procedure:
+
+1. **Read the manifest list for the snapshot.** Planning starts by reading the current snapshot's manifest list, then the manifests themselves. DELETED entries (status 2) are ignored.
+2. **Skip manifests by summary metadata.** A manifest list carries per-manifest file counts (`added_files_count`, `existing_files_count`, etc.) and per-partition-field summaries (`contains_null`, `contains_nan`, `lower_bound`/`upper_bound`). Planners use these to skip whole manifests without opening them.
+3. **Convert scan predicates to partition predicates per manifest.** Each manifest was written with a specific partition spec. The spec says conversion "uses the partition spec that was used to write the manifest file regardless of the current partition spec" — that's why these predicates are computed per-manifest, not once globally.
+4. **Use an *inclusive* projection.** If a scan predicate matches a row, the partition predicate must also match that row's partition. This guarantees correctness (no matching row is dropped) at the cost of pulling in extra files — e.g. `ts > X` becomes `ts_day >= day(X)`, which includes whole days that mostly don't match. The spec explicitly contrasts this with *strict* projection, which is instead used to compute per-file residual predicates.
+5. **Filter files by column stats.** After partition filtering, scan predicates are applied again against each file's per-field column bounds and counts (`lower_bounds`, `upper_bounds`, `null_value_counts`, `value_counts` via the `content` stats). Deleted rows are filtered from delete files using the same logic.
+6. **Apply delete files and deletion vectors** to surviving data files at read time, gated by scope rules keyed on data sequence number and partition equality (spec.md:1073-1092):
+   - position deletes/vectors: data seq <= delete seq, equal partition (and matching `file_path`/`referenced_data_file`);
+   - equality deletes: data seq *strictly less than* delete seq, equal partition — or a global delete if the delete's spec is unpartitioned.
+   - Unknown partition transforms don't affect partition equality.
+
+## Why it's designed this way
+
+Every choice traces back to the project's stated **Goals** (spec.md:69-77), especially *Speed* (O(1) planning calls, not O(n)) and *Storage separation* (partitioning is table configuration; reads are planned off data predicates, not partition predicates).
+
+**A two-level metadata tree (metadata → manifest list → manifests) exists to skip work.** The manifest list's per-partition summaries and file counts are specifically described as existing "to avoid reading manifests that are not required for an operation." The manifest *file*'s own per-file metrics then trim files inside a surviving manifest. So planning is bounded by how much of the tree matches the query, not by table size — that's the O(1)-ish speed goal.
+
+**Inclusive projection decouples the query language from physical layout.** Because partitioning can evolve (multiple spec IDs coexist in one snapshot), the planner must *derive* partition filters from data predicates using the spec that wrote each manifest. The user never expresses partition predicates directly; they express predicates on columns. This is the "Storage separation" goal — partition evolution is transparent to queries because correct partition filters are always re-derived from column predicates.
+
+**Sequence numbers exist to make delete application correct and cheap.** Deletes are stored separately from data, so the planner must decide which deletes apply to which data file without reading either. The data sequence number gives a total ordering: deletes only apply to *older* data files (or same-commit, for position deletes). This lets the planner prune deletes using only metadata.
+
+**Inefficiency is deliberately traded for correctness.** The inclusive projection pulls extra files; the spec acknowledges this is normal. Readers then apply the *residual* predicate per file using stats, and the excess is cleaned up at execution. This trade keeps planning fast (metadata-only) while guaranteeing no false negatives.
+
+**Delete-file pruning uses the same stats machinery as data files.** Because delete files carry metrics *of the deleted rows*, the planner can drop a delete file the same way it drops a data file (e.g. a delete file with `id` in [1,4] is irrelevant to `id = 9`). This is why the spec mandates delete files store bounds/counts of all deleted rows "or must be omitted" — a single, uniform pruning path.
+
+In short: the design optimizes for metadata-driven, log-parallel planning over huge immutable-file tables, keeps queries independent of physical partitioning/schema evolution, and uses sequence numbers plus shared statistics to correctly — but lazily — apply row-level deletes without touching the data.
+
+Want me to trace how this maps to actual code (e.g. `ManifestGroup`, `ManifestReader`, `InclusiveMetricsEvaluator`, `InclusiveManifestEvaluator` in `core/`)?

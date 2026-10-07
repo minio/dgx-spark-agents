@@ -1,0 +1,23 @@
+Ten starting points, roughly in reading order:
+
+1. FileIO is the pluggable storage boundary — "read, write, delete bytes at a path." Read the interface and its Javadoc: `api/src/main/java/org/apache/iceberg/io/FileIO.java:30-41` (`newInputFile`, `newOutputFile`, `deleteFile`).
+
+2. InputFile = seekable read of one file. `api/src/main/java/org/apache/iceberg/io/InputFile.java:30-61` (`getLength`, `newStream()` returning `SeekableInputStream`, lazily-skipped length at :46-53).
+
+3. OutputFile = write-once file; `create()` refuses to overwrite. `api/src/main/java/org/apache/iceberg/io/OutputFile.java:30-53` (`create` throws `AlreadyExistsException`; `createOrOverwrite` is the deliberate escape hatch).
+
+4. ResolvingFileIO routes a path's URI scheme to the right backend (s3/gs/abfs → cloud, else Hadoop). `core/src/main/java/org/apache/iceberg/io/ResolvingFileIO.java:60-69` (scheme map) and `:235-255` (`implFromLocation`/`scheme`).
+
+5. Delegates are loaded lazily, cached per scheme, and must be `DelegateFileIO`. `core/src/main/java/org/apache/iceberg/io/ResolvingFileIO.java:187-232` (`computeIfAbsent`, fallback to HadoopFileIO).
+
+6. The Hadoop adapter shows the three storage ops (in-place write, seekable read, delete) against a real FileSystem. `core/src/main/java/org/apache/iceberg/hadoop/HadoopFileIO.java:82-105` (`newInputFile`/`newOutputFile`/`deleteFile`).
+
+7. Bulk delete with retry/parallelism — the garbage-collection path. `core/src/main/java/org/apache/iceberg/hadoop/HadoopFileIO.java:173-208` (`Tasks.foreach`, retry, worker pool sizing).
+
+8. How locations become files: `OutputFileFactory` generates unique write-once file names and asks FileIO for the `OutputFile`. `core/src/main/java/org/apache/iceberg/io/OutputFileFactory.java:93-121` (filename gen + `newOutputFile`).
+
+9. Engines hand FileIO + planned tasks to workers; readers turn tasks into input files. Best read in the Spark reader base: `spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/source/BaseReader.java:179-191` (`getInputFile`/`inputFiles()` via `bulkDecrypt`).
+
+10. You never touch storage primitives from engine code — you plan, serialize a `FileIO`, and delegate. Larger map in the Spark write path: `spark/v4.2/spark/src/main/java/org/apache/iceberg/spark/source/SparkPositionDeltaWrite.java:452-454` and the Flink read path `flink/v2.3/flink/src/main/java/org/apache/iceberg/flink/source/DataIterator.java:52-59`.
+
+Rule of thumb: `FileIO` is pure byte I/O behind a scheme-chosen adapter; all the interesting concurrency, commit, sequence-number, and planning logic lives elsewhere, layered on top of these three operations.

@@ -1,0 +1,88 @@
+I've read the write path (ManifestWriter, the V2/V3/V4 metadata wrappers, ManifestListWriter) and the read path (ManifestReader, ManifestGroup, ManifestLists, InheritableMetadata). Here are the concrete edge cases and failure modes for manifests, and how the code guards each.
+
+## 1. Sequence number not yet assigned at write time (race with optimistic commit)
+
+Failure mode: a brand-new file's sequence number isn't known until the snapshot commits, but manifests must be written before commit. If the number were baked in, a failed commit/retry would require rewriting the manifest (violating spec.md:107, 937).
+
+Guard: manifests are written with `UNASSIGNED_SEQ = -1L` for the manifest's own sequence number and its min data sequence number (ManifestWriter.java:42, 232). The manifest list later supplies the real value. The validation that this is only legal for a fresh commit lives in `V2Metadata.ManifestEntryWrapper.get` — it throws unless the entry's snapshot is null or equals the current commit snapshot, and it requires status ADDED (V2Metadata.java:321-336). This enforces the spec rule that inheritance applies only to ADDED entries (spec.md:706).
+
+## 2. ADDED entry with an unassigned (null) data sequence number
+
+Failure mode: writing an entry with a null data sequence number that isn't actually a newly-added file of the current commit would produce a manifest that inherits the wrong sequence number (a silent correctness bug in which deletes apply to which files).
+
+Guard: the same `V2Metadata.ManifestEntryWrapper.get` Preconditions (V2Metadata.java:321-336) rejects null sequence numbers on any non-ADDED entry, and rejects them when the snapshot id doesn't match the commit. This mirrors the writer's own invariant that `wrapAppend` is the only path producing null data seq / file seq (GenericManifestEntry.java:69-80).
+
+## 3. `first_row_id` assignment races on the read path
+
+Failure mode: v3 row lineage requires that a null `first_row_id` in a data file be assigned from the manifest-level `first_row_id` at read time (spec.md:941-949). Getting this wrong produces wrong rows for `_row_id`/`_last_updated_sequence_number`.
+
+Guards (all in ManifestReader):
+- Manifest-level `first_row_id` is disallowed entirely on delete manifests — `Preconditions.checkArgument(firstRowId == null || content == FileType.DATA_FILES, "First row ID is not valid for delete manifests")` (ManifestReader.java:147-149), matching spec "the value of first_row_id for delete files is always null" (spec.md:947).
+- The id-assigner walks entries in order, filling null file `first_row_id` and advancing by `record_count` (ManifestReader.java:440-458) — exactly the spec's inheritance arithmetic (spec.md:945).
+- Uncommitted manifests keep their firstRowId untouched to avoid corrupting entries merged later (ManifestReader.java:459-462).
+- Committed pre-v3 manifests with a null manifest-level firstRowId are defensively nulled per-entry to avoid leaking stale values (ManifestReader.java:463-472).
+
+## 4. Manifest list reads/version mismatches
+
+Failure mode: writing a delete manifest into a v1 snapshot, or mis-assigning sequence numbers across versions, corrupts the snapshot.
+
+Guards:
+- v1 manifest lists can't contain delete manifests — `Preconditions.checkArgument(manifest.content() == DATA, "Cannot store delete manifests in a v1 table")` in `ManifestListWriter.V1Writer.prepare` (ManifestListWriter.java:293-296).
+- v1 lists reject a nonzero sequence number — the only valid v1 value is `INITIAL_SEQUENCE_NUMBER` (ManifestLists.java:71-74).
+- Every version's list writer embeds its `format-version` in the file metadata (ManifestListWriter.java:128-132, 187-192, 246-249, 286-289), so the reader can detect and reject a mismatch.
+- Docker/attempted unsupported formats are caught up front: reading manifest metadata only supports Avro — `Preconditions.checkArgument(manifestFormat == AVRO, "Reading manifest metadata is only supported for Avro manifests")` (ManifestReader.java:184-187), and `open` requires a known format (`Preconditions.checkArgument(format != null, "Unable to determine format of manifest")`, ManifestReader.java:311-312).
+
+## 5. Null/unknown metadata breaking schema and spec resolution
+
+Failure mode: a corrupt manifest missing `schema`/`partition-spec` key-value metadata, or referencing a spec id not in table metadata, would make the manifest unreadable and the table unscannable.
+
+Guard: the reader parse throws on missing required metadata — `SchemaParser.fromJson(metadata.get("schema"))` and `PartitionSpecParser.fromJsonFields(...metadata.get("partition-spec"))` (ManifestReader.java:178-179) fail instead of silently proceeding. Manifest list readers wrap IO failures as `RuntimeIOException("Cannot read manifest list file")` (ManifestLists.java:55-57).
+
+## 6. Manifest/container reuse and mutability → data races and stale stats
+
+Failure mode: manifest readers reuse writable `IndexedRecord`/containers (`reuseContainers()`); holding references to entries after moving on yields mutated/wrong files, and retaining full stats in memory is expensive.
+
+Guards:
+- The writer reuses a single `GenericManifestEntry` instance but copies values into the appender immediately at each `add` (ManifestWriter.java:76-77, 148), so later wraps can't corrupt prior rows.
+- The reader makes defensive copies before handing files back — `ManifestReader.iterator()` calls `e.file().copy(!dropStats)` (ManifestReader.java:367-373), and `dropStats` decides whether to strip the potentially huge metrics maps (ManifestReader.java:416-428). This is the "callers must copyWithoutStats if holding references" concern the codebase flags.
+- Copy-without-stats is actually *enforced* at the wrapper boundary: `V2Metadata.DataFileWrapper.copyWithStats`/`copyWithoutStats` throw `UnsupportedOperationException("Cannot copy IndexedDataFile wrapper")` (V2Metadata.java:585-591), preventing accidental retention of reused containers.
+
+## 7. Unpartitioned manifests (empty partition struct)
+
+Failure mode: v4+ allows Parquet manifests, and Parquet cannot represent an empty struct for the `partition` field; reading it as required would throw.
+
+Guard: for unpartitioned specs the reader substitutes `UNPARTITIONED_PARTITION_FIELD` for the partition field, making it optional so the missing field returns null instead of throwing (ManifestReader.java:314, 321-328) — the comment explains the v4/empty-struct rationale (ManifestReader.java:316-320).
+
+## 8. Entries disallowed by partition/spec (logical mismatch)
+
+Failure mode: a manifest holding files that violate its declared partition spec (mixing specs, or files from a different spec than `partition-spec-id`) would make scan filtering wrong.
+
+Guard: the reader filters live entries by partition set — `inPartitionSet` checks `specId()` and partition tuple against the requested set (ManifestReader.java:304-307), and `isLiveEntry` drops DELETED entries so they never enter scan results (ManifestReader.java:358-365), matching the spec's "deletes are informational only" (spec.md:691) and the scan rule that DELETED entries aren't used (spec.md:1055).
+
+## 9. Stats-driven manifest skipping going wrong
+
+Failure mode: manifests whose `added/existing/deleted files` counts are missing must not be assumed empty (or non-empty), or a scan planner would skip a manifest that actually matters (spec.md:1021-1026 says null counts imply "non-zero").
+
+Guard: `ManifestGroup` only skips a manifest based on counts when the relevant count is present — the predicates explicitly "remove any manifests that don't have any existing or added files; if either count is missing, the manifest must be scanned" (ManifestGroup.java:311-330). So a null count forces scanning instead of a risky skip.
+
+## 10. Unassigned manifest sequence number leaking into a committed list
+
+Failure mode: a `UNASSIGNED_SEQ` (-1) sequence or min-sequence floor on a manifest being written to a manifest list would record a garbage number and break ordering/deletes.
+
+Guard: `V2Metadata.ManifestFileWrapper.get` replaces `UNASSIGNED_SEQ` with the real commit sequence number, and validates the manifest actually belongs to this commit before doing so — `Preconditions.checkState(commitSnapshotId == wrapped.snapshotId(), "Found unassigned sequence number for a manifest from snapshot: %s")` (V2Metadata.java:98-125). Same pattern for the min sequence number (V2Metadata.java:111-125).
+
+## 11. Manifest list `first_row_id` accounting for existing manifests
+
+Failure mode: when assigning `first_row_id` across the manifests of a list, forgetting that a manifest's existing (not just added) data files may have unassigned row ids would let row IDs collide or overlap (spec.md:1049-1051 — "existing and added rows" both count).
+
+Guard: `ManifestListWriter.V3Writer.prepare`/`V4Writer.prepare` only assign a first-row-id to data manifests that don't already have one, and advance the running counter by `existingRowsCount() + addedRowsCount()` (ManifestListWriter.java:139-149, 198-209). This preserves already-assigned manifests and accounts for existing files, matching the spec note.
+
+## 12. Deliberately-unsupported mutations hit loud failures, not silent corruption
+
+Failure mode: code paths that cannot legally mutate reused containers or copied wrappers must not silently produce wrong values.
+
+Guard: wrapper `set(...)` methods throw `UnsupportedOperationException("Cannot modify ... via set")` (V2Metadata.java:78-80, 305-307; V3Metadata same pattern) and `V2Metadata.DataFileWrapper` copy methods throw (V2Metadata.java:585-591). A call that shouldn't modify a manifest entry or copy a wrapper fails loudly rather than corrupting state.
+
+## The theme
+
+Two classes of failure dominate: (a) optimistic-commit timing — sequence numbers and row IDs that aren't known until commit, all handled by writing sentinels (`UNASSIGNED_SEQ`, null) and validating/inheriting them in a strict order (writer: ManifestWriter.java:232, GenericManifestEntry.java:69-95; reader: ManifestReader.java:440-472, ManifestListWriter.java:139-149); and (b) mutability/reuse — reused containers and wrappers that could corrupt data or retain huge stats, handled with defensive copies, early-teardown of stats, and loud `UnsupportedOperationException`/Preconditions failures (ManifestReader.java:367-373, 416-428; V2Metadata.java:78-80, 305-307, 585-591). Every failure mode maps back to a spec rule the code refuses to let silently break.

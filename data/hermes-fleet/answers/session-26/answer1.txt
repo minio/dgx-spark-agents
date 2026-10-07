@@ -1,0 +1,51 @@
+I've read the full spec (all 2,153 lines across the three consecutive chunks). Here's what it says about rewriting manifests and the reasoning behind it.
+
+## Where manifest rewriting is designed in the spec
+
+The spec never has a section literally titled "rewriting manifests" — it's woven through several parts: the overview/snapshot structure, the Manifests and Manifest Lists sections, Optimistic Concurrency, Sequence Numbers, and Commit Conflict Resolution and Retry.
+
+## The fundamental design: manifests are reused, not rewritten
+
+The core idea is that snapshots reference manifest files, and manifest files are reused across snapshots to avoid rewriting metadata that changes slowly (line 87):
+
+> "Manifest files are reused across snapshots to avoid rewriting metadata that is slow-changing."
+
+A manifest is an immutable Avro file. A snapshot's state isn't captured by rewriting all manifest files; it's captured by writing a new **manifest list** that points at the same underlying manifests plus any new ones. This is the key to the whole design — you only rewrite the parts that actually changed.
+
+## Why this matters — restructuring manifests is a separate concern
+
+The spec allows multiple manifests per snapshot explicitly to support two things (lines 978-982): fast appends (add a new manifest instead of rewriting/merging existing ones) and parallel planning / reducing the cost of rewriting a manifest on large tables.
+
+Rewriting manifests (merging many small manifests into fewer, or rewriting to reduce planning overhead for compaction) is thus a *maintenance* operation, distinct from the append path. When files are added/changed in place (compaction, file rewriting), writers produce a new manifest list that includes new manifests while reusing existing ones.
+
+## The design mechanics that make manifest reuse correct
+
+Several mechanisms in the spec exist specifically so manifests can be written once and reused across snapshots and commit retries:
+
+1. **Inherited sequence numbers (lines 105-107, 928-939).** A new file's data and file sequence numbers are written as `null` in the manifest, then filled in from the manifest list's sequence number at read time. Because the commit's sequence number isn't known until the snapshot commits, writing manifests with `null` lets the same manifest file be reused verbatim in a commit retry — to change the sequence number only the manifest list must be rewritten (which is rewritten anyway).
+
+2. **Inherited snapshot_id and first_row_id (lines 692-706, 103-105, 941-949).** Same pattern for `snapshot_id` and, in v3+, `first_row_id`. The manifest entry stores `null` and the value is inherited from manifest metadata on read. This lets manifests be written before commit-time values are known, avoiding a rewrite on optimistic retry.
+
+3. **Status field (0 EXISTING / 1 ADDED / 2 DELETED) with per-entry write-back.** When a file is removed (e.g. replaced by a rewrite/compaction), its original manifest entry is marked `DELETED` rather than physically removed, and the file is copied as an `EXISTING` entry into the new manifest. The `EXISTING` copy must carry explicit (non-null) sequence numbers and `first_row_id` so they don't change after first inheritance (lines 706, 935, 947).
+
+4. **Manifest list as the source of truth for a snapshot (lines 999-1052).** A new manifest list is always written for each commit attempt because the set of manifests always changes to form the new snapshot. The list carries per-manifest summary stats (file/row counts, per-field partition bounds) precisely so that scan planning can skip manifests without reading them — this is what makes reusing many small manifests cheap to plan.
+
+5. **Immutable manifest, new snapshot on every change (Overview, 85-89).** Because all files are tracked individually and manifests are immutable, any change creates a new metadata file and a new snapshot; readers always read a committed snapshot and never see partial writes.
+
+## The retry story (Commit Conflict Resolution, lines 97, 1312-1319)
+
+This is where "rewrite/replace" is explicitly defined:
+
+- **Replace operations** (line 1317) — "format changes (replace an Avro file with a Parquet file) and compactions (several files are replaced with a single file)" — must verify on retry that the files being deleted are *still in the table*. If all the files being replaced are still present, the rewrite can be re-applied to the new current snapshot and retried. This is precisely the condition that lets a manifest-rewriting compaction retry safely.
+- The snapshot summary captures the rewriting cost: `manifests-created`, `manifests-kept`, `manifests-replaced`, and `entries-processed` (lines 2116-2119) let a compaction report how many manifest files it rewrote/reused.
+
+## Why it's designed this way
+
+Summed up, the design rationale:
+
+- **O(1) planning vs. O(1) writes.** The "Speed" goal (line 72) says operations use O(1) remote calls to plan files. Manifest-list summaries feed this — you don't re-derive file sets by scanning every file, and you don't physically rewrite manifests on every append.
+- **Mutable-append-without-touching-history.** Reusing manifests gives fast appends and cheap concurrent commits; rewriting only what changed keeps commit cost proportional to the delta, not the table.
+- **Serializable isolation without locks.** Readers hold a snapshot; writers optimistically create new metadata and swap. Because manifests are immutable and sequence numbers are inherited, a manifest written once is valid regardless of which snapshot ends up committing, which is what makes optimistic retry cheap and correct.
+- **Rewriting is a deliberate, validated maintenance op.** Compaction/rewrite is allowed precisely because it doesn't change table data — it just replaces files carrying identical rows. That's why `replace` needs only to validate the targeted files are still present, and why the "operation" summary field (line 972) distinguishes `replace` (no data change) so tools like snapshot expiration and planning can treat it correctly.
+
+The through-line: **manifest reuse + inheritance + immutable snapshots is the default, and manifest rewriting is an explicit, validated exception** done only when it pays for itself (compaction, format changes, file relocation), with correctness guaranteed by requiring that replaced files still exist at commit and by carrying forward immutable per-file state (sequence numbers, row IDs) so the rewritten manifests stay consistent.

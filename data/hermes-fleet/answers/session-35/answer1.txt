@@ -1,0 +1,39 @@
+I've read the full spec. Here's what it says about equality deletes and why it works that way.
+
+WHAT AN EQUALITY DELETE IS
+
+An equality delete file marks rows deleted by one or more column values rather than by file position. A data row is deleted if its values equal all of the delete columns for any row in an equality delete file that applies to that data file. Each row becomes an equality predicate; multiple delete columns read as an AND (`id = 3 AND category IS NULL`). A null in a delete column matches a null row, i.e. `col IS NULL`.
+
+Encoding (spec 1418-1470):
+- A delete file stores any subset of the table's columns, using the table's field IDs.
+- The matching columns are identified by the `equality_ids` field on the `data_file` struct in the manifest — a list of int field IDs, required when content=2 and null otherwise.
+- The file's `content` field marks it as `2` (EQUALITY DELETES).
+- Delete columns appear before any other columns; extra columns beyond `equality_ids` are optional and just carry deleted-row values (for reconstructing change streams).
+
+Scope/application (spec 1084-1091):
+- An equality delete applies to a data file only if the data file's data sequence number is STRICTLY LESS than the delete's sequence number, and the partitions match (same spec id and values) — or the delete file is stored with an unpartitioned spec, in which case it's a global delete applied to all data files.
+- This strict-less-than rule is the key difference from position deletes, which use <= (so a position delete can delete rows written in the same commit). Equality deletes never apply to files from the same commit because a delete can't know the values that a concurrent, not-yet-committed write will produce.
+
+Metrics: delete files carry the same field metrics as data files, but the metrics describe the DELETED values, so scan planning can skip a delete file whose rows can't overlap a scan's filter or a data file's bounds.
+
+Schema-evolution caveats (spec 1469): if a delete column is later dropped from the schema, it must still be used when applying that delete file; if a column is used as a delete column after being added, older data files read it via normal projection (defaulting to null).
+
+WHY IT'S DESIGNED THAT WAY
+
+1. It enables deletes without rewriting data files. Iceberg's data is immutable and append-only. Equality deletes let you "delete" rows by adding a small side file that says "anything equal to these values is gone," leaving the original data files untouched. This is exactly what makes v2 row-level deletes possible on immutable storage.
+
+2. Comparison-based, not position-based. Position deletes require you to know which file and offset a row lives in, which in turn requires reading existing data to find positions. Equality deletes are the escape hatch for the common case of "delete WHERE col = X": the writer never has to read the old data to figure out positions. This is why plugins that rewrite updates as delete+insert rely on equality deletes when they don't want to scan the current data.
+
+3. The strict < sequence-number rule preserves correctness under concurrency. Because the delete file only applies to data strictly older than itself, a delete can never wrongly kill a row that another concurrent writer is adding in the same (or later) commit. Position deletes use <= only because they target a specific file+offset, which is unambiguous; equality deletes can't, because value matching is speculative against future writes.
+
+4. It composes with Iceberg's prune-by-metrics design. Both data and delete files carry bounds/counts keyed by field ID, so scan planning can skip both kinds of files using the same logic. A delete file whose values don't overlap the query never gets read or applied. This is what keeps equality deletes cheap at plan time despite being a "write a predicate, evaluate everywhere" approach.
+
+5. Global-delete escape hatch. The unpartitioned-spec global-delete special case exists because you may need to delete "all rows where id=5" regardless of partition, and forcing a value-based delete to be partitioned would make it miss rows. Without that carve-out, a delete file would only ever apply within its partition.
+
+6. Relationship to identifier fields. The restrictions on which columns may be used as delete columns mirror the identifier-field rules (same primitive, non-float/double constraints) — but deliberately relaxed to also allow optional columns and columns under optional structs, because with deletes a null parent implies a null leaf. This keeps equality matching well-defined.
+
+7. Row-lineage caveat (spec 470). v3 row lineage explicitly does NOT track lineage through equality deletes, because engines using them avoid reading existing data and can't supply the original row ID. Such updates are treated as full removal + insertion of a new row.
+
+8. Lifecycle and eventual deprecation. Equality deletes are a v2/v3 feature (v1 has no row-level deletes at all). v4 prohibits writing new equality deletes: the spec recognized they're expensive to apply (value lookup across files) relative to deletion vectors, which pinpoint rows by position in a compact bitmap. v4 keeps the format backward-compatible — existing equality delete files in upgraded tables must still be applied — but no new ones may be created.
+
+The shortest version: equality deletes let you delete by value on immutable files without reading existing data, correct under concurrency via the strict sequence-number boundary, prunable at plan time via field metrics, with an unpartitioned global-delete option — and enough implementation difficulty that v4 retires writing them in favor of deletion vectors while still honoring the ones that exist.

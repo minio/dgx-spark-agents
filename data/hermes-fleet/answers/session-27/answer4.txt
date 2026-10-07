@@ -1,0 +1,44 @@
+I now have a complete picture across both engines. Here's the explanation.
+
+## How query engines use cherry-picking
+
+Both Spark and Flink expose cherry-picking, but through different surfaces:
+
+**Spark** exposes it as named SQL procedures, registered in the catalog. `SparkProcedures.initProcedureBuilders()` maps the procedure names to builders — `cherrypick_snapshot` → `CherrypickSnapshotProcedure::builder` (SparkProcedures.java:50) and `publish_changes` → `PublishChangesProcedure::builder` (SparkProcedures.java:60). These become `CALL ...system.cherrypick_snapshot(...)` / `CALL ...system.publish_changes(...)` statements.
+
+**Flink** exposes it as a table-property on `ALTER TABLE` — `SET('cherry-pick-snapshot-id'='<id>')` — handled in `FlinkCatalog` (FlinkCatalog.java:717, 778-779).
+
+Both ultimately call the same core entry point, `Table.manageSnapshots().cherrypick(id).commit()`, which runs the `CherryPickOperation` covered earlier.
+
+### Spark — the two procedures
+
+**1. `cherrypick_snapshot`** (`CherrypickSnapshotProcedure.java:44-116`): a direct, user-facing cherry-pick by snapshot id.
+- Takes `table` and `snapshot_id` parameters (lines 48-54).
+- In the `call()` body it does `table.manageSnapshots().cherrypick(snapshotId).commit()` (line 98), then reports back an output row of `(source_snapshot_id, current_snapshot_id)` (lines 59-61, 102).
+- The Javadoc (lines 35-36) states the intent: "applies changes in a given snapshot and creates a new snapshot which will be set as the current snapshot." The class doc also notes it invalidates cached Spark plans for the table (lines 39-41) — this is the query-engine-specific bit: after re-pointing `current-snapshot-id`, Spark must drop its cached plans so subsequent queries see the new snapshot.
+- Registered at SparkProcedures.java:50.
+
+**2. `publish_changes`** (`PublishChangesProcedure.java:46-132`): the WAP (Write-Audit-Publish) publish path — it cherry-picks by `wap_id` rather than snapshot id.
+- Takes `table` and `wap_id` (lines 50-56).
+- Scans all snapshots for one whose summary carries a matching `wap.id` (via `WapUtil.stagedWapId`, line 100), and guards against a non-unique wap id (throws "Cannot apply non-unique WAP ID", lines 101-104) or an unknown one (lines 111-113).
+- Then cherry-picks that snapshot: `table.manageSnapshots().cherrypick(wapSnapshotId).commit()` (line 116), returning the same `(source_snapshot_id, current_snapshot_id)` row shape (lines 61-63, 118).
+- This is the Spark implementation of the spec's WAP workflow (spec.md:2125-2126) layered on `CherryPickOperation`'s WAP handling (`CherryPickOperation.java:80-83, 108-111`).
+- Registered at SparkProcedures.java:60. Tests: `spark/v3.5/spark-extensions/src/test/.../TestCherrypickSnapshotProcedure.java:67, 104, 147` (also the v4.1 copy).
+
+**3. ALTER-style property path** (`SparkCatalog.commitChanges`, SparkCatalog.java:842-864): Spark also accepts `cherry-pick-snapshot-id` as a table property during an ALTER (parsed at SparkCatalog.java:318, 853). The guard at lines 851-853 rejects combining `current-snapshot-id` and `cherry-pick-snapshot-id` in the same statement because the execution order is ambiguous (mirroring Flink), and it performs the cherry-pick at line 863.
+
+### Flink — ALTER TABLE property
+
+`FlinkCatalog` routes the `cherry-pick-snapshot-id` option through `FlinkAlterTableUtil`:
+- In the property-based `alterTable`, it captures `pickSnapshotId` (FlinkCatalog.java:717) and in the table-change variant captures `cherrypickSnapshotId` (FlinkCatalog.java:778-779).
+- `FlinkAlterTableUtil.commitManageSnapshots(...)` (FlinkAlterTableUtil.java:97-115) rejects setting both `current-snapshot-id` and `cherry-pick-snapshot-id` at once (lines 101-103, comment at 99-100 explaining ordering ambiguity), then does the cherry-pick at line 113. Both `commitChanges` overloads call it first (lines 43, 74) — deliberately ahead of schema/property/location changes so the snapshot update happens first and fails fast if the id is invalid.
+- Test: `flink/v1.20/flink/src/test/.../TestFlinkCatalogTable.java:689, 729-730` (`ALTER TABLE tl SET('cherry-pick-snapshot-id'='...')`).
+
+## Common design points (the query-engine view)
+
+- **All roads lead to `ManageSnapshots.cherrypick(long)`.** No engine reimplements the operation; each just maps a user-facing surface (SQL procedure / ALTER property) onto the core `CherryPickOperation`. This is precisely the "engine behavior layered on the spec's snapshot model" structure described earlier.
+- **Both engines refuse to combine set-current-snapshot with cherry-pick** in one statement (SparkCatalog.java:851-853; FlinkAlterTableUtil.java:101-103), because applying them in either order yields a different table state.
+- **Both engines invalidate/refresh cached read plans** after the change so open queries don't keep reading the old `current-snapshot-id` — explicitly documented in the Spark procedure Javadocs (CherrypickSnapshotProcedure.java:39-41; PublishChangesProcedure.java:41-43).
+- **Flink ties it to the option-parsing layer**, so a user writes `SET('cherry-pick-snapshot-id'=...)`; **Spark ties it to procedures**, so a user writes `CALL ...cherrypick_snapshot(...)`. Both surface the same capability tailored to the engine's SQL dialect.
+
+The one notable asymmetry to flag: Flink exposes only the direct snapshot-id cherry-pick via `ALTER`; the WAP `publish_changes` path is Spark-only in this repo (there's no Flink equivalent procedure).

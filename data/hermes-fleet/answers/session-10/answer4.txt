@@ -1,0 +1,63 @@
+I have a complete picture now. Here is how query engines in this repo use branches and tags.
+
+## Overview
+
+Both integrations expose branch/tag as **SQL DDL** (Spark) and as **read options/table hints** (Spark data source options, Flink config + `FlinkSource.Builder`). On the read side, both funnel through the core `TableScan.useRef(name)` / `Table.snapshot(name)` API, which resolves the named reference into a snapshot before planning files. The DDL path — which is Spark-only — mutates the `refs` map via `ManageSnapshots`.
+
+## 1. Spark: SQL DDL to create, replace, and drop refs
+
+Spark implements dedicated `ALTER TABLE ... CREATE BRANCH/TAG`, `REPLACE BRANCH/TAG`, and `DROP BRANCH/TAG` statements through `spark-extensions`. The grammar declares the syntax (IcebergSqlExtensions.g4), and the AST builder maps it to logical plans.
+
+Execution for a branch is in CreateOrReplaceBranchExec.scala:
+- It loads the `SparkTable`, defaults the new branch to the current snapshot unless an explicit one is given (CreateOrReplaceBranchExec.scala:46-49).
+- It dispatches create vs. replace: `manageSnapshots.createBranch(...)` vs `replaceBranch(...)` (:54-70), with `CREATE OR REPLACE` handling (:62-69), and `IF NOT EXISTS` short-circuit (:71-73).
+- It applies the per-ref retention options — `setMinSnapshotsToKeep`, `setMaxSnapshotAgeMs`, `setMaxRefAgeMs` — then commits (:78-90). This is exactly the branch-only retention surface: `numSnapshots` → min-snapshots-to-keep, `snapshotRetain` → max-snapshot-age-ms, `snapshotRefRetain` → max-ref-age-ms.
+
+Tags follow the same pattern via CreateOrReplaceTagExec.scala and DropTagExec.scala / DropBranchExec.scala. These ultimately call into `UpdateSnapshotReferencesOperation` (core), which rewrites refs and produces the `SetSnapshotRef`/`RemoveSnapshotRef` metadata updates we covered earlier.
+
+## 2. Spark: read-side resolution (data-source options)
+
+Spark accepts `branch`/`tag` as read options alongside `snapshot-id`/`as-of-timestamp`. In IcebergSource it:
+- Reads all four and enforces mutual exclusivity: at most one of snapshot-id/as-of/branch/tag (IcebergSource.java:138-148).
+- Builds a "selector" used to form a distinct table identifier per ref — `BRANCH_PREFIX + branch`, `TAG_PREFIX + tag` (:150-166), so different branches are cached as separate table instances.
+
+The actual snapshot selection happens in SparkScanBuilder:
+- `useRef(branch)` / `useRef(tag)` when a ref is specified (SparkScanBuilder.java:495-501).
+- Incremental/changelog scans reject a branch/tag selector as incompatible (SparkScanBuilder.java:530-539).
+- Streaming micro-batches anchor the latest snapshot to the branch head via `SnapshotUtil.latestSnapshot(table, readConf.branch())` (SparkScanBuilder.java:644, 688) and `SparkMicroBatchStream` carries `readConf.branch()` through planning (SparkMicroBatchStream.java:94, 167).
+- The per-executor readers resolve the schema for the branch via `SnapshotUtil.schemaFor(table, branch)` (BatchDataReader.java:59, ChangelogRowReader.java:57, SparkPartitioningAwareScan.java:150) — which returns the table schema for branches but the pinned snapshot's schema for tags (SnapshotUtil.java:407-418, 431-443).
+
+Spark also supports branch selection via **WAP (write-audit-publish)**: when `write.audit.publish.enabled` is set and a WAP branch is configured in the session, reads transparently target that branch (SparkReadConf.java:119-127) — a query-engine-specific branch consumer.
+
+## 3. Flink: read-side resolution
+
+Flink does not ship branch/tag DDL — it consumes them as read options (`FlinkReadOptions.BRANCH`, `TAG`, plus `START_TAG`/`END_TAG` for incremental scans, FlinkReadOptions.java:35-45) and exposes fluent setters on `FlinkSource.Builder` (FlinkSource.java:155-161). The options flow into `ScanContext` (ScanContext.java:186-194, 539-545) and are applied at planning time in FlinkSplitPlanner:
+
+- Bounded full scan: `useRef(tag)` / `useRef(branch)` (FlinkSplitPlanner.java:126-129).
+- Incremental scan: `start-tag`/`end-tag` resolve to snapshot IDs via `table.snapshot(name)` for exclusive-start/inclusive-end bounds (FlinkSplitPlanner.java:91-117).
+- Streaming: the monitor uses the branch head as "current" instead of `table.currentSnapshot()` — `table.snapshot(scanContext.branch())` when a branch is set (StreamingMonitorFunction.java:196-199; same pattern in ContinuousSplitPlannerImpl.java:108-109), so streaming discovers new commits on the named branch rather than on `main`.
+
+## 4. The core hook both rely on: `Table.snapshot(name)` / `TableScan.useRef`
+
+Every engine path above bottoms out in core's name→snapshot resolution. `SnapshotUtil.latestSnapshot` implements the backward-compat rule: for `main` (or a missing/empty ref) it uses `currentSnapshot()` so legacy code keeps working, and only for a real non-main branch does it call `table.snapshot(name)` (SnapshotUtil.java:456-462, 478-489). Note the important asymmetry both engines inherit: a **branch** read tracks the branch head (which moves as the branch advances), while a **tag** read is pinned to the snapshot the tag points at — matching the spec's "tags are labels for individual snapshots; branches are mutable named references" (spec.md:1103).
+
+## Summary table
+
+| Surface | File:line | What it does |
+|---|---|---|
+| Spark branch DDL | CreateOrReplaceBranchExec.scala:43-90 | create/replace branch, set retention, commit |
+| Spark tag DDL | CreateOrReplaceTagExec.scala | create/replace tag label |
+| Spark drop | DropBranchExec.scala / DropTagExec.scala | remove ref |
+| Spark read option | IcebergSource.java:138-166 | branch/tag selector, mutual exclusion |
+| Spark scan resolution | SparkScanBuilder.java:487-501 | `useRef(branch/tag)` |
+| Spark schema for ref | SparkReadConf / BatchDataReader.java:59 | `schemaFor(table, branch)` |
+| Spark streaming branch | SparkMicroBatchStream.java:94,167; SparkScanBuilder.java:644 | branch-head micro-batch |
+| Spark WAP | SparkReadConf.java:119-127 | session WAP branch read |
+| Flink options | FlinkReadOptions.java:35-45 | branch/tag/start-tag/end-tag |
+| Flink builder | FlinkSource.java:155-161 | fluent setters |
+| Flink bounded scan | FlinkSplitPlanner.java:124-130 | `useRef(tag/branch)` |
+| Flink incremental scan | FlinkSplitPlanner.java:91-117 | start/end tag → snapshot bounds |
+| Flink streaming | StreamingMonitorFunction.java:196-199; ContinuousSplitPlannerImpl.java:108-109 | branch head = current |
+| Core resolution | SnapshotUtil.java:456-489 | name → snapshot, main falls back to current |
+
+The key design consequence the engines encode: branches are a moving target used for both reads and writes (streaming, WAP), while tags are an immutable pin used for bounded point-in-time reads and incremental bounding — a faithful implementation of the spec's branch/tag distinction.

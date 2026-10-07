@@ -1,0 +1,31 @@
+I've read format/spec.md in full (lines 1–2153). Here's what it says about partition evolution and why it's designed that way.
+
+## What the spec says
+
+**Where it lives.** The table tracks a *list* of partition specs in `partition-specs`, with `default-spec-id` pointing at the spec writers should use by default, and `last-partition-id` tracking the highest assigned partition-field ID so evolving specs always get fresh, unused field IDs (`#1157-1159`, `#1185-1187`). Each spec has a unique spec ID; evolving produces a new spec that's appended to the list and may become the new default (`#627`).
+
+**What evolution means.** "Table partitioning can be evolved by adding, removing, renaming, or reordering partition spec fields" (`#625`). A spec is a tuple of fields, each with source column id(s), a partition field id unique within the spec (and, in v2+, across all specs), a transform, and a name (`#552-557`). Two specs are "compatible/equivalent" when every corresponding field has the same source IDs, transform, and name — and writers must not create a new spec if a compatible one already exists, and must reuse field IDs for equivalent fields (`#565-567`).
+
+**Why field IDs must be stable.** "When evolving a spec, changes should not cause partition field IDs to change because the partition field IDs are used as the partition tuple field IDs in manifest files" (`#629`). The `partition` struct stored per data file uses partition field IDs as its struct field IDs (`#723, 746`), so changing an ID would corrupt how existing files' partition tuples are interpreted.
+
+**Version-specific rules (`#631-637`).** In v2, partition field IDs are explicit and new IDs assigned off `last-partition-id`. In v1, field IDs weren't tracked (the reference impl assigned them sequentially from 1000), which broke reading metadata tables from multiple specs because same-ID fields could hold different data types. So for v1 tables the spec *recommends*: (1) don't reorder fields, (2) don't drop fields — replace the transform with `void` instead, and (3) only append fields at the end. This is exactly what the `void` transform (always null, `#580-584`) exists for: "may be used to replace the transform in an existing partition field so that the field is effectively dropped."
+
+**How multiple specs coexist on disk.** A manifest stores files for a *single* partition spec, because "a manifest file's schema is based on its partition spec" (`#666`). When the spec changes, old files stay in the old manifest and new files go to new manifests. Snapshots freely contain manifests from multiple specs — "Tables can use multiple partition specs" (`#981`). Each manifest records its `partition-spec-id`, and the manifest list associates each manifest with its `partition_spec_id` (`#676, 1016`).
+
+**How reads stay correct across specs.** Reads don't use the current spec — they use the spec that wrote each manifest (`#666`, and `#1059`: "Conversion uses the partition spec that was used to write the manifest file regardless of the current partition spec"). Scan predicates on data columns are converted to partition predicates via an *inclusive projection*, so pruning is always derived from user predicates, never from hand-maintained partition predicates. That's what makes spec evolution transparent to queries.
+
+**Buckets.** Re-bucketing means changing `N` in `bucket[N]`, and "Changing the number of buckets as a table grows is possible by evolving the partition spec" (`#602`).
+
+## Why it's designed that way
+
+The core reason is the "**Storage separation**" goal: "Partitioning will be table configuration. Reads will be planned using predicates on data values, not partition values. Tables will support evolving partition schemes" (`#76`). Partitioning is deliberately *not* baked into how users query — it's a storage/physical concern that can change without breaking queries. The partition spec captures the transform from data to partition values, which is used to derive partition predicates from column predicates (`#561`), so "the partitioning can change and the correct partition filters are always derived from column predicates."
+
+A few concrete design consequences:
+
+- **Manifest-per-spec** isolates evolution: because a manifest's Avro schema derives from its spec, each spec gets its own immutable manifests, avoiding a rewrite of old metadata when the spec changes. Evolution is thereby cheap and non-destructive.
+- **Stable partition field IDs** are the contract that lets old and new assets coexist and be read correctly, since partition tuples and JSON serialization key off those IDs.
+- **IDs, not positions**, mean renaming and reordering are safe, and (in v2+) dropping is clean.
+- **The v1 rules** exist purely as a backward-compatibility workaround for a historical lack of tracked field IDs — the recommendation to drop via `void` rather than removing a field preserves tuple shape so same manifest-family files stay mutually interpretable.
+- **Evolution is cheap metadata-only** for most operations: it changes `partition-specs`/`default-spec-id`/`last-partition-id` in a new metadata file. Partition spec changes validate that the schema is unchanged between base and current version during commit conflict resolution (`#1319`). New data goes to new manifests, and query correctness is maintained by per-manifest predicate projection and metrics-based pruning.
+
+The design realizes the overall goal that an analytic table's physical layout can grow and change over time without rewriting data files or forcing users to change their queries.

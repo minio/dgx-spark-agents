@@ -1,0 +1,39 @@
+I've read format/spec.md end-to-end. Here's what it says about schema evolution and the design rationale behind it.
+
+What the spec says
+
+The core, ID-based design (Schemas and Data Types + Appendix A, C)
+- A table schema is a struct of named columns; every field in every struct, list element, and map key/value carries a stable integer field ID unique within the table schema. The schema's column names and order may change, but IDs are permanent.
+- Each changed schema becomes a distinct schema object with its own schema-id, appended to the table's `schemas` list; the current one is pointed to by `current-schema-id`. Old schemas remain readable.
+- All three embedded file formats (Avro, Parquet, ORC) store these field IDs in their schemas so readers can project by ID regardless of what the column is currently called. The ORC appendix calls this out explicitly: Iceberg's evolution is ID-based, ORC's is name-based, so Iceberg must rename columns to drive ORC's own evolution.
+
+Which changes are allowed (Schema Evolution section)
+- Type promotion (widening only) per a defined table: int->long, float->double, decimal(P,S)->decimal(P',S) with P'>P, and in v3 unknown->any, date->timestamp/timestamp_ns. No narrowing, and promotions must not change partition transform output.
+- Adding, deleting, renaming, reordering fields in structs (including nested).
+- Renaming keeps the same field ID; adding a field assigns fresh IDs; deleting removes the field.
+- Explicitly NOT allowed: folding/unfolding fields into/out of nested structs (`a,b,c` <-> `a, struct<b,c>`), and evolving primitives to structs or back.
+
+Behavioral consequences layered on top
+- Column projection by field ID (Column Projection): a file written with schema `1:a int, 2:b string, 3:c double` can be read by a schema projecting `3:measurement, 2:name, 4:a`. Missing field IDs resolve to: the identity-partition value, a `schema.name-mapping.default` ID map, the field's `initial-default`, else null.
+- Default values (v3): `initial-default` (for rows written before the field existed) and `write-default` (for rows written after). This gives SQL-ADD-COLUMN-default semantics without rewriting data files. Adding a required field requires both defaults set non-null; additions set `initial-default` permanently and allow `write-default` to change.
+- Identifier fields: an optional set of primitive field IDs that define row identity; float/double/optional fields can't be identifiers.
+- Reserved field ID range (> Integer.MAX_VALUE - 200) keeps metadata columns like `_file`, `_pos`, `_row_id` out of user-ID space.
+- Commit conflict rules: schema updates and partition spec changes must validate that the schema hasn't changed between the base and current version before applying, unlike appends.
+
+Why it's designed this way
+
+- Safe evolution without rewriting data. Because IDs outlive names, data files are decoupled from the schema that happens to be current. Old files written under old schemas stay valid and readable under new schemas. This is the "Evolution" goal (line 74): "safe column add, drop, reorder and rename, including in nested structures."
+
+- Immutable files, mutable metadata. Iceberg's whole model is that data files are immutable and each commit is a new metadata file with the full history preserved. Schema evolution is just one more metadata change producing a new current schema; nothing touches existing files. This keeps writes cheap (no rewrite on schema change) and operations O(1) at planning time.
+
+- Projection by ID is the keystone. If columns were resolved by name or position, rename/reorder would corrupt reads. IDs make rename, reorder, and add/drop semantically safe, including in nested structs, and let manifests from different eras coexist.
+
+- Type promotion is conservative to protect partition transforms and bounds. Only widening is allowed, and only to types whose hash (bucket) and truncate behavior is unchanged — the spec's examples (int->long OK, int->string not; date->timestamp not for bucket partitions because the transform value would differ). Manifest bounds don't store type info (Appendix B/Schema Evolution notes), so readers infer the original type from byte length (4 bytes = int/float/date, 8 = long/double/timestamp); promotion works only because these are supersets.
+
+- Defaults avoid a full-table backfill. `initial-default` lets new columns read as if present in old rows, matching SQL's ADD COLUMN DEFAULT behavior, without rewriting or adding a value to every existing row.
+
+- Evolution stays engine-agnostic and partitioned-metadata-friendly. Schema history lives in table metadata; partition and sort evolution are separate but parallel (each manifest pins its own spec, and reads derive filters from data predicates, not partition values), so schema and partitioning can evolve independently without breaking queries.
+
+- Backward/forward compatibility by design. Per-field required/optional rules and the v1->v2/v3/v4 defaults in Appendix E exist precisely so that evolving the schema doesn't break older readers (e.g., old readers default optional columns to null but fail on required columns populated only by `initial-default`).
+
+The one caveat worth flagging: the spec never guarantees full rollback — deleting a field can't be undone unless it was nullable or the snapshot hasn't changed — and it deliberately forbids structural regrouping (nested-struct folding), so the ID-based design prizes forward extensibility over arbitrary reshaping.

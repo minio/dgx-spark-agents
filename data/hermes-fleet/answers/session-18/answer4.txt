@@ -1,0 +1,58 @@
+Both Spark and Flink rely on name mapping in exactly the two places you'd expect from the spec: **reading** files (projection of files whose schemas carry names but no field ids) and **importing/migrating** non-Iceberg tables (making pre-existing files readable + stamping a mapping so writes stay consistent). Here's the walkthrough.
+
+## Spark
+
+**Read path — pull the mapping from table properties, hand it to the reader builder.**
+
+Every Spark data reader is a subclass of `BaseReader`. In its constructor it reads the table property and parses it into a `NameMapping`:
+
+- `BaseReader.java:100-102` — `String nameMappingString = table.properties().get(TableProperties.DEFAULT_NAME_MAPPING);` then `NameMappingParser.fromJson(...)` if non-null, else null.
+- `BaseReader.java:123-125` — exposes it via `protected NameMapping nameMapping()`.
+
+That mapping is then threaded into the per-file ReadBuilder so the underlying Parquet/Avro/ORC reader can resolve names→ids for files lacking ids:
+
+- `BaseBatchReader.java:94` — `.withNameMapping(nameMapping())` on the columnar batch read builder.
+- `BaseRowReader.java:63` — `.withNameMapping(nameMapping())` on the row-based builder.
+- Both build a reader whose `project(...)` (BaseBatchReader.java:84) selects columns. When the file has no field-id metadata, the reader consults the name mapping to translate the file's column names to the Iceberg field ids the projection asks for — exactly the spec's fallback (#2 in the projection order, spec :406).
+
+**Import/migration path — the whole point of the feature: read a non-Iceberg table.**
+
+`SparkTableUtil.importSparkTable` / `importUnpartitionedSparkTable` migrates an existing Spark (Hive/Parquet) table into Iceberg file-by-file:
+
+- `SparkTableUtil.java:444-446` — reads the target's `name-mapping.default` property and parses the `NameMapping`.
+- `SparkTableUtil.java:448-457` — passes it to `TableMigrationUtil.listPartition(...)` so metrics and the file listing can be computed even though the source files have no field ids.
+
+**Table-creation action — ensure a mapping always exists.**
+
+When creating an Iceberg table from an existing non-Iceberg one (migrate/snapshot), the code generates and stores a mapping derived from the schema, unless one is already set:
+
+- `BaseTableCreationSparkAction.ensureNameMappingPresent` (spark/v4.1 .../actions/BaseTableCreationSparkAction.java:172-177) — if `DEFAULT_NAME_MAPPING` is absent, builds one via `MappingUtil.create(table.schema())`, serializes with `NameMappingParser.toJson`, and commits it as the table property.
+- Called by `MigrateTableSparkAction.java:150` and `SnapshotTableSparkAction.java:149`.
+
+This is the symmetric write side: the same name mapping that lets readers find ids in files gets persisted so that a re-import or a reader later can resolve the names.
+
+(The v3.5 Spark module mirrors all of this at the same paths — e.g. SparkTableUtil.java:680-692, BaseTableCreationSparkAction.java:172-177.)
+
+## Flink
+
+Flink's integration is a thin pass-through: it carries the mapping string through its read config and hands it to the core reader.
+
+**Config plumbing:**
+
+- `FlinkReadConf.nameMapping()` (flink .../source/FlinkReadConf.java:165-167) — reads the `DEFAULT_NAME_MAPPING` option.
+- Source builders let callers override it: `FlinkSource.java:215-216` and `IcebergSource.java:456-457` put it into read options.
+- `ScanContext` (ScanContext.java:63, :88, :246-247, :379, :479-480, :559, :583) carries it; `IcebergSource.readerFunction` forwards it when constructing the reader function (IcebergSource.java:683, :695).
+
+**Read path — where the mapping is actually applied:**
+
+- `RowDataFileScanTaskReader.newIterable` (flink .../source/RowDataFileScanTaskReader.java:111-113) — `if (nameMapping != null) builder.withNameMapping(NameMappingParser.fromJson(nameMapping));` on the format ReadBuilder, before `.project(schema)` at :117. Same mechanism as Spark: names→ids resolved by the reader during projection.
+
+**Rewrite path — same mapping reused when rewriting files.**
+
+Flink's maintenance/rewrite operators read and forward the mapping so rewritten files keep their ids consistent:
+
+- `RowDataRewriter.java:68-69` — reads `DEFAULT_NAME_MAPPING` via `PropertyUtil.propertyAsString`.
+- `DataFileRewriteRunner.java:214` — reads it when configuring rewrites.
+- `RowDataFileScanTaskReader` / reader functions (`RowDataReaderFunction.java:95`, `ConverterReaderFunction.java:77`, `AvroGenericRecordReaderFunction.java:87`) all pass the mapping string into the scan-task reader; `SnapshotTableSparkAction`/`MigrateTableSparkAction` equivalents live under `actions/`.
+
+So in both engines the pattern is identical and matches the spec's intent: the query engine is agnostic to *why* a mapping exists (migration, alias names, etc.) — it just reads the `schema.name-mapping.default` property, parses it into a `NameMapping`, and feeds it to the format reader so that projection-by-name on id-less files produces the correct Iceberg field ids. The only engine-specific difference is plumbing: Spark builds the mapping itself at table-creation time (`MappingUtil.create`), while Flink keeps the plain JSON string in config and lets `RowDataFileScanTaskReader` / the core builder parse it.

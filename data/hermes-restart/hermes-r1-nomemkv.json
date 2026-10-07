@@ -1,0 +1,18 @@
+{
+ "label": "nomemkv",
+ "wall_s": 129.5,
+ "server": {
+  "prompt_tokens_total": 1383555.0,
+  "generation_tokens_total": 3950.0,
+  "prefix_cache_hits_total": 1275648.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 53.0,
+  "time_to_first_token_seconds_count": 14.0,
+  "request_prefill_time_seconds_sum": 50.6,
+  "request_decode_time_seconds_sum": 73.3
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "write, each data file is read, position/equality/DV deletes are applied via `DeleteFilter`, deleted rows are dropped, and only live rows are written to the new files \u2014 so the rewrite bakes the deletes in.\n\n**2. Drop now-obsolete delete files.** After the data is rewritten, the delete files that applied to the replaced files are no longer needed and are listed as `deleteFilesToReplace` so they're removed from the snapshot (BaseRewriteFiles.java:107-109), and the commit records them as removed \u2014 see the manifest merge's `VALIDATE_DATA_FILES_EXIST`/delete-file handling in MergingSnapshotProducer (MergingSnapshotProducer.java:76-85).\n\nThe compaction engine drives this via `BaseRewriteDataFilesAction`: it plans rewrites, then `table.newRewrite().validateFromSnapshot(startingSnapshotId)` marks the old data files for deletion, adds the compacted files, and crucially can set `dataSequenceNumber(startingSnapshotId.sequenceNumber)` (core/actions/BaseRewriteDataFilesAction.java:331-346). That `dataSequenceNumber` matters: the rewritten files inherit the *original* sequence number so that **older delete files (and any committed concurrently by a retry) still apply correctly** \u2014 the rewrite must not accidentally make deletes that should apply to the compacted rows stop applying (data spec: sequence-number inheritance, spec.md:928-937).\n\nIf the *new* compacted files are written with the starting snapshot's sequence number (not the new commit's), any delete file that came between starting and commit is correctly applied to them; if they took the new highest sequence number, older deletes (lower seq) would *not* apply and deleted rows could leak back in. That's exactly what `BaseRewriteDataFilesAction.java:341-344` handles. The `validateNoNewDeletesForDataFiles` check (BaseRewriteFiles.java:137-140) is the safety net that rejects the commit if a concurrent writer added deletes for files this compaction is replacing.\n\n## Key citations\n\nSpec \u2014 spec.md:1356-1372 (delete formats overview), 1375-1387 (DVs), 1391-1416 (position deletes), 1418-1429 (equality deletes), 1053-1092 (scan planning & application scope), 1946/1953/1921 (version gates), 928-937 (sequence number inheritance).\n\nCode \u2014 data/DeleteFilter.java:188-190 (composed filter), 257-273 (pos/DV), 202-242 (equality); data/BaseDeleteLoader.java:159-213 (loading DV vs pos files), 266-284 (DV validation); core/BaseRewriteFiles.java:85-155 (rewrite + validate); core/actions/BaseRewriteDataFilesAction.java:331-346 (sequence number on compaction); MergingSnapshotProducer.java:76-85 (delete-file validation).\n\n**Bottom line:** all three encodings express \"rows deleted in otherwise immutable data files\"; readers apply them only to older same-partition files (position/DV) or strictly-older files, possibly global for unpartitioned equality deletes; and compaction physically removes both the dead rows and the delete files (optionally preserving the original data sequence number so delete semantics survive the rewrite).\n",
+ "stderr": ""
+}

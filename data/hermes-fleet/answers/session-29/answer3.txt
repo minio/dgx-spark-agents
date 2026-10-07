@@ -1,0 +1,43 @@
+Here are the edge cases and failure modes in table encryption, mapped to the code guards, file:line cited.
+
+## Configuration / setup failures
+
+**1. Invalid table key id (null).** `StandardEncryptionManager.java:67` — `Preconditions.checkNotNull(tableKeyId, ...)` rejects a null `encryption.key-id`.
+**2. Invalid data key length.** The AEAD key must be 16/24/32 bytes (AES-128/192/256). Guarded in three places because bad lengths surface at different layers: the manager constructor `StandardEncryptionManager.java:68-71`; the factory `EncryptionUtil.createEncryptionManager` `EncryptionUtil.java:117-120`; and the cipher itself `Ciphers.newKey` `Ciphers.java:191-194` (this last one matters because a KMS could return a key of unexpected length at *decrypt/unwrap* time, which the earlier checks can't see).
+**3. KMS client misconfiguration.** `EncryptionUtil.java:51-55` forbids setting both `kms-type` and `kms-impl`. A wrong/absent impl class or a class that doesn't implement the interface fails fast via `EncryptionUtil.java:72-94`. `StandardEncryptionManager.java:72` requires a non-null client.
+**4. Encryption configured on a pre-v3 table.** Encryption is a v3 feature; `EncryptionUtil.checkCompatibility` `EncryptionUtil.java:205-217` rejects the `encryption.key-id` / `encryption.data-key-length` properties for format version < 3.
+
+## State / key-rotation failures
+
+**5. Which key is a KEK vs. a file key.** The manager decides whether an entry is a key-encryption-key by `key.encryptedById().equals(tableKeyId)` `StandardEncryptionManager.java:139`. If table metadata is corrupted or hand-edited such that no key wraps with the table key, `keyEncryptionKeyID()` falls through and *creates a new wrapping key* `StandardEncryptionManager.java:148-159`, which changes the effective KEK — but note this creates risk silently rather than failing.
+**6. Registering a file key whose wrapping key is a KEK.** `encryptedByKey` validates `!encryptedKeyMetadata.encryptedById().equals(tableKeyId)` `StandardEncryptionManager.java:179-182` — it rejects passing a KEK where a manifest-list/file key id is expected.
+**7. Missing encryption key for a stored key id.** `encryptedByKey` `StandardEncryptionManager.java:174-177` throws if the manifest-list key id isn't in table metadata (a broken/missing `encryption-keys` entry → cannot decrypt).
+**8. Missing/tampered KEK timestamp.** The KEK timestamp is used as GCM AAD to bind the key metadata to a specific key version (anti timestamp-tampering). Guarded by `StandardEncryptionManager.java:140-141` (parse) and `EncryptionUtil.decryptManifestListKeyMetadata` `EncryptionUtil.java:161-162` (`Preconditions.checkState` that the KEK is timestamped) — decryption fails rather than proceeding with an untrustworthy binding.
+
+## Key lifecycle / access failures
+
+**9. Expired KEK (rotation).** `keyEncryptionKeyID()` skips keys older than 730 days (NIST SP 800-57 max KEK crypto-period) `StandardEncryptionManager.java:42,142-144` and rotates a fresh one via the KMS `StandardEncryptionManager.java:149-159`.
+**10. The `encryption.key-id` table property doesn't change security — it only changes the wrapping key.** Nothing complains if the table's `key-id` property is changed to a key that doesn't match existing data files' wrapping; `EncryptionUtil.java:101-123` merely uses it for `unwrapKey`. The real check is the GCM tag: a wrong key produces an auth failure (below). So the code relies on the AEAD integrity check, not on id bookkeeping, to catch key mismatch.
+**11. Wrong/corrupt key or tampered data at decrypt.** GCM authenticates every block; `Ciphers.AesGcmDecryptor` catches `AEADBadTagException` and fails loudly with an explicit message `Ciphers.java:175-179`, since AES-GCM can't distinguish wrong key from tampered ciphertext.
+
+## Format / stream-level failures
+
+**12. Not-a-GCM-stream input.** `AesGcmInputFile.newStream()` refuses streams shorter than the minimum `MIN_STREAM_LENGTH` `AesGcmInputFile.java:70-73`; header magic `AGS1` and block size are validated `AesGcmInputStream.validateHeader` `AesGcmInputStream.java:75-84`. If a data file is somehow plaintext or a different stream, this throws.
+**13. Truncated/tampered ciphertext length causing block math errors.** The stream detects insufficient length before decrypting a block `Ciphers.java:152-157`; reading a partial/beyond-EOF seek raises `EOFException` `AesGcmInputStream.java:149-155`.
+**14. Missing file length (GCM truncation protection).** Whole-file AES-GCM requires the ciphertext length to compute plaintext length and guard truncation. The deprecated constructor that omits it is marked unsafe `AesGcmInputFile.java:33-39`; `encryptedLength()` throws if null `AesGcmInputFile.java:49-55`; `AesGcmOutputFile.toInputFile()` refuses because length is unknown `AesGcmOutputFile.java:52-54`. The `ManifestListWriter`/`ManifestWriter` code embeds the file length into the key metadata specifically for this (`ManifestWriter.java:252-257`, `ManifestListWriter.java:105-108` via `copyWithLength`), and the reader uses it (`StandardEncryptionManager.java:319-330`, `StandardKeyMetadata` `fileLength`).
+**15. Partial-block ordering violation.** `AesGcmOutputStream.encryptAndWriteBlock` `AesGcmOutputStream.java:143-144` forbids writing data after a partial (last) block — a write bug would otherwise corrupt the stream.
+
+## Metadata / lifecycle edge cases
+
+**16. Duplicate or orphan encryption keys in `encryption-keys`.** `TableMetadata.addEncryptionKey` `TableMetadata.java:1507-1511` dedupes by key id (idempotent across commit retries), so re-registering the same key doesn't create duplicates — important because snapshot commits are retried optimistically and the same key metadata may be added repeatedly (`SnapshotProducer.java:507-510`).
+**17. Null/absent `key_metadata`.** Handled gracefully: `BaseFile.keyMetadata()` returns null `BaseFile.java:535-536`; `EncryptionKeyMetadatas`/`ManifestWriter.keyMetadataBuffer()` returns null for plaintext writes `ManifestWriter.java:258-262`; decrypt treats null metadata as a plaintext pass-through (`StandardEncryptionManager.java:97-98` short-circuits for already-native files). `PlaintextEncryptionManager` is returned when the table isn't encrypted `EncryptionUtil.java:106-109`.
+**18. Decrypting without a `StandardEncryptionManager`.** `EncryptionUtil.decryptManifestListKeyMetadata` / `encryptionKeys` validate the manager type `EncryptionUtil.java:146-149,177-180`, so plaintext managers can't be pushed into key-decrypt paths.
+
+## Key observations on residual risk
+
+- **The primary integrity/correctness backstop is the GCM authentication tag, not the metadata bookkeeping.** Wrong wrapping key (`#10`), tampered data, or a mismatched key all manifest as an `AEADBadTagException` (`Ciphers.java:175`) rather than a targeted error.
+- **Silent behavior on certain corruption:** if table metadata contains a key whose `encryptedById` never matches the table key (`#5`), `keyEncryptionKeyID()` silently mints a new KEK (`StandardEncryptionManager.java:148-159`) instead of erroring — that's a recoverability foot-gun more than a crypto one.
+- **The timestamp-as-AAD binding (`#8`) only protects the manifest-list key metadata path.** Data-file key metadata (`StandardKeyMetadata`) has no timestamp binding, so it relies solely on GCM's tag for tamper detection.
+- **No rate/attempt throttling or KMS error translation** in the client boundary (`KeyManagementClient.java`); a `RuntimeException` from a down KMS propagates as a hard read/write failure — availability, not confidentiality, is the risk there.
+
+Net: the code guards configuration errors (length, nulls, v3 gate, KMS wiring), key lifecycle (rotation, expiry, missing/dup ids, KEK-vs-file disambiguation), and stream integrity (magic, block size, truncation, partial-blocks, AEAD auth). The single consistent failure mode for any wrong-key/tampered data is a GCM tag check failure, which Iceberg surfaces as an explicit, actionable error.

@@ -1,0 +1,18 @@
+{
+ "label": "day1-1",
+ "wall_s": 68.4,
+ "server": {
+  "prompt_tokens_total": 162966.0,
+  "generation_tokens_total": 1567.0,
+  "prefix_cache_hits_total": 97792.0,
+  "external_prefix_cache_hits_total": 0.0,
+  "time_to_first_token_seconds_sum": 33.8,
+  "time_to_first_token_seconds_count": 5.0,
+  "request_prefill_time_seconds_sum": 32.0,
+  "request_decode_time_seconds_sum": 32.1
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "nifests.\n\nThe picture on the spec's Overview section (line 81) shows exactly this nesting: metadata JSON -> snapshot -> manifest list -> manifests -> data files.\n\n## How a reader finds the files for a query\n\nThe whole design is about getting to the answer with O(1) remote calls to open metadata/list files, and only touching the leaf files that can match:\n\n1. Load table metadata and pick the snapshot. Read the metadata JSON once, resolve the target snapshot (current, or a branch/tag/time-travel target via snapshot-log). This is the single atomic read that fixes the reader to one consistent state.\n\n2. Read the snapshot's manifest list. Open the one manifest list file for that snapshot. This gives concise summaries for every manifest.\n\n3. Skip whole manifests using manifest-list summaries. Use the per-manifest file counts and partition-field bounds to drop manifests whose partitions can't satisfy the query (spec \"Scan Planning\", lines 1053-1058).\n\n4. Convert the query predicate into an inclusive partition predicate, then read each surviving manifest. The scan predicate (on data columns) is projected down to a predicate on partition values using the partition spec that wrote that manifest \u2014 e.g. `ts > X` becomes `ts_day >= day(X)` (lines 1059-1063). This picks only the manifests/files whose partition tuples can overlap.\n\n5. Within a manifest, prune individual data files using column metrics. Data files are further filtered by comparing the query predicate against their per-column lower/upper bounds and counts stored in the manifest (lines 1067-1069). Only files that survive are scheduled for reading.\n\n6. Account for delete files. Delete manifests are scanned and, using the same metric pruning, only delete files/DVs that can overlap a surviving data file (same partition, correct data-sequence-number ordering) are kept and must be applied at read time (lines 1073-1098). Position deletes apply to same/older data files in the same partition; equality deletes typically only to strictly older files in the partition (or globally if unpartitioned).\n\n7. Read the surviving data files and apply residual predicates. Each file's rows are filtered against the actual (residual) predicate \u2014 partition filtering is inclusive, so files may contain non-matching rows that must be filtered at read time \u2014 and any applied deletes are merged out.\n\nKey properties that make this work: each live content file appears at most once within a snapshot (content file uniqueness), DELETED entries are simply ignored in scans, and everything is immutable \u2014 the snapshot a reader grabbed is never mutated, so the reader never needs locks. That's where serializable isolation and O(1) planning come from.\n\nOne note: the file at `format/spec.md` in this checkout is the current spec including v4 (which adds relative paths and prohibits new equality deletes). v4 is still under development per the versioning note (lines 27-31); the layout above holds whether you're reading v1, v2, or v3 metadata.\n",
+ "stderr": ""
+}

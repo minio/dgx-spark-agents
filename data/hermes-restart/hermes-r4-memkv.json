@@ -1,0 +1,18 @@
+{
+ "label": "memkv",
+ "wall_s": 76.6,
+ "server": {
+  "prompt_tokens_total": 816350.0,
+  "generation_tokens_total": 3167.0,
+  "prefix_cache_hits_total": 707328.0,
+  "external_prefix_cache_hits_total": 97024.0,
+  "time_to_first_token_seconds_sum": 12.5,
+  "time_to_first_token_seconds_count": 8.0,
+  "request_prefill_time_seconds_sum": 10.4,
+  "request_decode_time_seconds_sum": 60.1
+ },
+ "clone_unchanged": true,
+ "returncode": 0,
+ "answer": "value matches before returning results.\n\n## What compaction does with them\n\nCompaction (rewriting data files) rewrites a set of old data files into fewer, larger files. It reads the surviving rows \u2014 i.e. it applies the deletes so deleted rows are not copied forward \u2014 then swaps old files for new via `RewriteFiles`, which removes the old data files' delete files from the snapshot as part of the same atomic commit.\n\nThe flow is `BaseRewriteDataFilesAction` (core/src/main/java/org/apache/iceberg/actions/BaseRewriteDataFilesAction.java): plan files from the starting snapshot (lines 226-244), group by partition, keep partitions with >1 file (lines 246-256), split/combine into tasks (lines 258-270), `rewriteDataForTasks` (line 276) does the actual read-and-rewrite (this is where `DeleteFilter` drops deleted rows), then `replaceDataFiles` \u2192 `doReplace` (lines 303-347) builds a `RewriteFiles` op that deletes the old data files and adds the new ones, and commits (line 346).\n\nTwo compaction-specific interactions worth noting:\n\n1. **Equality/position deletes are consumed by the rewrite.** New output files contain only live rows, so the old delete files no longer apply and are removed along with the old data files. After compaction those rows are implicitly deleted by absence rather than by a delete marker.\n\n2. **Sequence-number handling for equality deletes.** Because a rewrite re-bases onto whatever snapshot is current, the new data files are written at the commit's (newer) sequence number. If a concurrent writer added a new equality delete at a sequence number between the original data and the rewrite, the rewritten file could \"escape\" that delete. `useStartingSequenceNumber(true)` (BaseRewriteDataFilesAction.java:214-217) writes the rewritten files with the starting snapshot's sequence number instead, so higher-numbered equality deletes still apply to them \u2014 the code comment at lines 204-210 states this is to \"avoid commit conflicts with updates that add newer equality deletes at a higher sequence number.\" The plumbing is `rewriteFiles.dataSequenceNumber(...)` at lines 341-344.\n\n## Summary table\n\n| Mechanism | New writes in | Read-time condition (spec) | Compacted by rewriting live rows |\n|---|---|---|---|\n| Position deletes | v2 (deprecated v3) | file_path match (+ ratcheted file), same partition, seq \u2264; same-commit allowed | yes |\n| Equality deletes | v2, v3 (prohibited v4) | seq **strictly <** delete; same partition or global | yes |\n| Deletion vectors | v3+ | referenced_data_file match, same partition, seq \u2264; at most one per file | yes |\n\nKey citations: format/spec.md:1356-1389 (formats), 1053-1098 (scan planning/apply rules), 1418-1469 (equality), 1921-1925 & 1953 (version prohibitions); code: BaseDeleteLoader.java:160-284 (DV/position loading, referenced-file validation), data DeleteFilter.java (row filtering), BaseRewriteDataFilesAction.java:303-347 (compaction rewrite+replace), :214-217 & :341-344 (starting sequence number for equality deletes).\n",
+ "stderr": ""
+}

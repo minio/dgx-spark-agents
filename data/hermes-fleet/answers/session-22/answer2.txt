@@ -1,0 +1,45 @@
+I now have the full picture. Here's how the implementation follows the spec, with file:line citations.
+
+## SnapshotSummary.java — the summary *producer*
+
+This class is the single place that computes the optional metric fields. It tracks additions/removals and folds them into the final `Map<String,String>`.
+
+**It's a string map, exactly as the spec requires.** Every key is a `public static final String` constant whose value is the spec's exact kebab-case name (SnapshotSummary.java:32-68), e.g. `added-data-files` (line 32), `total-records` (line 46), `manifests-created` (line 65). The values are all strings — `setIf` converts with `String.valueOf(value)` (SnapshotSummary.java:386-394), matching Appendix F's "value of these fields should be of string type (e.g. `"120"`)" (spec.md:2084). The final result is an `ImmutableMap<String, String>` (SnapshotSummary.java:191-214).
+
+**Only non-zero deltas are emitted.** Every metric is written through `setIf`, which omits the key when the counted value is 0 (SnapshotSummary.java:386-394). `addedFile`/`removedFile` accumulate counters grouped by content type (SnapshotSummary.java:291-345). This keeps the summary minimal and cheap — consistent with the spec's design that the summary is optional-by-value and only summarizes *changes*.
+
+**The counters map 1:1 to Appendix F's metrics table.**
+
+- Data files/records: `addedFiles`/`removedFiles` → `added-data-files`, `deleted-data-files`; `addedRecords`/`deletedRecords` → `added-records`, `deleted-records` (SnapshotSummary.java:267-268, 278-279). Records come from `file.recordCount()` (line 296, 324), matching spec's `total-records`/`added-records` as counts of data-file records.
+- Delete files: `addedDeleteFiles`/`removedDeleteFiles` → `added-delete-files`, `removed-delete-files` (lines 274-275, 305, 309, 333, 337); split into equality (`added-equality-delete-files`, `removed-equality-delete-files`, lines 269-270) and position (`added-position-delete-files`, `removed-position-delete-files`, lines 271-273). Deletion vectors are counted separately (`added-dvs`, `removed-dvs`, lines 276-277).
+- Delete records: `addedPosDeletes`→`added-position-deletes`, `addedEqDeletes`→`added-equality-deletes` (lines 284-287, plus total variants), matching Appendix F.
+- Sizes: `addedSize`/`removedSize` → `added-files-size`, `removed-files-size` (lines 282-283).
+- Manifest counts: `manifests-created`, `manifests-replaced`, `manifests-kept`, `entries-processed` (lines 65-68); `addedManifest` updates these (lines 347-361).
+- `deleted-duplicate-files` (line 56, emitted at 198) and `changed-partition-count` (line 57, emitted at 200) also match the spec's "Other"/metrics tables.
+
+**The `added-delete-files` vs DVs distinction follows the code it calls.** When a file is added, `addedFile` checks `ContentFileUtil.isDV(deleteFile)` (SnapshotSummary.java:300) — DV detection is `delete FileFormat == PUFFIN` (ContentFileUtil.java:142-144). A PUFFIN DV increments `addedDVs` (→`added-dvs`); a regular position-delete increments `addedPosDeleteFiles`; both bump `addedDeleteFiles` (→`added-delete-files`, lines 298-306). This matches Appendix F's definitions: `added-delete-files` = "positional/equality delete files *and deletion vectors*", with `added-dvs` and `added-position-delete-files` as the finer breakdown.
+
+**Sizes come from `ScanTaskUtil.contentSizeInBytes`** (SnapshotSummary.java:292, 320), which for a data file uses `fileSizeInBytes()`, for a DV uses `contentSizeInBytes()`, and for other delete files uses `fileSizeInBytes()` (ScanTaskUtil.java:30-37). This correctly sizes DVs (which are blobs stored inside a Puffin file, so their *content* length, not the host file length, is the added size), mirroring the delete-manifest's `content_offset`/`content_size_in_bytes` semantics for vectors (spec.md:743-744).
+
+**Partition summaries and the append-vs-rewrite distinction.** The builder tracks per-partition `UpdateMetrics` and emits `changed-partition-count` and per-partition summaries under a `partitions.` prefix, gated by `partition-summaries-included` and a partition-summary limit (SnapshotSummary.java:159-171, 199-214). Critically, `addedManifest` sets `trustPartitionMetrics = false` (line 150) — so when a snapshot is produced by *merging/rewriting whole manifests* (BaseRewriteManifests → snapshot metadata) rather than adding individual files (FastAppend/append), per-partition counts and size/delete-record totals are dropped. This is a faithful read of the spec: those are *recommended* Appendix F fields, and the implementation only guarantees them when the producer actually has exact per-file metrics.
+
+## The `operation` field (required by spec)
+
+The spec requires `summary.operation` (spec.md:963, 969). That value does *not* come from SnapshotSummary's builder — it's supplied by the snapshot producer and handled separately:
+
+- The defining constants live in `DataOperations` (api), with the exact spec strings: `APPEND="append"`, `REPLACE="replace"`, `OVERWRITE="overwrite"`, `DELETE="delete"` (DataOperations.java:36, 43, 50, 57), matching the four spec values (spec.md:971-975).
+- Each concrete producer overrides `operation()`: `FastAppend` → APPEND (FastAppend.java:62-63), `BaseRewriteFiles`/`BaseRewriteManifests` → REPLACE (BaseRewriteFiles.java:43-44), `BaseReplacePartitions` → OVERWRITE (BaseReplacePartitions.java:46-47), `StreamingDelete` → DELETE (StreamingDelete.java:37-38). `BaseOverwriteFiles`/`BaseRowDelta` choose dynamically — DELETE if only deleting, APPEND if only adding, otherwise OVERWRITE (BaseOverwriteFiles.java:50-59).
+- `SnapshotProducer.summary()` calls the abstract `operation()` and `summary()` (SnapshotProducer.java:342-343, 389) — it validates that a REPLACE has `added-records <= deleted-records` (SnapshotProducer.java:345-354), then keeps the operation while decorating the implementation's per-snapshot summary. If no summary is present it returns empty (SnapshotProducer.java:395-397).
+- **Crucially**, `Snapsh/otProducer.summary(previous)` also maintains the running `total-*` metrics across snapshots (SnapshotProducer.java:426-467): it takes the *previous* snapshot's totals (or seeds them at 0 for a first snapshot, lines 410-418) and adds this snapshot's `added-*` minus `removed-*` to produce `total-records`, `total-files-size`, `total-data-files`, `total-delete-files`, `total-position-deletes`, `total-equality-deletes`. This is what produces the spec's total metrics (e.g. `total-records` = "total records in live data files in the snapshot", spec.md:2104) — SnapshotSummary alone only knows the delta.
+
+## Serialization and parsing (spec conformance at the boundary)
+
+- **Write:** `SnapshotParser.toJson` writes `summary` as a JSON object, always emitting `operation` first, and skips re-emitting it from the map so it appears exactly once (SnapshotParser.java:69-83). This matches the spec's snapshot JSON where `summary.operation` is required (spec.md:1797).
+- **Read:** `SnapshotParser.fromJson` parses `operation` out of the summary (SnapshotParser.java:153-154), defaulting to `OVERWRITE` when the snapshot predates operation tracking (SnapshotParser.java:167) — matching the spec's rule that `operation` is required in v2+ but was optional in v1.
+- The `Snapshot` interface exposes `operation()` and `summary()` (BaseSnapshot.java:140), which is what expiration, incremental scans, and cherry-pick use — the consumers the spec's `operation` field is designed for.
+
+## Net
+
+SnapshotSummary.java is the concrete, exact implementation of Appendix F's metrics: same kebab-case string keys, string-typed values, only non-zero deltas, split by data / equal-delete / position-delete / DV, with sizes computed correctly for DV blobs via `ScanTaskUtil`/`ContentFileUtil`. The required `operation` field is provided by the producer layer (`DataOperations` + `Snapsh/otProducer`), which additionally rolls up the cross-snapshot `total-*` metrics — the part of Appendix F that a single-snapshot builder cannot compute on its own. Together they produce a minimal, forward-compatible string-map summary that stays purely informational, exactly as the spec intends.
+
+One small caveat: I read only `SnapshotSummary.java` in full plus the specific methods it calls; I traced the producers (`FastAppend`, `BaseOverwriteFiles`, etc.) only as far as their `operation()`/`summary()` return values, not each one's full summary-building path. If you want, I can trace how e.g. `FastAppend` vs `BaseRewriteFiles` build their per-snapshot `summary()` maps (the part merged in at SnapshotProducer.java:424).

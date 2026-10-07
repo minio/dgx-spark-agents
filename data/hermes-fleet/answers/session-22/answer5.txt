@@ -1,0 +1,12 @@
+Snapshot summaries in ~10 bullets, each pointing at the first thing to read.
+
+- **What it is:** `summary` is a `Map<String,String>` on every snapshot that describes what that snapshot changed — one required key, `operation`, plus informative counts. Snapshot schema: `format/spec.md:963`.
+- **The four operations:** `append`, `replace`, `overwrite`, `delete` — the only legal values, defined centrally. Spec: `format/spec.md:969-976`; constants: `api/src/main/java/org/apache/iceberg/DataOperations.java:36-57`.
+- **Why `operation` exists:** readers/expiration classify a snapshot to skip ones with no user data (e.g. a rewrite). Intent is documented right at the constants: `DataOperations.java:24-27`.
+- **The metric keys:** every allowed optional count (`added-data-files`, `total-records`, sizes, delete-file counts, DVs, manifests) is a named constant here — start here to see the full vocabulary: `core/src/main/java/org/apache/iceberg/SnapshotSummary.java:32-68`.
+- **How counts are computed:** delta is tracked per add/remove, grouped by content type (data / position-delete / equality-delete / DV), zero values omitted. Builder + counters: `SnapshotSummary.java:118-147`, `SnapshotSummary.java:266-289`.
+- **Totals are rolled forward, not stored per-snapshot:** `total-*` are computed by adding this snapshot's `added-*` minus `removed-*` onto the previous snapshot's totals. `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:426-467`, helper `:898-928`.
+- **Where totals come from on a first snapshot:** synthesized baseline of zeros when there's no parent, or empty when the parent had no summary. `SnapshotProducer.java:402-419`.
+- **The one hard invariant:** a `replace` must not add more records than it removed — commit fails if it does. `SnapshotProducer.java:345-357`.
+- **How it's serialized:** `operation` is written first and de-duplicated so it appears exactly once; read back with a default of `overwrite` for v1 snapshots. `core/src/main/java/org/apache/iceberg/SnapshotParser.java:69-83`, `:153-167`.
+- **Why a query engine cares:** Spark streaming skips `replace`/`delete`/`overwrite` snapshots based on `operation` (`spark/.../source/BaseSparkMicroBatchPlanner.java:54-81`), and Flink persists its checkpoint offset inside the summary for restart recovery (`flink/.../sink/SinkUtil.java:83-105`).

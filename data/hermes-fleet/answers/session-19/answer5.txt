@@ -1,0 +1,23 @@
+Ten entry points for a new contributor, in reading order:
+
+1. What a partition transform is, conceptually, and the full table of built-ins — format/spec.md:569-588. This is the contract everything below implements: `identity`, `bucket[N]`, `truncate[W]`, `year/month/day/hour`, `void`.
+
+2. The `Transform` interface every partition transform implements — api/.../transforms/Transform.java:39-128. Read this first: `bind`, `canTransform`, `getResultType`, and the two projection methods `project`/`projectStrict` are the shape of all transforms.
+
+3. How transforms are parsed from their string form (e.g. `"bucket[16]"` from table metadata) — api/.../transforms/Transforms.java:54-81. Case-insensitive dispatch, `UnknownTransform` fallback.
+
+4. The factory for creating a transform from parameters (the modern entry point used by engines) — api/.../transforms/Transforms.java:221-295. `bucket(int)`, `truncate(int)`, `year()`, etc., versus the deprecated typed variants.
+
+5. The bucket math — the exact spec formula `(hash & Integer.MAX_VALUE) % N` is in Bucket.java:112-117; the actual hash is in util/BucketUtil.java:34-103. Note the fixed-seed Murmur3 and the int/long hash identity that makes schema promotion safe.
+
+6. Truncate semantics (positive-remainder int/long, scale-aware decimal, code-point-aware string) — api/.../transforms/Truncate.java:164-304 plus util/TruncateUtil.java:47-74 and util/UnicodeUtil.java:41-55.
+
+7. The time transforms (year/month/day/hour) — api/.../transforms/TimeTransform.java:28-106. They delegate by source type to Dates (api/.../transforms/Dates.java:34-223) or Timestamps (api/.../transforms/Timestamps.java:34-242) for date vs timestamp sources.
+
+8. The two that aren't really transforms: `void` (always null, for dropping fields) — VoidTransform.java:28-93; and `UnknownTransform` (readable but not writable) — UnknownTransform.java:28-99.
+
+9. How transforms make queries work: predicate projection — api/.../expressions/Projections.java:28-67 (inclusive vs strict) and 195-259 (per-partition-field binding). This is the "storage separation" payoff from the spec.
+
+10. Where it actually runs in a query: core ManifestGroup.java:286-291 turns a data filter into a per-manifest partition filter using `Projections.inclusive(...).project(...)`, and Spark mirrors transforms to its planner at Spark3Util.java:305-346 and for metadata deletes via Projections.strict at SparkTable.java:397.
+
+Start with #1 and #2; the rest hang off those.

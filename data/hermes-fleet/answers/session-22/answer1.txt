@@ -1,0 +1,44 @@
+I've read the full spec (all 2153 lines). Here's what it says about snapshot summaries and the reasoning behind the design.
+
+## What the spec says
+
+**The `summary` field on a snapshot** (spec.md:963)
+
+A snapshot is the state of a table at a point in time. In the snapshot JSON, `summary` is a string→string map that "summarizes the snapshot changes." Its required member is `operation`. It's optional in v1, required in v2 and v3.
+
+**`operation` values** (spec.md:969-976)
+
+The summary's one *required* key is `operation`, which is used by operations like snapshot expiration to decide whether to skip processing a snapshot. There are exactly four allowed values, each classifying what kind of change a snapshot made:
+
+- `append` — only data files were added, none removed. "Fast append."
+- `replace` — data/delete files added and removed without changing table data (compaction, changing file format, relocating files).
+- `overwrite` — data/delete files added and removed in a logical overwrite.
+- `delete` — data files removed / their rows logically deleted, and/or delete files added.
+
+**Optional summary keys** (Appendix F, spec.md:2082-2129)
+
+Beyond `operation`, the summary may carry optional metrics (all stored as strings, e.g. `"120"`):
+
+- File counts: `added-data-files`, `deleted-data-files`, `total-data-files`, plus delete-file variants (`added-delete-files`, `added-position-delete-files`, `added-equality-delete-files`, `removed-...`, `added-dvs`, `removed-dvs`, `total-delete-files`).
+- Record counts: `added-records`, `deleted-records`, `total-records`.
+- Size: `added-files-size`, `removed-files-size`, `total-files-size`; and position/equality delete record counts.
+- Operational/planning stats: `deleted-duplicate-files`, `changed-partition-count`, `manifests-created`, `manifests-kept`, `manifests-replaced`, `entries-processed`.
+- Non-metric operational details: `wap.id`, `published-wap-id`, `source-snapshot-id`, `engine-name`, `engine-version` (e.g. for Write-Audit-Publish staging and cherry-picking).
+
+Note an important subtlety in Appendix F: the metrics section explicitly says these snapshot-summary fields are part of **"Implementation Notes"** — recommendations, not spec requirements. Only `operation` is a true spec requirement.
+
+## Why it's designed that way
+
+The design choices map directly back to Iceberg's stated goals (spec.md:69-77) — especially **serializable isolation, speed (O(1) planning, no locks), and scale (clients do the planning, no central metadata bottleneck)**:
+
+1. **It's a *summary*, not the data.** The full file set of a snapshot lives in manifests, tracked by a manifest list. The summary's job is to give a *cheap, human/engine-consumable snapshot* of what changed, and to let operations classify and roughly size snapshots without opening any manifests. That's consistent with the "avoid reading manifests that are not required" philosophy (spec.md:89, 1005) — you can answer "what happened in this snapshot and roughly how big" from one small JSON map instead of scanning Avro files.
+
+2. **It's a string map, not a typed struct.** Keeping it a flat `map<string,string>` is deliberate: it's extensible across versions and engines without breaking forward compatibility. Engines and catalogs can add their own keys (like `engine-name`, `wap.id`, `source-snapshot-id`) without the spec having to version or define them, and without becoming a compatibility surface. Since the summary is informational plumbing rather than something readers depend on for correctness, a loose format is cheap and flexible.
+
+3. **`operation` is required because retention/expiration needs it.** The one place the summary is load-bearing is snapshot expiration (spec.md:969): the retention policy walks ancestors of branches, and classifying a snapshot as `append`/`replace`/`overwrite`/`delete` lets expiration and other maintenance decide whether a snapshot can be skipped or how to treat its files. Because these operations *depend* on the classification, `operation` alone is a hard requirement, while everything else remains optional.
+
+4. **The metrics help clients plan without a catalog bottleneck.** Because job planning is client-side (the "Scale" and "Speed" goals), the summary's counts — total/added/deleted files and records, file sizes, manifest counts, partitions changed — let a planner or a tool estimate work, do cost-based optimization, and monitor writes (e.g. compaction effectiveness, redundant duplicate cleanup via `deleted-duplicate-files`) using only the in-memory metadata already loaded, keeping the design O(1) calls and refined-scans-free.
+
+5. **Version gating reflects growing requirements.** `summary` and `operation` are optional in v1 but required by v2 (spec.md:963). This tracks v2's stricter writer requirements (Appendix E: Version 2) — v2 snapshots are expected to carry a full manifest list plus this authoritative summary, whereas v1 treated it as a convenience.
+
+In short: the summary is deliberately a small, optional-by-value, free-form string map carrying exactly one required field (`operation`), designed to give cheap operational and planning information and reliable classification for retention — without ever becoming a correctness dependency for reading the table's data, and without constraining forward evolution across engine versions.
