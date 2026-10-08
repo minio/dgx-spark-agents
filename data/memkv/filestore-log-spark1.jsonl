@@ -1,0 +1,6 @@
+{"timestamp":"2026-10-05T19:07:54.050674Z","level":"INFO","message":"FileStore (mmap) opened","files":1,"block_size":"4.2 MB","blocks_recovered":12514,"target":"memkv::main_linux"}
+{"timestamp":"2026-10-06T04:12:01.555712Z","level":"INFO","message":"FileStore (mmap) opened","files":1,"block_size":"4.2 MB","blocks_recovered":42932,"target":"memkv::main_linux"}
+{"timestamp":"2026-10-06T04:12:32.005828Z","level":"INFO","message":"FileStore shard created","path":"/var/lib/memkv/drive0.dat","num_slots":262143,"block_size_bytes":4194304,"file_size_bytes":1099511627776,"target":"memkv::storage::filestore"}
+{"timestamp":"2026-10-06T04:12:32.018406Z","level":"INFO","message":"FileStore (mmap) opened","files":1,"block_size":"4.2 MB","blocks_recovered":0,"target":"memkv::main_linux"}
+{"timestamp":"2026-10-07T21:12:03.062720Z","level":"INFO","message":"FileStore shard created","path":"/var/lib/memkv/drive0.dat","num_slots":1048575,"block_size_bytes":1048576,"file_size_bytes":1099511627776,"target":"memkv::storage::filestore"}
+{"timestamp":"2026-10-07T21:12:03.099862Z","level":"INFO","message":"FileStore (mmap) opened","files":1,"block_size":"1048.6 KB","blocks_recovered":0,"target":"memkv::main_linux"}

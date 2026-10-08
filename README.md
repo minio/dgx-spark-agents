@@ -221,7 +221,7 @@ python3 harness/cost.py
 | `openclaw-restart/` | `results.jsonl`: the time window and MemKV bytes read for each run. `openclaw-r<n>-<arm>.json`: OpenClaw's answer, its own metadata and vLLM's counters over the run. `nic-*.jsonl`: network card counters. `metrics.jsonl`: vLLM's counters every half second. |
 | `openclaw-fleet/` | `ocfleet-turns.jsonl`: one line per agent turn. `ocfleet-windows.jsonl`: when each round ran. `ocfleet-counters-*.jsonl`: vLLM and MemKV counters every 10 seconds. |
 | `hermes-restart/` | The same files as `openclaw-restart/`, for Hermes. Run 1 has no half-second counters, so its wait for the first word is not known. |
-| `memkv/` | A snapshot of both MemKV servers' counters after the OpenClaw restart test: the size of one KV value and the space it takes. |
+| `memkv/` | A snapshot of both MemKV servers' counters after the OpenClaw restart test: the size of one KV value and the space it takes. MemKV's log lines for each storage file it created, which date the change from 4 MiB to 1 MiB blocks. |
 | `vllm/` | vLLM's GPU KV cache size from its startup log, for every vLLM start in the OpenClaw tests. |
 | `memory/` | Free memory on both DGX Sparks while vLLM serves. |
 | `power/` | GPU power while idle and while vLLM recomputes a 103,000-token session, from `harness/power_probe.py`. |

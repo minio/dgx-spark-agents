@@ -29,7 +29,7 @@ Source: `data/openclaw-restart/`, three runs numbered 11, 12 and 13, with MemKV 
 
 ## Forty agents share the server
 
-Source: `data/openclaw-fleet/`. Command: `analyze.py openclaw-fleet`. This test ran on 7 October 2026 between 07:29 and 17:44 UTC, before MemKV moved to 1 MiB blocks, so it used MemKV's default of 4 MiB.
+Source: `data/openclaw-fleet/`. Command: `analyze.py openclaw-fleet`. This test ran on 7 October 2026 between 07:29 and 17:44 UTC, before MemKV moved to 1 MiB blocks, so it used MemKV's default of 4 MiB (see the last section).
 
 | Blog figure | Value in the data |
 |---|---|
@@ -79,4 +79,14 @@ Source: `harness/cost.py`, which reads the two tests above. Prices were checked 
 - **Sample sizes are small.** The restart test is three pairs, always run with MemKV first. The 40-session test is one run of each setup, one after the other.
 - **Answer quality was not graded.** MemKV does not change the model or its settings, but we did not compare the two setups' answers.
 - **More than four agents at once was not tested.** The 40-session test kept four agents active.
-- **The slot-size change is not published as a log.** MemKV's server log records when each storage file was created with 4 MiB and with 1 MiB blocks. It is not in this repository. The dates above, and the 1 MiB console screenshots in `images/`, are the public record.
+
+## Which tests used which MemKV storage block size
+
+MemKV logs each storage file it creates, with its block size. `data/memkv/filestore-log-spark1.jsonl` and `filestore-log-spark2.jsonl` hold those lines from both DGX Sparks:
+
+| Storage file created (UTC) | Block size | Tests that ran on it |
+|---|---|---|
+| 2026-10-06 04:12 | 4 MiB (`block_size_bytes` 4194304, 262,143 slots) | Hermes restart test, 2026-10-06 05:27–06:38. Hermes 40 sessions, 2026-10-06 from 09:24. OpenClaw 40 sessions, 2026-10-07 07:29–17:44. |
+| 2026-10-07 21:12 | 1 MiB (`block_size_bytes` 1048576, 1,048,575 slots) | OpenClaw restart test, 2026-10-07 21:31–22:42. |
+
+The test times come from `results.jsonl`, `ocfleet-windows.jsonl` and `hfleet-*.t0` in `data/`.
