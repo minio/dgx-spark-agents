@@ -1,0 +1,4 @@
+spark1 enp1s0f0np0 	Speed: 200000Mb/s
+spark1 enP2p1s0f0np0 	Speed: 200000Mb/s
+spark2 enp1s0f0np0 	Speed: 200000Mb/s
+spark2 enP2p1s0f0np0 	Speed: 200000Mb/s

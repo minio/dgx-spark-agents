@@ -1,0 +1,10 @@
+== spark1 2026-10-08T00:14:29Z, vLLM serving DeepSeek-V4-Flash with MemKV
+               total        used        free      shared  buff/cache   available
+Mem:     130661203968 123144802304  2735411200  2960756736  8902553600  7516401664
+Swap:    17179865088   278548480 16901316608
+vllm_node Up 2 hours
+== spark2 2026-10-08T00:14:29Z, vLLM serving DeepSeek-V4-Flash with MemKV
+               total        used        free      shared  buff/cache   available
+Mem:     130661208064 122384220160  2325278720  2960850944 10078035968  8276987904
+Swap:    17179865088   145625088 17034240000
+vllm_node Up 2 hours

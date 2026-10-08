@@ -87,6 +87,8 @@ def _at(mon, t):
 def openclaw_fleet(d):
     windows = [json.loads(l) for l in open(os.path.join(d, "ocfleet-windows.jsonl"))]
     turns = [json.loads(l) for l in open(os.path.join(d, "ocfleet-turns.jsonl"))]
+    built = {t["session"]: t["prompt_tokens"] for t in turns if t["label"] == "build-q2" and t.get("prompt_tokens")}
+    print(json.dumps({"sessions": len(built), "session_tokens_after_build": sum(built.values())}))
     for w in windows:
         arm = "build" if w["label"].startswith("build") else w["label"].rsplit("-", 1)[0]
         mon = [json.loads(l) for l in open(os.path.join(d, f"ocfleet-counters-{arm}.jsonl"))]

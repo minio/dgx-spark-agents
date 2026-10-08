@@ -2,7 +2,7 @@
 
 This repository holds everything behind our tests of AI agents on two NVIDIA DGX Sparks with MinIO MemKV: the setup files, the scripts that ran the tests, the raw measurements and screenshots.
 
-Use it to set up the same system on your own DGX Sparks, to repeat the tests, or to check our numbers.
+Use it to set up the same system on your own DGX Sparks, to repeat the tests, or to check our numbers. [EVIDENCE.md](EVIDENCE.md) lists the file and the command behind every number in the blog post.
 
 ## What MemKV does here
 
@@ -32,13 +32,25 @@ You need:
 - Two DGX Sparks connected by one cable between their ConnectX-7 network ports.
 - A MemKV license. Email [sales@min.io](mailto:sales@min.io) and ask for a MemKV trial license.
 - A computer for the agents, with Docker. OpenClaw, OpenShell and Hermes run there and reach vLLM over the network.
+- A checkout of [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) on the first DGX Spark, with the DeepSeek-V4-Flash model downloaded.
+
+Our files use these names and addresses. Change them to match your systems:
+
+| What | In our files | Where it is set |
+|---|---|---|
+| ssh names of the two DGX Sparks | `spark1`, `spark2` | `SPARK_HOSTS` in `harness/common.py` |
+| Address of the first DGX Spark, where vLLM listens | `192.0.2.10` | `setup/openshell/spark-vllm.yaml`, `setup/hermes/config.yaml`, `VLLM_URL` |
+| Addresses on the cable between the DGX Sparks | `192.168.100.1`, `192.168.100.2` | `setup/memkv/client.yaml`, `SPARK_PEERS` in `setup/vllm/launch.sh` |
+| RDMA devices, from `ibv_devices` | `rocep1s0f0`, `roceP2p1s0f0` | `setup/memkv/server.yaml`, `setup/memkv/client.yaml` |
+| Network interfaces, for the traffic counters | `enp1s0f0np0`, `enP2p1s0f0np0` | `IFACES` in `harness/nic_sampler.py` |
 
 ### 1. MemKV, on each DGX Spark
 
 1. Install the MemKV server from [dl.minio.io/aistor/memkv](https://dl.minio.io/aistor/memkv/).
 2. Make one shared key with `openssl rand -hex 32`. Every message between MemKV clients and servers is signed with it.
 3. Copy [`setup/memkv/server.yaml`](setup/memkv/server.yaml) to `/etc/memkv/config.yaml` and put the shared key in it. `storage.mode: file` keeps KV in an ordinary 1 TiB file on the drive the DGX Spark ships with.
-4. Start MemKV as a systemd service:
+4. Keep `storage.block_size: 1 MiB`. It fits about four times as many tokens in the file as MemKV's 4 MiB default, which makes it the better size for a DGX Spark.
+5. Start MemKV as a systemd service:
 
    ```
    memkv start --config /etc/memkv/config.yaml --license /etc/memkv/memkv.license
@@ -119,6 +131,8 @@ The setup script sets OpenClaw's context window to 1 million tokens, which is wh
 
 ## Results
 
+The OpenClaw restart test used MemKV with 1 MiB storage blocks. The other three tests ran earlier, with MemKV's 4 MiB default.
+
 ### An agent resumes its session after a vLLM restart
 
 Each agent built up a long session, vLLM was restarted, and the agent asked a follow-up question in the same session. We ran each test once with MemKV and once without, from the same saved session. The table shows the median, with the range in brackets.
@@ -160,18 +174,30 @@ Forty sessions, four at a time, each studied its own Iceberg topic: partitioning
 
 Round 1 is a little slower with MemKV, because MemKV stores every new block as vLLM computes it. Round 3 gains less than round 2 because its requests carry more new material that no cache has seen. In one run without MemKV, four replayed requests finished in vLLM but their responses never closed, so the client waited for its timeout and retried them. The round times in `data/hermes-fleet` include that idle time.
 
+## Limits of these results
+
+- **The samples are small.** The restart tests are three and four pairs, always run with MemKV first. Each 40-session test is one run of each setup, one after the other.
+- **The two setups of a 40-session test did not do identical work.** The agents decide how many files to read, so the OpenClaw sessions served 94 million prompt tokens with MemKV and 84 million without. Compare rates and shares, not totals.
+- **Answer quality was not graded.** MemKV does not change the model or its settings, but we did not compare the answers from the two setups.
+- **We kept at most four agents active at once.** The network had room for more restores, but we did not test them.
+
 ## Repeat the tests
 
 The scripts in [`harness/`](harness/) run each test with no one at the keyboard, including stopping and starting vLLM. They run on the agent computer and reach the DGX Sparks over ssh. vLLM must run in tmux window 0 on the first DGX Spark.
 
 Set these first, if yours differ from the defaults in [`harness/common.py`](harness/common.py): `VLLM_URL`, `VLLM_API_KEY`, `MEMKV_CONSOLES`, `SPARK_HOSTS`, `LAUNCH` and `LOG_DIR`.
 
-| Test | Command |
-|---|---|
-| OpenClaw resumes after a restart | `python3 harness/openclaw_restart.py out/openclaw-restart 3` |
-| 40 OpenClaw sessions | `python3 harness/openclaw_fleet.py out/openclaw-fleet` |
-| Hermes resumes after a restart | `ICEBERG_SRC=~/iceberg python3 harness/hermes_restart.py out/hermes-restart 3` |
-| 40 Hermes sessions | `python3 harness/hermes_fleet.py build`, then `ab` and `ab-same`. Run `hermes_task.py day1` first: it makes the read-only Iceberg clone the sessions read. |
+Each script also needs:
+
+- ssh from the agent computer to both DGX Sparks, and passwordless `sudo` there, to clear the page cache before each vLLM start;
+- a tmux session on the first DGX Spark, with `launch.sh` reachable at the path in `LAUNCH`.
+
+| Test | Command | Took us |
+|---|---|---|
+| OpenClaw resumes after a restart | `python3 harness/openclaw_restart.py out/openclaw-restart 3` | about 30 minutes per repetition, mostly starting vLLM three times |
+| 40 OpenClaw sessions | `python3 harness/openclaw_fleet.py out/openclaw-fleet` | about 10 hours |
+| Hermes resumes after a restart | `ICEBERG_SRC=~/iceberg python3 harness/hermes_restart.py out/hermes-restart 3` | about 20 minutes per repetition |
+| 40 Hermes sessions | `python3 harness/hermes_fleet.py build`, then `ab` and `ab-same`. Run `hermes_task.py day1` first: it makes the read-only Iceberg clone the sessions read. | several hours to build, 3 to 4 hours for each of `ab` and `ab-same` |
 
 The OpenClaw tests need the sandboxes from step 3: `openclaw` for the restart test, and `oc-w0` to `oc-w3` for the 40 sessions.
 
@@ -183,7 +209,10 @@ Summarize a run, or our data, with [`harness/analyze.py`](harness/analyze.py):
 python3 harness/analyze.py restart data/openclaw-restart
 python3 harness/analyze.py openclaw-fleet data/openclaw-fleet
 python3 harness/analyze.py hermes-fleet data/hermes-fleet
+python3 harness/cost.py
 ```
+
+[`harness/cost.py`](harness/cost.py) computes every cost figure in the blog post from the data: the DGX Spark cost per million prompt tokens, the same tokens priced on each API, and the break-even. The API prices in it were checked on 7 October 2026.
 
 ## What is in `data/`
 
@@ -192,6 +221,12 @@ python3 harness/analyze.py hermes-fleet data/hermes-fleet
 | `openclaw-restart/` | `results.jsonl`: the time window and MemKV bytes read for each run. `openclaw-r<n>-<arm>.json`: OpenClaw's answer, its own metadata and vLLM's counters over the run. `nic-*.jsonl`: network card counters. `metrics.jsonl`: vLLM's counters every half second. |
 | `openclaw-fleet/` | `ocfleet-turns.jsonl`: one line per agent turn. `ocfleet-windows.jsonl`: when each round ran. `ocfleet-counters-*.jsonl`: vLLM and MemKV counters every 10 seconds. |
 | `hermes-restart/` | The same files as `openclaw-restart/`, for Hermes. Run 1 has no half-second counters, so its wait for the first word is not known. |
+| `memkv/` | A snapshot of both MemKV servers' counters after the OpenClaw restart test: the size of one KV value and the space it takes. |
+| `vllm/` | vLLM's GPU KV cache size from its startup log, for every vLLM start in the OpenClaw tests. |
+| `memory/` | Free memory on both DGX Sparks while vLLM serves. |
+| `power/` | GPU power while idle and while vLLM recomputes a 103,000-token session, from `harness/power_probe.py`. |
+| `network/` | The link speed both network cards report. |
+| `versions.json` | The version of every component. |
 | `hermes-fleet/` | `hfleet-<run>.jsonl`: one line per replayed request. `hfleet-counters-*.jsonl`: counters every 10 seconds. `answers/`: every Hermes answer. Runs named `same-` resend round 1's request in every round. |
 
 ## Versions

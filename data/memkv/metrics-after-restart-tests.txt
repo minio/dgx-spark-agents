@@ -1,0 +1,16 @@
+== spark1 2026-10-08T00:15:34Z, MemKV with 1 MiB storage blocks, after the restart tests
+memkv_blocks_total 5669
+memkv_read_bytes_total 1324961280
+memkv_read_total 1322
+memkv_storage_usable_bytes 1099510579200
+memkv_storage_used_bytes 5944377344
+memkv_write_bytes_total 15300195840
+memkv_write_total 15266
+== spark2 2026-10-08T00:15:35Z, MemKV with 1 MiB storage blocks, after the restart tests
+memkv_blocks_total 5773
+memkv_read_bytes_total 1357032960
+memkv_read_total 1354
+memkv_storage_usable_bytes 1099510579200
+memkv_storage_used_bytes 6053429248
+memkv_write_bytes_total 15458549760
+memkv_write_total 15424

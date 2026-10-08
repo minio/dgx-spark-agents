@@ -1,0 +1,9 @@
+openclaw-fleet ocfleet-build: GPU KV cache size: 1,889,548 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.80x
+openclaw-fleet ocfleet-memkv: GPU KV cache size: 1,890,533 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.80x
+openclaw-fleet ocfleet-nomemkv: GPU KV cache size: 1,889,829 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.80x
+openclaw-restart run 11-memkv: GPU KV cache size: 1,891,096 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.80x
+openclaw-restart run 12-memkv: GPU KV cache size: 1,893,066 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.81x
+openclaw-restart run 13-memkv: GPU KV cache size: 1,888,281 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.80x
+openclaw-restart run 11-nomemkv: GPU KV cache size: 1,893,911 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.81x
+openclaw-restart run 12-nomemkv: GPU KV cache size: 1,890,392 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.80x
+openclaw-restart run 13-nomemkv: GPU KV cache size: 1,887,859 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.80x
